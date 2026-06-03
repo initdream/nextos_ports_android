@@ -78,6 +78,29 @@ static const char *resolve_jstring(void *jstr) {
   return "";
 }
 
+/* ---- Registry de method/field IDs por NOME (recon Unity) ---- */
+struct mid_entry { const char *name; const char *sig; };
+static struct mid_entry g_midreg[1024];
+static int g_midreg_count = 0;
+
+static void *reg_mid(const char *name, const char *sig) {
+  for (int i = 0; i < g_midreg_count; i++)
+    if (g_midreg[i].name == name ||
+        (name && g_midreg[i].name && strcmp(g_midreg[i].name, name) == 0))
+      return &g_midreg[i];
+  if (g_midreg_count >= 1024) g_midreg_count = 0;
+  int i = g_midreg_count++;
+  g_midreg[i].name = name;
+  g_midreg[i].sig = sig;
+  return &g_midreg[i];
+}
+static const char *mid_name(void *tag) {
+  if ((char *)tag >= (char *)g_midreg &&
+      (char *)tag < (char *)(g_midreg + 1024))
+    return ((struct mid_entry *)tag)->name;
+  return NULL;
+}
+
 /* ---- Generic stub ---- */
 static intptr_t jni_stub(void) { return 0; }
 
@@ -100,11 +123,7 @@ static void *jni_GetMethodID(void *env, void *clazz, const char *name,
   (void)env;
   (void)clazz;
   debugPrintf("jni_shim: GetMethodID(%s, %s)\n", name, sig);
-  if (strcmp(name, "getClassLoader") == 0)
-    return &g_method_tags[MID_GET_CLASS_LOADER];
-  if (strcmp(name, "loadClass") == 0)
-    return &g_method_tags[MID_LOAD_CLASS];
-  return &g_method_tags[MID_GENERIC];
+  return reg_mid(name, sig);
 }
 
 static void *jni_GetStaticMethodID(void *env, void *clazz, const char *name,
@@ -112,15 +131,7 @@ static void *jni_GetStaticMethodID(void *env, void *clazz, const char *name,
   (void)env;
   (void)clazz;
   debugPrintf("jni_shim: GetStaticMethodID(%s, %s)\n", name, sig);
-  if (strcmp(name, "getStorageDir") == 0)
-    return &g_method_tags[MID_GET_STORAGE_DIR];
-  if (strcmp(name, "getPackName") == 0)
-    return &g_method_tags[MID_GET_PACK_NAME];
-  if (strcmp(name, "setActivity") == 0)
-    return &g_method_tags[MID_SET_ACTIVITY];
-  if (strcmp(name, "errorDialog") == 0)
-    return &g_method_tags[MID_ERROR_DIALOG];
-  return &g_method_tags[MID_GENERIC];
+  return reg_mid(name, sig);
 }
 
 static void *jni_GetFieldID(void *env, void *clazz, const char *name,
@@ -144,9 +155,20 @@ static void *jni_GetStaticFieldID(void *env, void *clazz, const char *name,
 /* CallObjectMethod (index 36) - variadic */
 static void *jni_CallObjectMethod(void *env, void *obj, void *methodID, ...) {
   (void)env;
-  (void)obj;
-  debugPrintf("jni_shim: CallObjectMethod(mid=%p)\n", methodID);
+  const char *nm = mid_name(methodID);
+  debugPrintf("jni_shim: CallObjectMethod(%s)\n", nm ? nm : "?");
   static int fake_obj;
+  if (nm) {
+    if (strcmp(nm, "getPackageName") == 0)
+      return make_jstring("com.teamcherry.hollowknight");
+    /* builders Android (Intent.addFlags/setData/...) retornam o proprio obj */
+    if (strcmp(nm, "addFlags") == 0 || strcmp(nm, "setFlags") == 0 ||
+        strcmp(nm, "setData") == 0 || strcmp(nm, "setAction") == 0 ||
+        strcmp(nm, "append") == 0)
+      return obj;
+    if (strcmp(nm, "toString") == 0)
+      return make_jstring("");
+  }
   return &fake_obj;
 }
 
@@ -180,20 +202,10 @@ static void *jni_CallStaticObjectMethod(void *env, void *clazz,
   (void)env;
   (void)clazz;
 
-  if (methodID == &g_method_tags[MID_GET_STORAGE_DIR]) {
-    debugPrintf("jni_shim: CallStaticObjectMethod -> getStorageDir = \".\"\n");
-    return make_jstring(".");
-  }
-  if (methodID == &g_method_tags[MID_GET_PACK_NAME]) {
-    debugPrintf(
-        "jni_shim: CallStaticObjectMethod -> getPackName = \"%s\"\n",
-        g_package_name);
-    return make_jstring(g_package_name);
-  }
-
-  debugPrintf("jni_shim: CallStaticObjectMethod(mid=%p) -> NULL\n", methodID);
+  const char *nm = mid_name(methodID);
+  debugPrintf("jni_shim: CallStaticObjectMethod(%s)\n", nm ? nm : "?");
   static int fake_result;
-  return &fake_result;
+  return &fake_result;  /* fake Class/objeto nao-nulo (forName etc.) */
 }
 
 /* CallStaticBooleanMethod (index 124) */
@@ -360,7 +372,17 @@ static jint vm_AttachCurrentThreadAsDaemon(void *vm, void **penv, void *args) {
   return 0;
 }
 
-/* ---- recon: RegisterNatives com log (Unity usa muito) ---- */
+/* ---- recon: RegisterNatives com log + STORAGE dos ponteiros ---- */
+struct native_method { const char *name; const char *sig; void *fn; };
+static struct native_method g_natives[512];
+static int g_natives_count = 0;
+
+void *jni_find_native(const char *name) {
+  for (int i = 0; i < g_natives_count; i++)
+    if (strcmp(g_natives[i].name, name) == 0) return g_natives[i].fn;
+  return 0;
+}
+
 static int jni_RegisterNatives(void *env, void *clazz, const void *methods, int n) {
   (void)env; (void)clazz;
   debugPrintf("jni_shim: >> RegisterNatives(%d metodos)\n", n);
@@ -368,18 +390,36 @@ static int jni_RegisterNatives(void *env, void *clazz, const void *methods, int 
   for (int i = 0; i < n && i < 128; i++) {
     const char *nm = (const char *)m[i * 3];
     const char *sg = (const char *)m[i * 3 + 1];
-    debugPrintf("     [%d] %s %s\n", i, nm ? nm : "?", sg ? sg : "?");
+    void *fn = (void *)m[i * 3 + 2];
+    debugPrintf("     [%d] %s %s  -> %p\n", i, nm ? nm : "?", sg ? sg : "?", fn);
+    if (nm && g_natives_count < 512) {
+      g_natives[g_natives_count].name = nm;
+      g_natives[g_natives_count].sig = sg;
+      g_natives[g_natives_count].fn = fn;
+      g_natives_count++;
+    }
   }
   return 0;
 }
 
+/* GetJavaVM (index 219) — initJni chama isso */
+static jint jni_GetJavaVM(void *env, void **vm) {
+  (void)env;
+  debugPrintf("jni_shim: GetJavaVM -> nossa VM\n");
+  *vm = &java_vm_ptr;   /* mesma JavaVM passada no out_vm */
+  return 0;
+}
+
 /* ---- Init ---- */
+
+void jni_install_indexed(uintptr_t *vt, int n);
 
 void jni_shim_init(void **out_vm, void **out_env) {
   for (int i = 0; i < JNI_VTABLE_SIZE; i++) {
     jni_env_vtable[i] = (uintptr_t)jni_stub;
     java_vm_vtable[i] = (uintptr_t)jni_stub;
   }
+  jni_install_indexed(jni_env_vtable, JNI_VTABLE_SIZE);
 
   /*
    * JNIEnv vtable indices from Android NDK jni.h.
@@ -420,6 +460,7 @@ void jni_shim_init(void **out_vm, void **out_env) {
   jni_env_vtable[4] = (uintptr_t)jni_GetVersion;
   jni_env_vtable[6] = (uintptr_t)jni_FindClass;
   jni_env_vtable[215] = (uintptr_t)jni_RegisterNatives;  /* recon: Unity */
+  jni_env_vtable[219] = (uintptr_t)jni_GetJavaVM;        /* recon: Unity initJni */
   jni_env_vtable[15] = (uintptr_t)jni_ExceptionOccurred;
   jni_env_vtable[17] = (uintptr_t)jni_ExceptionClear;
   jni_env_vtable[21] = (uintptr_t)jni_NewGlobalRef;

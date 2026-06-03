@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <dlfcn.h>
+#include <string.h>
 
 // stubs (logam nome, 1as 2 vezes, retornam 0)
 long stub_accept(void){ static int n=0; if(n++<2) fprintf(stderr,"[STUB] accept\\n"); return 0; }
@@ -724,13 +725,22 @@ DynLibFunction dynlib_functions[] = {
 };
 size_t dynlib_numfunctions = sizeof(dynlib_functions)/sizeof(dynlib_functions[0]);
 
-// resolve os passthrough via dlsym(RTLD_DEFAULT) em runtime
+// alias bionic->glibc p/ nomes diferentes
+static void *resolve_bionic(const char *nm){
+  void *p = dlsym(RTLD_DEFAULT, nm);
+  if(p) return p;
+  if(strcmp(nm,"__errno")==0)   return dlsym(RTLD_DEFAULT,"__errno_location");
+  if(strcmp(nm,"__assert2")==0) return dlsym(RTLD_DEFAULT,"__assert_fail");
+  return 0;
+}
+// dlsym em TODOS: o que existe no glibc/libm vira passthrough real (sobrescreve
+// o stub). So os Android-specific (__android_log, __system_property...) ficam stub.
 void recon_fill_passthrough(void){
+  int real=0, stub=0;
   for(size_t i=0;i<dynlib_numfunctions;i++){
-    if(dynlib_functions[i].func==0){
-      void *p = dlsym(RTLD_DEFAULT, dynlib_functions[i].symbol);
-      if(p) dynlib_functions[i].func=(uintptr_t)p;
-      else fprintf(stderr,"[passthrough FALHOU dlsym] %s\\n", dynlib_functions[i].symbol);
-    }
+    void *p = resolve_bionic(dynlib_functions[i].symbol);
+    if(p){ dynlib_functions[i].func=(uintptr_t)p; real++; }
+    else stub++;
   }
+  fprintf(stderr,"[passthrough] %d reais via dlsym + %d stubs android-specific\n", real, stub);
 }

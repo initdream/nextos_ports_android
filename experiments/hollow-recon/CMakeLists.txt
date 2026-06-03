@@ -6,6 +6,7 @@ add_executable(hollow-recon
     src/so_util.c
     src/jni_shim.c
     src/imports_unity.gen.c
+    src/jni_idx_stubs.gen.c
     src/util.c
     src/error.c
 )
