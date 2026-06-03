@@ -93,6 +93,22 @@ static long aa_getLength64(void *h) { AAsset *a = h; return a ? a->len : 0; }
 static long aa_getRemainingLength64(void *h) { AAsset *a = h; return a ? a->len - ftell(a->fp) : 0; }
 static void aa_close(void *h) { AAsset *a = h; if (a) { fclose(a->fp); free(a); } }
 
+/* ---- ESPIÃO de I/O: loga todo fopen/open do jogo (descobrir o que o GameMain pede) ---- */
+static FILE *w_fopen(const char *path, const char *mode) {
+  static FILE *(*real)(const char *, const char *) = NULL;
+  if (!real) real = dlsym(RTLD_DEFAULT, "fopen");
+  FILE *f = real ? real(path, mode) : NULL;
+  fprintf(stderr, "[fopen] \"%s\" (%s) -> %s\n", path ? path : "(null)", mode ? mode : "?", f ? "OK" : "FALHA");
+  return f;
+}
+static int w_open(const char *path, int flags, int mode) {
+  static int (*real)(const char *, int, int) = NULL;
+  if (!real) real = dlsym(RTLD_DEFAULT, "open");
+  int fd = real ? real(path, flags, mode) : -1;
+  fprintf(stderr, "[open] \"%s\" -> %s\n", path ? path : "(null)", fd >= 0 ? "OK" : "FALHA");
+  return fd;
+}
+
 /* ---- glGetString nunca-NULL (GameMain chama sem contexto -> NULL -> strlen crash) ---- */
 static const unsigned char *w_glGetString(unsigned name) {
   static const unsigned char *(*real)(unsigned) = NULL;
@@ -123,6 +139,7 @@ static Shim S[] = {
   {"AAsset_getLength64", aa_getLength64}, {"AAsset_getRemainingLength64", aa_getRemainingLength64},
   {"AAsset_close", aa_close},
   {"glGetString", w_glGetString},
+  {"fopen", w_fopen}, {"open", w_open},
   {"_ZTH7gString", tl_noop}, {"_ZTH8gString2", tl_noop},
   {"_ZTHN10ALCcontext13sLocalContextE", tl_noop},
   {"_Z24NVThreadGetCurrentJNIEnvv", NVThreadGetCurrentJNIEnv},

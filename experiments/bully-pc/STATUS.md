@@ -94,4 +94,17 @@ Então o ZIPFile::Find(NULL) NÃO é o asset_archive.
 - **CAUSA REAL / FIX = portar o `zip_fs.c` do bully-NX**: ele intercepta **`fopen`** (via funopen + minizip) e serve os arquivos de DENTRO dos data_*.zip transparentemente — NÃO usa OS_ZipAdd. bully-NX combina: asset_archive (NvAPK) + **zip_fs (fopen)** + check_data (stat). É o componente de I/O que falta (ref-bully-NX/source/zip_fs.c, usa libminizip). Provável que o jogo abre arquivos via fopen/NvF que precisam ser servidos de dentro dos zips.
 Crash anterior (perfprofile glGetString, AND_DestroyEglSurface abort) já resolvidos.
 
+### 🔬 MÉTODO DE DESCOBERTA (como achamos cada coisa — responde "como descobrir isso?")
+1. **Espião de fopen/open** (wrapper em imports.c que loga path+OK/FALHA) → revelou EXATAMENTE os arquivos que o jogo pede e quais faltam. Achou: `data_2.zip`/`data_3.zip`/`data_4.zip` (FALHA) + `bully/resource_files.list`.
+2. **gdb backtrace + offset (addr−libGame_base) + objdump/nm** → identifica a função que crasha e a instrução.
+3. **ler bully-NX** (mesmo lib) p/ saber como cada peça deveria funcionar.
+
+### DESCOBERTAS via fopen-spy (e fixes que avançaram o jogo)
+- Jogo faz `fopen("data_2.zip".."data_4.zip")` que NÃO existem (só data_0/1) → registrava ZIPFile NULL → ZIPFile::Find(NULL). **FIX: criar zips VAZIOS válidos** (EOCD 22 bytes) `gamefiles/data_2.zip/3/4.zip` → fopen OK → ZIPFile vazia válida, sem NULL. **PASSOU do data-layer.** (+ symlink data_0/1.zip no cwd; OS_ZipAdd data_0/1 no driver).
+- `bully/resource_files.list` (FALHA) = probe opcional (não existe nos zips; ok). Dados reais estão sob `bullyorig/` nos data zips (config/audio/dat/...). Path do jogo "bully/"→"bullyorig/" (asset_archive mapeia p/ NvAPK; fopen direto precisaria do zip_fs).
+
+### CRASH ATUAL (avançou pra inicialização gráfica!)
+Thread GameMain, **`GameRenderer::Setup()` +0x47d** (libGame+0x8a0c0d): `cmpl $0,0x6c(%r14)` com r14=objeto de render NULL. Saímos do data-layer e entramos no **setup do renderer** (GfxDevice/render device não inicializado). Trajetória: load→gate Rockstar→GameMain→data zips→**GameRenderer::Setup**.
+**PRÓXIMO:** investigar GameRenderer::Setup (o objeto NULL em +0x6c — provável GfxDevice/contexto GL na thread certa). Setup files no gamefiles: data_2/3/4.zip vazios + symlinks data_0/1. zip_fs (servir bullyorig/ via fopen) provavelmente necessário p/ assets reais mais adiante.
+
 **Trajetória completa:** load→0 unresolved→init_array→JNI_OnLoad→implOnInitialSetup→ActivityCreated→EGL→Surface→Resume→frame loop(0..31)→**gate Rockstar PASS**→GameMain sobe→asset_archive indexa 1912→**ZIPFile::Find(NULL)**. Cada sessão avança várias camadas.
