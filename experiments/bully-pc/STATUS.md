@@ -105,6 +105,18 @@ Crash anterior (perfprofile glGetString, AND_DestroyEglSurface abort) já resolv
 
 ### CRASH ATUAL (avançou pra inicialização gráfica!)
 Thread GameMain, **`GameRenderer::Setup()` +0x47d** (libGame+0x8a0c0d): `cmpl $0,0x6c(%r14)` com r14=objeto de render NULL. Saímos do data-layer e entramos no **setup do renderer** (GfxDevice/render device não inicializado). Trajetória: load→gate Rockstar→GameMain→data zips→**GameRenderer::Setup**.
-**PRÓXIMO:** investigar GameRenderer::Setup (o objeto NULL em +0x6c — provável GfxDevice/contexto GL na thread certa). Setup files no gamefiles: data_2/3/4.zip vazios + symlinks data_0/1. zip_fs (servir bullyorig/ via fopen) provavelmente necessário p/ assets reais mais adiante.
+### RASTREADO: GameRenderer::Setup crasha em ResourceManager::Get<Texture2D>("whitetexture")=NULL
+- O objeto NULL (r14+0x6c) = `r14 = ResourceManager::Get<Texture2D>("whitetexture")` (libGame+0x8a09ea) retornou NULL.
+- **"whitetexture" = textura INTERNA da engine** (1x1 branca p/ render sem-textura), NÃO asset. As 3 refs à string (GameRenderer::Setup, Material::CreateNew, GameSprite::Draw) são todas `Get` — **nenhuma cria** → a whitetexture deveria ser criada por um **init de recursos default** que NÃO rodou.
+- Causa provável: (a) **contexto GL não current na thread GameMain** (criar Texture2D precisa de glGenTextures/glTexImage), e/ou (b) **orquestração GameMain do bully-NX não portada** (forçar gamestate 0→2, tick flags 0x126bb70/74, g_gamemain_alive) — o init gráfico que cria os defaults não dispara.
+
+### 🎮 FASE GRÁFICA (a maior peça restante)
+Próximo = fazer o renderer subir:
+1. **GL context handoff correto pras threads do jogo** (GameMain/render thread chamam makeCurrent; garantir que a textura-creation tenha GL current). No PC o ctx é EGL pbuffer.
+2. **Portar a orquestração GameMain do bully-NX** (frame loop ~linha 1349: gamestate forcing via 0x12146a8 deref+0x68, tick flags, g_gamemain_alive, async file worker) — provável que destrave o init de recursos default (whitetexture).
+3. Depois: render visível (window surface) + assets reais (zip_fs servindo bullyorig/ via fopen, p/ texturas/modelos).
+
+Setup atual em gamefiles/: data_0/1.zip(symlink) + data_2/3/4.zip(vazios) + assets/(flutter+data) + libs.
+Trajetória: load→gate Rockstar→GameMain→data zips→**GameRenderer::Setup (whitetexture/graphics init)**.
 
 **Trajetória completa:** load→0 unresolved→init_array→JNI_OnLoad→implOnInitialSetup→ActivityCreated→EGL→Surface→Resume→frame loop(0..31)→**gate Rockstar PASS**→GameMain sobe→asset_archive indexa 1912→**ZIPFile::Find(NULL)**. Cada sessão avança várias camadas.
