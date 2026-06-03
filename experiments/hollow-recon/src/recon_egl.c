@@ -5,10 +5,24 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <dlfcn.h>
 
 #include "egl_shim.h"
 #include "so_util.h"
 #include "imports.h"
+
+/* wrapper de dlopen/dlsym p/ ver o Unity carregar libil2cpp */
+static void *my_dlopen(const char *name, int flag) {
+  fprintf(stderr, "[dlopen] \"%s\" flag=%d\n", name ? name : "(self)", flag);
+  void *h = dlopen(name, flag);
+  fprintf(stderr, "[dlopen] -> %p %s\n", h, h ? "OK" : dlerror());
+  return h;
+}
+static void *my_dlsym(void *h, const char *sym) {
+  void *p = dlsym(h, sym);
+  if (!p) fprintf(stderr, "[dlsym] %s -> NULL\n", sym ? sym : "?");
+  return p;
+}
 
 /* ---- ANativeWindow shim (Unity usa no Surface) ---- */
 static void *ANW_fromSurface(void *env, void *surface) {
@@ -60,5 +74,8 @@ void recon_wire_egl(void) {
   set_import("ANativeWindow_setBuffersGeometry", (void *)ANW_setBuffersGeometry);
   set_import("ANativeWindow_acquire", (void *)ANW_acquire);
   set_import("ANativeWindow_release", (void *)ANW_release);
-  fprintf(stderr, "[egl] wired: 20 EGL + 6 ANativeWindow -> egl_shim (SDL2/Mali)\n");
+  /* dlopen/dlsym logados (ver libil2cpp carregar) */
+  set_import("dlopen", (void *)my_dlopen);
+  set_import("dlsym", (void *)my_dlsym);
+  fprintf(stderr, "[egl] wired: 20 EGL + 6 ANativeWindow + dlopen/dlsym -> egl_shim\n");
 }
