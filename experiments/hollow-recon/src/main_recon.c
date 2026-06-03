@@ -31,6 +31,10 @@ void recon_wire_egl(void);
 
 FILE *stderr_fake;               /* exigido por imports.h */
 
+/* modulos multi-modulo (compartilhados com recon_egl.c p/ dlopen/dlsym bridge) */
+so_module *g_m_il2cpp = NULL;
+so_module *g_m_unity = NULL;
+
 typedef int jint;
 typedef jint (*JNI_OnLoad_t)(void *vm, void *reserved);
 
@@ -61,65 +65,69 @@ int main(int argc, char **argv) {
   stderr_fake = stderr;
   setvbuf(stderr, NULL, _IOLBF, 0);
 
+  static char altstack[64 * 1024];
+  stack_t ss = {.ss_sp = altstack, .ss_size = sizeof(altstack), .ss_flags = 0};
+  sigaltstack(&ss, NULL);
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
   sa.sa_sigaction = on_segv;
-  sa.sa_flags = SA_SIGINFO;
+  sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
   sigaction(SIGSEGV, &sa, NULL);
   sigaction(SIGBUS, &sa, NULL);
+  sigaction(SIGABRT, &sa, NULL);
 
   fprintf(stderr, "===================================================\n");
   fprintf(stderr, " HOLLOW-RECON — carregando %s\n", SO_NAME);
   fprintf(stderr, "===================================================\n");
 
-  /* 1. heap RWX */
-  size_t heap_size = (size_t)MEMORY_MB * 1024 * 1024;
-  void *heap = mmap(NULL, heap_size, PROT_READ | PROT_WRITE | PROT_EXEC,
-                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (heap == MAP_FAILED) { perror("mmap"); return 1; }
-  fprintf(stderr, "[1] heap %p (%d MB)\n", heap, MEMORY_MB);
+  /* === MULTI-MODULO: replica o libmain (carrega il2cpp -> unity) === */
+  size_t hs = (size_t)MEMORY_MB * 1024 * 1024;
+  void *heap_il2 = mmap(NULL, hs, PROT_READ | PROT_WRITE | PROT_EXEC,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void *heap_uni = mmap(NULL, hs, PROT_READ | PROT_WRITE | PROT_EXEC,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (heap_il2 == MAP_FAILED || heap_uni == MAP_FAILED) { perror("mmap"); return 1; }
 
-  /* 2. carregar o ELF */
-  if (so_load(SO_NAME, heap, heap_size) < 0) {
-    fprintf(stderr, "FALHOU so_load(%s) — o arquivo esta no cwd?\n", SO_NAME);
-    return 1;
-  }
-  fprintf(stderr, "[2] carregado: text=%p+0x%zx\n", text_base, text_size);
-
-  /* 3. relocations */
-  if (so_relocate() < 0) { fprintf(stderr, "FALHOU so_relocate\n"); return 1; }
-  fprintf(stderr, "[3] relocate ok\n");
-
-  /* 4. resolver imports (passthrough libc/GLES + stubs que logam) */
-  fprintf(stderr, "[4] resolvendo %zu imports...\n", dynlib_numfunctions);
+  /* tabela de imports (uma vez) + wire egl/ANativeWindow */
   void recon_fill_passthrough(void); recon_fill_passthrough();
-  recon_wire_egl();   /* egl + ANativeWindow -> egl_shim (SDL2/Mali) */
+  recon_wire_egl();
+
+  /* (A) libil2cpp — .init_array inicializa o runtime/memory manager */
+  fprintf(stderr, "[A] carregando libil2cpp.so...\n");
+  if (so_load("libil2cpp.so", heap_il2, hs) < 0) { fprintf(stderr, "FALHOU il2cpp\n"); return 1; }
+  if (so_relocate() < 0) { fprintf(stderr, "FALHOU reloc il2cpp\n"); return 1; }
   so_resolve(dynlib_functions, dynlib_numfunctions, 0);
-  fprintf(stderr, "    (imports nao-resolvidos aparecem como '*** UNRESOLVED ***' acima)\n");
-
-  /* 5. construtores .init_array */
-  fprintf(stderr, "[5] rodando .init_array...\n");
   so_execute_init_array();
-  fprintf(stderr, "    init_array ok\n");
+  g_m_il2cpp = so_save();
+  fprintf(stderr, "[A] libil2cpp OK (text=%p+0x%zx)\n", text_base, text_size);
 
-  /* 6. JavaVM/JNIEnv falso */
+  /* (B) libunity */
+  fprintf(stderr, "[B] carregando libunity.so...\n");
+  if (so_load(SO_NAME, heap_uni, hs) < 0) { fprintf(stderr, "FALHOU unity\n"); return 1; }
+  if (so_relocate() < 0) { fprintf(stderr, "FALHOU reloc unity\n"); return 1; }
+  so_resolve(dynlib_functions, dynlib_numfunctions, 0);
+  so_execute_init_array();
+  g_m_unity = so_save();
+  fprintf(stderr, "[B] libunity OK (text=%p+0x%zx)\n", text_base, text_size);
+
+  /* JavaVM/JNIEnv falso */
   void *fake_vm = NULL, *fake_env = NULL;
   jni_shim_init(&fake_vm, &fake_env);
-  fprintf(stderr, "[6] jni_shim pronto (vm=%p)\n", fake_vm);
+  fprintf(stderr, "[6] jni_shim pronto\n");
 
-  /* 7. JNI_OnLoad — aqui o Unity registra natives + chama Java (logado) */
-  uintptr_t onload = so_find_addr("JNI_OnLoad");
-  if (!onload) {
-    fprintf(stderr, "!!! JNI_OnLoad NAO encontrado em %s\n", SO_NAME);
-    return 1;
+  /* (C) JNI_OnLoad: il2cpp (se houver) + unity — igual o libmain */
+  so_use(g_m_il2cpp);
+  uintptr_t il2_onload = so_find_addr("JNI_OnLoad");
+  if (il2_onload) {
+    fprintf(stderr, "[C] il2cpp JNI_OnLoad @ %p...\n", (void *)il2_onload);
+    ((JNI_OnLoad_t)il2_onload)(fake_vm, NULL);
   }
-  fprintf(stderr, "[7] JNI_OnLoad @ %p — CHAMANDO (o contrato Java vem agora)\n",
-          (void *)onload);
-  fprintf(stderr, "-------------------- CONTRATO UNITY --------------------\n");
-  JNI_OnLoad_t jni_onload = (JNI_OnLoad_t)onload;
-  jint ver = jni_onload(fake_vm, NULL);
-  fprintf(stderr, "--------------------------------------------------------\n");
-  fprintf(stderr, "[8] JNI_OnLoad RETORNOU 0x%x — recon ate aqui OK!\n", ver);
+  so_use(g_m_unity);
+  uintptr_t onload = so_find_addr("JNI_OnLoad");
+  if (!onload) { fprintf(stderr, "!!! unity JNI_OnLoad nao achado\n"); return 1; }
+  fprintf(stderr, "[C] unity JNI_OnLoad @ %p — CHAMANDO\n", (void *)onload);
+  jint ver = ((JNI_OnLoad_t)onload)(fake_vm, NULL);
+  fprintf(stderr, "[8] JNI_OnLoad RETORNOU 0x%x — multi-modulo OK!\n", ver);
 
   /* 9. DIRIGIR: UnityPlayer.initJni(Context) — o 1o passo do UnityPlayer.java */
   void *initJni = jni_find_native("initJni");

@@ -11,17 +11,27 @@
 #include "so_util.h"
 #include "imports.h"
 
-/* wrapper de dlopen/dlsym p/ ver o Unity carregar libil2cpp */
+/* bridge dlopen/dlsym -> modulos do so-loader (libil2cpp/libunity) */
+#include <stdlib.h>
+extern so_module *g_m_il2cpp, *g_m_unity;
+
 static void *my_dlopen(const char *name, int flag) {
-  fprintf(stderr, "[dlopen] \"%s\" flag=%d\n", name ? name : "(self)", flag);
-  void *h = dlopen(name, flag);
-  fprintf(stderr, "[dlopen] -> %p %s\n", h, h ? "OK" : dlerror());
-  return h;
+  fprintf(stderr, "[dlopen] \"%s\"\n", name ? name : "(self)");
+  if (name && strstr(name, "libil2cpp")) return (void *)g_m_il2cpp;
+  if (name && strstr(name, "libunity"))  return (void *)g_m_unity;
+  return dlopen(name, flag); /* real p/ libdl/libc/etc */
 }
 static void *my_dlsym(void *h, const char *sym) {
-  void *p = dlsym(h, sym);
-  if (!p) fprintf(stderr, "[dlsym] %s -> NULL\n", sym ? sym : "?");
-  return p;
+  if ((h == (void *)g_m_il2cpp || h == (void *)g_m_unity) && g_m_il2cpp) {
+    so_module *save = so_save();      /* salva modulo ativo */
+    so_use((so_module *)h);
+    uintptr_t a = so_find_addr(sym);
+    so_use(save);                     /* restaura */
+    free(save);
+    if (!a) fprintf(stderr, "[dlsym modulo] %s -> NULL\n", sym ? sym : "?");
+    return (void *)a;
+  }
+  return dlsym(h, sym);
 }
 
 /* ---- ANativeWindow shim (Unity usa no Surface) ---- */
