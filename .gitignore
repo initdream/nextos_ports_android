@@ -1,0 +1,26 @@
+# build artifacts
+build/
+ports/*/build/
+*.o
+*.a
+*.elf
+*.bin
+
+# logs
+log.txt
+*.log
+
+# === BYO game files — NUNCA commitar conteudo de jogo (copyright) ===
+*.so
+*.obb
+*.apk
+*.dat
+*.unity3d
+*.resource
+*.assets
+sharedassets*
+data.unity3d
+global-metadata.dat
+
+# OS
+.DS_Store
