@@ -36,7 +36,9 @@ target_include_directories(PORTNAME PRIVATE ${SDL2_INCLUDE_DIRS} src)
 if(USE_GLES2)
   set(GLES_LIB GLESv2)
 else()
-  set(GLES_LIB GLES_CM)
+  # NextOS/Mali expõe o GLES1 como libGLESv1_CM (nome padrão Linux).
+  # (No toolchain Trimui é "GLES_CM" — ajuste se portar pra lá.)
+  set(GLES_LIB GLESv1_CM)
 endif()
 
 target_link_libraries(PORTNAME PRIVATE
