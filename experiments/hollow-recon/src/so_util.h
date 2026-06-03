@@ -22,6 +22,11 @@ extern size_t text_size, data_size;
 
 void hook_arm64(uintptr_t addr, uintptr_t dst);
 
+/* multi-modulo: salva os globais do modulo atual / restaura p/ trocar */
+typedef struct so_module so_module;
+so_module *so_save(void);
+void so_use(so_module *m);
+
 void so_make_text_writable(void);
 void so_make_text_executable(void);
 void so_flush_caches(void);

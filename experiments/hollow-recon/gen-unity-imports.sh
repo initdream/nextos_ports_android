@@ -2,9 +2,9 @@
 # gera src/imports_unity.gen.c — passthrough libc resolvido via dlsym (runtime),
 # resto = stub que loga. Zero conflito de declaracao.
 set -euo pipefail
-SO="${1:?uso: gen-unity-imports.sh /caminho/libunity.so}"
+SOS="$*"; [ -n "$SOS" ] || { echo "uso: gen-unity-imports.sh lib1.so [lib2.so...]"; exit 1; }
 OUT=src/imports_unity.gen.c
-readelf --dyn-syms -W "$SO" 2>/dev/null | awk '$7=="UND" && $8!="" {print $8}' | sed 's/@.*//' | sort -u > /tmp/u.txt
+for SO in $SOS; do readelf --dyn-syms -W "$SO" 2>/dev/null | awk '$7=="UND" && $8!="" {print $8}' | sed 's/@.*//'; done | sort -u > /tmp/u.txt
 SAFE='^(mem(cpy|move|set|cmp|chr|rchr)|str(len|cpy|ncpy|cat|ncat|cmp|ncmp|chr|rchr|str|dup|ndup|tok|tol|toul|casecmp|ncasecmp|coll|error|spn|cspn|pbrk)|sn?printf|vsn?printf|v?f?printf|s?scanf|fwrite|fread|fopen|fclose|fseeko?|ftello?|fflush|fputs|fgets|fputc|fgetc|putc|getc|ungetc|puts|fdopen|fileno|rewind|setvbuf|setbuf|perror|clearerr|feof|ferror|malloc|calloc|realloc|free|posix_memalign|aligned_alloc|valloc|abort|exit|_exit|atexit|getenv|setenv|unsetenv|putenv|system|qsort|bsearch|rand|srand|rand_r|abs|labs|llabs|div|ldiv|atoi|atol|atoll|atof|strtol|strtoul|strtoll|strtoull|strtod|strtof|isalpha|isdigit|isalnum|isspace|isupper|islower|isprint|ispunct|iscntrl|isxdigit|isgraph|isblank|toupper|tolower|sin|cos|tan|asin|acos|atan|atan2|sinh|cosh|tanh|sqrt|cbrt|pow|exp|exp2|expm1|log|log2|log10|log1p|floor|ceil|round|lround|trunc|rint|nearbyint|fmod|remainder|fabsf?|fmin|fmax|fdim|fma|hypotf?|ldexp|frexp|modf|copysign|sinf|cosf|tanf|asinf|acosf|atanf|atan2f|sqrtf|cbrtf|powf|expf|logf|log2f|log10f|floorf|ceilf|roundf|truncf|fmodf|nanf?|isnan|isinf|signbit|open|open64|close|read|pread|write|pwrite|lseek|lseek64|stat|stat64|fstat|fstat64|lstat|access|mkdir|rmdir|unlink|remove|rename|opendir|readdir|readdir64|closedir|rewinddir|getcwd|chdir|realpath|dup|dup2|pipe|fcntl|ftruncate|truncate|ioctl|select|poll|mmap|mmap64|munmap|mprotect|madvise|msync|sysconf|getpagesize|sched_yield|getpid|getppid|getuid|getgid|gettimeofday|clock|clock_gettime|clock_getres|time|localtime|localtime_r|gmtime|gmtime_r|mktime|strftime|difftime|nanosleep|usleep|sleep|setlocale|localeconv|memmem|getauxval|tolower|toupper|dlopen|dlsym|dlclose|dlerror|pthread_[a-z_]+|sem_[a-z]+)$'
 {
 echo "// imports_unity.gen.c — GERADO. passthrough via dlsym; resto = stub log."
