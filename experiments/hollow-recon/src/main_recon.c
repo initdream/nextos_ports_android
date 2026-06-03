@@ -21,6 +21,10 @@
 #include "imports.h"
 #include "jni_shim.h"
 #include "util.h"
+#include "egl_shim.h"
+#include <SDL2/SDL.h>
+
+void recon_wire_egl(void);
 
 #define MEMORY_MB 384            /* libunity e grande */
 #define SO_NAME "libunity.so"
@@ -36,15 +40,19 @@ static void on_segv(int sig, siginfo_t *si, void *uc_) {
   uintptr_t pc = uc->uc_mcontext.pc;
   uintptr_t lr = uc->uc_mcontext.regs[30];
   uintptr_t tb = (uintptr_t)text_base;
-  fprintf(stderr, "\n*** SEGV fault=%p pc=%p lr=%p ", si->si_addr, (void *)pc,
-          (void *)lr);
+  char buf[256];
+  int n;
   if (pc >= tb && pc < tb + text_size)
-    fprintf(stderr, "[em libunity +0x%lx]\n", (unsigned long)(pc - tb));
+    n = snprintf(buf, sizeof(buf),
+                 "\n*** SEGV fault=%p pc=libunity+0x%lx lr=+0x%lx ***\n",
+                 si->si_addr, (unsigned long)(pc - tb),
+                 (lr >= tb && lr < tb + text_size) ? (unsigned long)(lr - tb)
+                                                   : 0xffffffffUL);
   else
-    fprintf(stderr, "[FORA do libunity — nosso codigo/libc]\n");
-  if (lr >= tb && lr < tb + text_size)
-    fprintf(stderr, "    LR aponta libunity +0x%lx\n", (unsigned long)(lr - tb));
-  fflush(stderr);
+    n = snprintf(buf, sizeof(buf),
+                 "\n*** SEGV fault=%p pc=%p [FORA libunity] ***\n", si->si_addr,
+                 (void *)pc);
+  if (write(2, buf, n) < 0) { /* ignore */ }
   _exit(139);
 }
 
@@ -85,6 +93,7 @@ int main(int argc, char **argv) {
   /* 4. resolver imports (passthrough libc/GLES + stubs que logam) */
   fprintf(stderr, "[4] resolvendo %zu imports...\n", dynlib_numfunctions);
   void recon_fill_passthrough(void); recon_fill_passthrough();
+  recon_wire_egl();   /* egl + ANativeWindow -> egl_shim (SDL2/Mali) */
   so_resolve(dynlib_functions, dynlib_numfunctions, 0);
   fprintf(stderr, "    (imports nao-resolvidos aparecem como '*** UNRESOLVED ***' acima)\n");
 
@@ -125,7 +134,15 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[10] initJni RETORNOU — proximo contrato Java logado acima\n");
   }
 
-  /* 11. nativeRecreateGfxState(api, Surface) — setup grafico (EGL ainda stub) */
+  /* 10b. janela SDL/GLES (precisa ES parado p/ pegar o framebuffer) */
+  fprintf(stderr, "[10b] SDL_Init(VIDEO) + egl_shim_create_window...\n");
+  if (SDL_Init(SDL_INIT_VIDEO) != 0)
+    fprintf(stderr, "    SDL_Init FALHOU: %s\n", SDL_GetError());
+  egl_shim_create_window();
+  fprintf(stderr, "[10c] window=%p (janela SDL criada?)\n", (void *)egl_shim_get_window());
+  fflush(NULL);
+
+  /* 11. nativeRecreateGfxState(api, Surface) — agora EGL = egl_shim */
   void *gfx = jni_find_native("nativeRecreateGfxState");
   fprintf(stderr, "[11] nativeRecreateGfxState @ %p\n", gfx);
   if (gfx) {
