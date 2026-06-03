@@ -12,6 +12,9 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdarg.h>
 
 #include "jni_shim.h"
 #include "util.h"
@@ -53,26 +56,25 @@ void jni_shim_set_package(const char *package_name, int obb_version) {
 
 /* ---- Fake jstring tracking ---- */
 /* We return tagged pointers as jstrings and map them to C strings */
-#define MAX_JSTRINGS 32
+#define MAX_JSTRINGS 1024
 static struct {
   void *handle;
-  const char *value;
+  char *value; /* copia propria (strdup) */
 } g_jstrings[MAX_JSTRINGS];
 static int g_jstring_count = 0;
 
 static void *make_jstring(const char *value) {
   static char jstring_storage[MAX_JSTRINGS];
-  if (g_jstring_count >= MAX_JSTRINGS)
-    g_jstring_count = 0; /* wrap around */
-  int idx = g_jstring_count++;
+  int idx = g_jstring_count++ % MAX_JSTRINGS;
+  if (g_jstrings[idx].value) free(g_jstrings[idx].value);
   g_jstrings[idx].handle = &jstring_storage[idx];
-  g_jstrings[idx].value = value;
+  g_jstrings[idx].value = strdup(value ? value : "");
   return g_jstrings[idx].handle;
 }
 
 static const char *resolve_jstring(void *jstr) {
-  for (int i = 0; i < g_jstring_count; i++) {
-    if (g_jstrings[i].handle == jstr)
+  for (int i = 0; i < MAX_JSTRINGS; i++) {
+    if (g_jstrings[i].handle == jstr && g_jstrings[i].value)
       return g_jstrings[i].value;
   }
   return "";
@@ -99,6 +101,97 @@ static const char *mid_name(void *tag) {
       (char *)tag < (char *)(g_midreg + 1024))
     return ((struct mid_entry *)tag)->name;
   return NULL;
+}
+
+/* ===================================================================
+ * AssetManager bridge — le de /storage/hollow-recon/assets/<path>
+ * (Unity: getAssets() + AssetManager.open(path) + InputStream.read/close)
+ * =================================================================== */
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#define ASSET_BASE "/storage/hollow-recon/assets/"
+
+static int g_assetmgr; /* tag do objeto AssetManager */
+
+/* --- byte[] tracking (backing real) --- */
+#define MAX_BARR 128
+struct barr { unsigned char *buf; int len; };
+static struct barr g_barr[MAX_BARR];
+static int g_barr_n = 0;
+static void *barr_new(int len) {
+  int i = g_barr_n++ % MAX_BARR;
+  if (g_barr[i].buf) free(g_barr[i].buf);
+  g_barr[i].buf = (unsigned char *)malloc(len > 0 ? len : 1);
+  g_barr[i].len = len;
+  return &g_barr[i];
+}
+static struct barr *barr_find(void *h) {
+  if ((char *)h >= (char *)g_barr && (char *)h < (char *)(g_barr + MAX_BARR))
+    return (struct barr *)h;
+  return NULL;
+}
+
+/* --- InputStream (FILE*) tracking --- */
+#define MAX_ASTREAMS 32
+struct astream { FILE *fp; long size; };
+static struct astream g_astreams[MAX_ASTREAMS];
+static int g_astream_n = 0;
+static void *asset_open(const char *path) {
+  char full[1200];
+  snprintf(full, sizeof(full), ASSET_BASE "%s", path ? path : "");
+  FILE *fp = fopen(full, "rb");
+  debugPrintf("asset: open(%s) -> %s\n", path ? path : "?",
+              fp ? "OK" : "FALHOU (sem arquivo)");
+  if (!fp) return NULL;
+  int i = g_astream_n++ % MAX_ASTREAMS;
+  if (g_astreams[i].fp) fclose(g_astreams[i].fp);
+  g_astreams[i].fp = fp;
+  fseek(fp, 0, SEEK_END);
+  g_astreams[i].size = ftell(fp);
+  fseek(fp, 0, SEEK_SET);
+  return &g_astreams[i];
+}
+static struct astream *astream_find(void *h) {
+  if ((char *)h >= (char *)g_astreams &&
+      (char *)h < (char *)(g_astreams + MAX_ASTREAMS))
+    return (struct astream *)h;
+  return NULL;
+}
+
+/* --- JNI byte-array functions --- */
+static void *jni_NewByteArray(void *env, int len) {
+  (void)env;
+  return barr_new(len);
+}
+static int jni_GetArrayLength_real(void *env, void *arr) {
+  (void)env;
+  struct barr *b = barr_find(arr);
+  return b ? b->len : 0;
+}
+static void *jni_GetByteArrayElements(void *env, void *arr, void *isCopy) {
+  (void)env;
+  if (isCopy) *(unsigned char *)isCopy = 0;
+  struct barr *b = barr_find(arr);
+  return b ? b->buf : NULL;
+}
+static void jni_ReleaseByteArrayElements(void *env, void *arr, void *elems,
+                                         int mode) {
+  (void)env; (void)arr; (void)elems; (void)mode;
+}
+static void jni_GetByteArrayRegion(void *env, void *arr, int start, int len,
+                                   void *buf) {
+  (void)env;
+  struct barr *b = barr_find(arr);
+  if (b && start >= 0 && len >= 0 && start + len <= b->len)
+    memcpy(buf, b->buf + start, len);
+}
+static void jni_SetByteArrayRegion(void *env, void *arr, int start, int len,
+                                   const void *buf) {
+  (void)env;
+  struct barr *b = barr_find(arr);
+  if (b && start >= 0 && len >= 0 && start + len <= b->len)
+    memcpy(b->buf + start, buf, len);
 }
 
 /* ---- Generic stub ---- */
@@ -152,8 +245,9 @@ static void *jni_GetStaticFieldID(void *env, void *clazz, const char *name,
   return &g_method_tags[FID_GENERIC];
 }
 
-/* CallObjectMethod (index 36) - variadic */
-static void *jni_CallObjectMethod(void *env, void *obj, void *methodID, ...) {
+/* CallObjectMethod — Unity (C++) usa a variante V (va_list); dispatch nela. */
+static void *jni_CallObjectMethodV(void *env, void *obj, void *methodID,
+                                   va_list ap) {
   (void)env;
   const char *nm = mid_name(methodID);
   debugPrintf("jni_shim: CallObjectMethod(%s)\n", nm ? nm : "?");
@@ -161,6 +255,13 @@ static void *jni_CallObjectMethod(void *env, void *obj, void *methodID, ...) {
   if (nm) {
     if (strcmp(nm, "getPackageName") == 0)
       return make_jstring("com.teamcherry.hollowknight");
+    /* AssetManager bridge */
+    if (strcmp(nm, "getAssets") == 0) return &g_assetmgr;
+    if ((strcmp(nm, "open") == 0 || strcmp(nm, "openNonAsset") == 0) &&
+        obj == &g_assetmgr) {
+      void *pathstr = va_arg(ap, void *);
+      return asset_open(resolve_jstring(pathstr)); /* NULL se nao existe */
+    }
     /* builders Android (Intent.addFlags/setData/...) retornam o proprio obj */
     if (strcmp(nm, "addFlags") == 0 || strcmp(nm, "setFlags") == 0 ||
         strcmp(nm, "setData") == 0 || strcmp(nm, "setAction") == 0 ||
@@ -170,6 +271,12 @@ static void *jni_CallObjectMethod(void *env, void *obj, void *methodID, ...) {
       return make_jstring("");
   }
   return &fake_obj;
+}
+static void *jni_CallObjectMethod(void *env, void *obj, void *methodID, ...) {
+  va_list ap; va_start(ap, methodID);
+  void *r = jni_CallObjectMethodV(env, obj, methodID, ap);
+  va_end(ap);
+  return r;
 }
 
 /* CallBooleanMethod (index 49) */
@@ -181,19 +288,47 @@ static unsigned char jni_CallBooleanMethod(void *env, void *obj,
   return 0;
 }
 
-/* CallIntMethod (index 61) */
-static jint jni_CallIntMethod(void *env, void *obj, void *methodID, ...) {
+/* CallIntMethod — variante V */
+static jint jni_CallIntMethodV(void *env, void *obj, void *methodID,
+                               va_list ap) {
   (void)env;
-  (void)obj;
-  (void)methodID;
+  const char *nm = mid_name(methodID);
+  struct astream *s = astream_find(obj);
+  if (s && nm) {
+    if (strcmp(nm, "read") == 0) {
+      void *barr = va_arg(ap, void *);
+      int off = va_arg(ap, int);
+      int len = va_arg(ap, int);
+      struct barr *b = barr_find(barr);
+      if (!b) return -1;
+      if (off < 0) off = 0;
+      if (off + len > b->len) len = b->len - off;
+      if (len <= 0) return -1;
+      size_t n = fread(b->buf + off, 1, (size_t)len, s->fp);
+      return n > 0 ? (int)n : -1; /* -1 = EOF */
+    }
+    if (strcmp(nm, "available") == 0) {
+      long pos = ftell(s->fp);
+      return (int)(s->size - pos);
+    }
+  }
   return 0;
+}
+static jint jni_CallIntMethod(void *env, void *obj, void *methodID, ...) {
+  va_list ap; va_start(ap, methodID);
+  jint r = jni_CallIntMethodV(env, obj, methodID, ap);
+  va_end(ap);
+  return r;
 }
 
 /* CallVoidMethod (index 94) */
 static void jni_CallVoidMethod(void *env, void *obj, void *methodID, ...) {
   (void)env;
-  (void)obj;
-  (void)methodID;
+  const char *nm = mid_name(methodID);
+  struct astream *s = astream_find(obj);
+  if (s && nm && strcmp(nm, "close") == 0) {
+    if (s->fp) { fclose(s->fp); s->fp = NULL; }
+  }
 }
 
 /* CallStaticObjectMethod (index 113) */
@@ -461,6 +596,13 @@ void jni_shim_init(void **out_vm, void **out_env) {
   jni_env_vtable[6] = (uintptr_t)jni_FindClass;
   jni_env_vtable[215] = (uintptr_t)jni_RegisterNatives;  /* recon: Unity */
   jni_env_vtable[219] = (uintptr_t)jni_GetJavaVM;        /* recon: Unity initJni */
+  /* AssetManager bridge: byte-array functions */
+  jni_env_vtable[171] = (uintptr_t)jni_GetArrayLength_real;
+  jni_env_vtable[176] = (uintptr_t)jni_NewByteArray;
+  jni_env_vtable[184] = (uintptr_t)jni_GetByteArrayElements;
+  jni_env_vtable[192] = (uintptr_t)jni_ReleaseByteArrayElements;
+  jni_env_vtable[200] = (uintptr_t)jni_GetByteArrayRegion;
+  jni_env_vtable[208] = (uintptr_t)jni_SetByteArrayRegion;
   jni_env_vtable[15] = (uintptr_t)jni_ExceptionOccurred;
   jni_env_vtable[17] = (uintptr_t)jni_ExceptionClear;
   jni_env_vtable[21] = (uintptr_t)jni_NewGlobalRef;
@@ -470,11 +612,11 @@ void jni_shim_init(void **out_vm, void **out_env) {
   jni_env_vtable[31] = (uintptr_t)jni_GetObjectClass;
   jni_env_vtable[33] = (uintptr_t)jni_GetMethodID;
   jni_env_vtable[34] = (uintptr_t)jni_CallObjectMethod;
-  jni_env_vtable[35] = (uintptr_t)jni_CallObjectMethod;    /* V variant */
+  jni_env_vtable[35] = (uintptr_t)jni_CallObjectMethodV;   /* V variant (va_list) */
   jni_env_vtable[37] = (uintptr_t)jni_CallBooleanMethod;
   jni_env_vtable[38] = (uintptr_t)jni_CallBooleanMethod;   /* V */
   jni_env_vtable[49] = (uintptr_t)jni_CallIntMethod;
-  jni_env_vtable[50] = (uintptr_t)jni_CallIntMethod;       /* V */
+  jni_env_vtable[50] = (uintptr_t)jni_CallIntMethodV;      /* V (va_list) */
   jni_env_vtable[61] = (uintptr_t)jni_CallVoidMethod;
   jni_env_vtable[62] = (uintptr_t)jni_CallVoidMethod;      /* V */
   jni_env_vtable[94] = (uintptr_t)jni_GetFieldID;
