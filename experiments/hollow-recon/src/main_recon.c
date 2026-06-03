@@ -142,30 +142,30 @@ int main(int argc, char **argv) {
   fprintf(stderr, "[10c] window=%p (janela SDL criada?)\n", (void *)egl_shim_get_window());
   fflush(NULL);
 
-  /* 11. nativeRecreateGfxState(api, Surface) — agora EGL = egl_shim */
-  void *gfx = jni_find_native("nativeRecreateGfxState");
-  fprintf(stderr, "[11] nativeRecreateGfxState @ %p\n", gfx);
-  if (gfx) {
-    static long fake_thiz = 0xA1, fake_surface = 0x5F;
-    void (*gfx_fn)(void *, void *, int, void *) =
-        (void (*)(void *, void *, int, void *))gfx;
-    fprintf(stderr, "------------- CHAMANDO nativeRecreateGfxState(0, surface) -------------\n");
-    gfx_fn(fake_env, &fake_thiz, 0, &fake_surface);
-    fprintf(stderr, "-----------------------------------------------------------------------\n");
-    fprintf(stderr, "[12] nativeRecreateGfxState RETORNOU\n");
+  /* === FASE 2: sequencia de init === */
+  /* 11. nativeRender PRIMEIRO — em muitas versoes do Unity o 1o nativeRender
+     dispara o engine init (dlopen libil2cpp + carrega dados). */
+  void *render = jni_find_native("nativeRender");
+  fprintf(stderr, "[11] nativeRender (1o = engine init?) @ %p\n", render);
+  if (render) {
+    static long t = 0xA1;
+    unsigned char (*rf)(void *, void *) = (unsigned char (*)(void *, void *))render;
+    fprintf(stderr, "----------------- CHAMANDO nativeRender() #1 -----------------\n");
+    unsigned char r = rf(fake_env, &t);
+    fprintf(stderr, "--------------------------------------------------------------\n");
+    fprintf(stderr, "[12] nativeRender #1 RETORNOU %d\n", r);
   }
 
-  /* 13. nativeRender() — o coracao. Aqui Unity inicializa engine/il2cpp/dados */
-  void *render = jni_find_native("nativeRender");
-  fprintf(stderr, "[13] nativeRender @ %p\n", render);
-  if (render) {
-    static long fake_thiz = 0xA1;
-    unsigned char (*render_fn)(void *, void *) =
-        (unsigned char (*)(void *, void *))render;
-    fprintf(stderr, "------------------- CHAMANDO nativeRender() -------------------\n");
-    unsigned char r = render_fn(fake_env, &fake_thiz);
-    fprintf(stderr, "--------------------------------------------------------------\n");
-    fprintf(stderr, "[14] nativeRender RETORNOU %d\n", r);
+  /* 13. nativeRecreateGfxState depois */
+  void *gfx = jni_find_native("nativeRecreateGfxState");
+  fprintf(stderr, "[13] nativeRecreateGfxState @ %p\n", gfx);
+  if (gfx) {
+    static long t = 0xA1, surf = 0x5F;
+    void (*gf)(void *, void *, int, void *) =
+        (void (*)(void *, void *, int, void *))gfx;
+    fprintf(stderr, "------ CHAMANDO nativeRecreateGfxState(0, surface) ------\n");
+    gf(fake_env, &t, 0, &surf);
+    fprintf(stderr, "[14] nativeRecreateGfxState RETORNOU\n");
   }
   return 0;
 }

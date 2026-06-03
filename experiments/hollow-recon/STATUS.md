@@ -28,7 +28,26 @@ pra portar Hollow Knight (Unity, Java-driven, sem `android_main`) ao Mali-450.
 libunity, ANTES de qualquer chamada EGL). Causa: **engine/player não inicializado** —
 está sendo chamado fora de ordem. A janela/EGL não é o problema (funcionam).
 
+## 🔑 DESCOBERTA (fase 2): como o Unity lê os dados
+Durante o init, o Unity chama via JNI:
+```
+GetMethodID(getAssets, ()Landroid/content/res/AssetManager;)
+CallObjectMethod(getAssets)
+NewStringUTF("bin/Data/boot.config")   <- 1o arquivo
+```
+→ **Unity lê os dados pelo `AssetManager` JAVA (JNI), NÃO pelo NDK AAssetManager.**
+Como controlamos o JNIEnv, dá pra implementar `getAssets` + `AssetManager.open/openFd`
+lendo dos arquivos REAIS extraídos. **Dados copiados pro device** em
+`/storage/hollow-recon/assets/bin/Data/` (413M: data.unity3d 303M, global-metadata.dat
+6.9M, boot.config, sharedassets*, Managed/).
+
 ## ▶️ PRÓXIMOS PASSOS
+0. **AssetManager bridge no jni_shim** (o desbloqueio agora):
+   - `getAssets()` → objeto AssetManager fake (tagged)
+   - `AssetManager.open(path)` → InputStream lendo `ASSET_BASE/path` (read/close)
+   - `AssetManager.openFd/openNonAssetFd(path)` → AssetFileDescriptor c/ fd real
+     (data.unity3d 303M é mmap'd → precisa fd + offset + length)
+   - byte[] handling (GetByteArrayElements/SetByteArrayRegion)
 1. **Sequência de init correta** (UnityPlayer.java): reverse-engineer a ordem real das
    chamadas nativas. Provavelmente o engine init acontece no 1º `nativeRender` OU há um
    `UnityInitApplication*` a chamar antes do gfx. Decompilar UnityPlayer.java (2020.2) ajuda.
