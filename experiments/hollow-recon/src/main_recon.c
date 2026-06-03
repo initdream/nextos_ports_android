@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 /*
  * main_recon.c — RECON do Unity (Hollow Knight).
  *
@@ -16,6 +17,7 @@
 #include <signal.h>
 #include <ucontext.h>
 #include <unistd.h>
+#include <dlfcn.h>
 
 #include "so_util.h"
 #include "imports.h"
@@ -34,28 +36,32 @@ FILE *stderr_fake;               /* exigido por imports.h */
 /* modulos multi-modulo (compartilhados com recon_egl.c p/ dlopen/dlsym bridge) */
 so_module *g_m_il2cpp = NULL;
 so_module *g_m_unity = NULL;
+void *g_il2_text = NULL;
+size_t g_il2_size = 0;
 
 typedef int jint;
 typedef jint (*JNI_OnLoad_t)(void *vm, void *reserved);
 
+extern void *g_il2_text; extern size_t g_il2_size;  /* def em main p/ ranges */
 static void on_segv(int sig, siginfo_t *si, void *uc_) {
   (void)sig;
   ucontext_t *uc = (ucontext_t *)uc_;
   uintptr_t pc = uc->uc_mcontext.pc;
   uintptr_t lr = uc->uc_mcontext.regs[30];
   uintptr_t tb = (uintptr_t)text_base;
-  char buf[256];
-  int n;
-  if (pc >= tb && pc < tb + text_size)
-    n = snprintf(buf, sizeof(buf),
-                 "\n*** SEGV fault=%p pc=libunity+0x%lx lr=+0x%lx ***\n",
-                 si->si_addr, (unsigned long)(pc - tb),
-                 (lr >= tb && lr < tb + text_size) ? (unsigned long)(lr - tb)
-                                                   : 0xffffffffUL);
-  else
-    n = snprintf(buf, sizeof(buf),
-                 "\n*** SEGV fault=%p pc=%p [FORA libunity] ***\n", si->si_addr,
-                 (void *)pc);
+  char buf[512];
+  const char *where = "system/stack";
+  unsigned long off = pc;
+  if (pc >= tb && pc < tb + text_size) { where = "libunity"; off = pc - tb; }
+  else if (g_il2_text && pc >= (uintptr_t)g_il2_text &&
+           pc < (uintptr_t)g_il2_text + g_il2_size) {
+    where = "libil2cpp"; off = pc - (uintptr_t)g_il2_text;
+  }
+  Dl_info info; const char *fn = "?"; const char *lib = "?";
+  if (dladdr((void *)pc, &info)) { fn = info.dli_sname ? info.dli_sname : "?"; lib = info.dli_fname ? info.dli_fname : "?"; }
+  int n = snprintf(buf, sizeof(buf),
+      "\n*** SEGV fault=%p pc=%s+0x%lx lr=%p ***\n    dladdr: %s in %s\n",
+      si->si_addr, where, off, (void *)lr, fn, lib);
   if (write(2, buf, n) < 0) { /* ignore */ }
   _exit(139);
 }
@@ -99,6 +105,7 @@ int main(int argc, char **argv) {
   so_resolve(dynlib_functions, dynlib_numfunctions, 0);
   so_execute_init_array();
   g_m_il2cpp = so_save();
+  g_il2_text = text_base; g_il2_size = text_size;
   fprintf(stderr, "[A] libil2cpp OK (text=%p+0x%zx)\n", text_base, text_size);
 
   /* (B) libunity */

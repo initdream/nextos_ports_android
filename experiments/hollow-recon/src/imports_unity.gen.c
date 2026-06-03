@@ -842,13 +842,25 @@ DynLibFunction dynlib_functions[] = {
 };
 size_t dynlib_numfunctions = sizeof(dynlib_functions)/sizeof(dynlib_functions[0]);
 
-// resolve os passthrough via dlsym(RTLD_DEFAULT) em runtime
+#include <string.h>
+/* alias bionic->glibc (nomes/semantica diferentes) */
+static void *resolve_bionic(const char *nm){
+  /* setjmp/longjmp: usar _setjmp/_longjmp (glibc SEM signal mask, igual bionic;
+     o setjmp normal do glibc tem jmpbuf maior e ESTOURA o buffer bionic) */
+  if(strcmp(nm,"setjmp")==0)   return dlsym(RTLD_DEFAULT,"_setjmp");
+  if(strcmp(nm,"longjmp")==0)  return dlsym(RTLD_DEFAULT,"_longjmp");
+  if(strcmp(nm,"__errno")==0)  return dlsym(RTLD_DEFAULT,"__errno_location");
+  if(strcmp(nm,"__assert2")==0)return dlsym(RTLD_DEFAULT,"__assert_fail");
+  return dlsym(RTLD_DEFAULT, nm);
+}
+/* dlsym em TODOS os simbolos: o que existe no glibc vira passthrough real
+   (sobrescreve o stub). So os Android-specific ficam stub. */
 void recon_fill_passthrough(void){
+  int real=0, stub=0;
   for(size_t i=0;i<dynlib_numfunctions;i++){
-    if(dynlib_functions[i].func==0){
-      void *p = dlsym(RTLD_DEFAULT, dynlib_functions[i].symbol);
-      if(p) dynlib_functions[i].func=(uintptr_t)p;
-      else fprintf(stderr,"[passthrough FALHOU dlsym] %s\\n", dynlib_functions[i].symbol);
-    }
+    void *p = resolve_bionic(dynlib_functions[i].symbol);
+    if(p){ dynlib_functions[i].func=(uintptr_t)p; real++; }
+    else stub++;
   }
+  fprintf(stderr,"[passthrough] %d reais + %d stubs (setjmp->_setjmp)\n", real, stub);
 }

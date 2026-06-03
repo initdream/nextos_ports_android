@@ -112,7 +112,10 @@ static const char *mid_name(void *tag) {
 #include <stdarg.h>
 #define ASSET_BASE "/storage/hollow-recon/assets/"
 
-static int g_assetmgr; /* tag do objeto AssetManager */
+static int g_assetmgr;   /* tag do objeto AssetManager */
+static int g_empty_list; /* tag de uma java.util.List vazia */
+static int g_iterator;   /* tag de um Iterator vazio */
+static int g_appinfo;    /* tag de ApplicationInfo */
 
 /* --- byte[] tracking (backing real) --- */
 #define MAX_BARR 128
@@ -257,6 +260,13 @@ static void *jni_CallObjectMethodV(void *env, void *obj, void *methodID,
       return make_jstring("com.teamcherry.hollowknight");
     /* AssetManager bridge */
     if (strcmp(nm, "getAssets") == 0) return &g_assetmgr;
+    /* listas vazias (queryIntentActivities, etc.) + iterator vazio */
+    if (strcmp(nm, "queryIntentActivities") == 0 ||
+        strcmp(nm, "queryBroadcastReceivers") == 0 ||
+        strcmp(nm, "getSystemSharedLibraryNames") == 0)
+      return &g_empty_list;
+    if (strcmp(nm, "iterator") == 0) return &g_iterator;
+    if (strcmp(nm, "getApplicationInfo") == 0) return &g_appinfo;
     if ((strcmp(nm, "open") == 0 || strcmp(nm, "openNonAsset") == 0) &&
         obj == &g_assetmgr) {
       void *pathstr = va_arg(ap, void *);
@@ -284,7 +294,11 @@ static unsigned char jni_CallBooleanMethod(void *env, void *obj,
                                            void *methodID, ...) {
   (void)env;
   (void)obj;
-  (void)methodID;
+  const char *nm = mid_name(methodID);
+  if (nm) {
+    if (strcmp(nm, "isEmpty") == 0) return 1;  /* lista vazia */
+    if (strcmp(nm, "hasNext") == 0) return 0;  /* iterator vazio */
+  }
   return 0;
 }
 
@@ -293,6 +307,7 @@ static jint jni_CallIntMethodV(void *env, void *obj, void *methodID,
                                va_list ap) {
   (void)env;
   const char *nm = mid_name(methodID);
+  if (nm && strcmp(nm, "size") == 0) return 0; /* List/Collection vazia */
   struct astream *s = astream_find(obj);
   if (s && nm) {
     if (strcmp(nm, "read") == 0) {
