@@ -207,10 +207,12 @@ static void my_glViewport(int x, int y, int w, int h) {
 static void (*real_glVAP)(unsigned, int, unsigned, unsigned char, int,
                           const void *) = NULL;
 // FIX peds pretos/bugados: librw usa GL_TEXTURE_MAX_LEVEL (GLES3/desktop, NÃO
-// existe em GLES2) p/ limitar a cadeia de mipmaps. No GLES2 isso é ignorado ->
-// texturas com mipmap incompleto ficam INCOMPLETAS -> renderizam PRETO. Os NPCs
-// usam texturas mipmapeadas (cadeia parcial) -> pretas; o player não. Forçamos
-// o min filter p/ GL_LINEAR (sem mipmap) -> completude não exigida -> renderiza.
+// existe em GLES2) p/ limitar a cadeia de mipmaps -> no GLES2 é ignorado ->
+// textura com mipmap incompleto = INCOMPLETA -> renderiza PRETO (NPCs).
+// (Tentamos glGenerateMipmap mas não completa no Mali -> NPCs voltavam pretos.)
+// Fix que funciona: forçar o min filter de *_MIPMAP_* p/ GL_LINEAR (sem mipmap)
+// -> completude não exigida -> renderiza. Efeito colateral: shimmer no reflexo
+// do sol na água (aceitável).
 static void (*real_glTexParameteri)(unsigned, unsigned, int) = NULL;
 static void my_glTexParameteri(unsigned target, unsigned pname, int param) {
   if (pname == 0x2801) { // GL_TEXTURE_MIN_FILTER
