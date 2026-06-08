@@ -130,3 +130,18 @@ Base limpa que BOOTA reproduz o crash em `GameRenderer::Setup` libGame+**0x8a0c0
 - **gamestate forcing**: o bully-NX força gamestate 0→2 só em **frame>240** (jni_patch.c ~1380); o crash é frame ~31, MUITO antes. Não é isso.
 **Refs à string "whitetexture" (x86_64, .rodata 0x5caaf6):** 0x88a852, 0x8a09d1 (GameRenderer::Setup, logo antes do crash), 0x97ef2e, 0xedb0fb (GameSprite::Draw). **TODAS são GET — nenhuma CRIA.** A whitetexture é criada de forma opaca (manifest/hash de default resources), NÃO por string literal.
 **PRÓXIMO (sessão dedicada de RE):** achar O QUE popula o ResourceManager com os recursos default (whitetexture). Candidatos: (a) um init de "default resources" que não roda na nossa ordem/threading (race GameRenderer::Setup vs Initialize); (b) portar MAIS hooks do bully-NX patch_game que faltam (OrigInitialize trace, BullySettings_Load/ResetDisplay, LoadingScreen) — bully-NX RODA no Switch, então tem hook(s) que destravam isso. Método: rodar bully-NX-style com TODOS os hooks portados e ver se a whitetexture aparece; OU rastrear ResourceManager::Add / o populate dos defaults no disasm.
+
+### Tentativas que NÃO moveram o crash (ainda 0x8a0c0d whitetexture):
+- re-seed EGL globals pós-surface (mantido, correto).
+- hook OS_ScreenGetWidth/Height=1280/720 + OS_CanGameRender=1 + OS_IsGameSuspended=0 (mantido).
+- hook __cxa_guard_acquire/release/abort (versão simples Itanium) (mantido).
+Nenhum destravou -> a whitetexture NÃO depende de: GL ctx, gamestate, screen dims, render gates, cxa_guard.
+### HIPÓTESE RESTANTE + PRÓXIMO ATAQUE:
+**RACE de ordem entre threads.** Thread 54 (render) roda GameRenderer::Setup ANTES da thread
+GameMain criar os recursos default (whitetexture). No jogo real há sync. PRÓXIMO:
+1. Identificar se Thread 54 = render thread vs GameMain (gdb `thread apply all bt` no crash).
+2. Achar o CREATE da whitetexture: o Get em 0x8a09d1 hasheia "whitetexture"; achar o
+   ResourceManager::Add com o MESMO hash (não usa string literal -> rastrear a hash fn + call site),
+   OU o populate de "default resources" no init. Ver QUE thread/quando cria.
+3. Alternativa brute-force: portar TODOS os 101 hooks do bully-NX patch_game de uma vez (bully-NX
+   RODA no Switch), confirmar que passa, depois bisectar qual hook era essencial.

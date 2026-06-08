@@ -237,6 +237,33 @@ static void hook_egl(void) {
   hook_x64(so_symbol(&mod_game, "_Z20OS_ThreadMakeCurrentv"), (uintptr_t)os_thread_makecurrent);
 }
 
+/* ---- hooks de tela/render como FUNÇÃO (bully-NX hooka; nós só setávamos flags
+ * srp). GameRenderer::Setup pode dimensionar a textura/fbo pela tela -> se
+ * Width/Height retornam 0, a whitetexture sai 0x0 e falha (NULL). ---- */
+static int os_screen_w(void) { return 1280; }
+static int os_screen_h(void) { return 720; }
+static int os_can_render(void) { return 1; }
+static int os_is_suspended(void) { return 0; }
+static void hook_screen(void) {
+  hook_x64(so_symbol(&mod_game, "_Z17OS_ScreenGetWidthv"), (uintptr_t)os_screen_w);
+  hook_x64(so_symbol(&mod_game, "_Z18OS_ScreenGetHeightv"), (uintptr_t)os_screen_h);
+  hook_x64(so_symbol(&mod_game, "_Z16OS_CanGameRenderv"), (uintptr_t)os_can_render);
+  hook_x64(so_symbol(&mod_game, "_Z18OS_IsGameSuspendedv"), (uintptr_t)os_is_suspended);
+}
+
+/* ---- __cxa_guard: o guard de static do jogo (NDK) pode travar/falhar no
+ * ambiente so-loader (futex/pthread) -> statics C++ não inicializam (ex: o
+ * registro dos recursos default / whitetexture). Substituímos por uma versão
+ * simples correta (Itanium ABI: byte 0 = inicializado), igual bully-NX. ---- */
+static int my_cxa_guard_acquire(char *g) { return g && *g == 0; }
+static void my_cxa_guard_release(char *g) { if (g) *g = 1; }
+static void my_cxa_guard_abort(char *g) { (void)g; }
+static void hook_cxa(void) {
+  hook_x64(so_symbol(&mod_game, "__cxa_guard_acquire"), (uintptr_t)my_cxa_guard_acquire);
+  hook_x64(so_symbol(&mod_game, "__cxa_guard_release"), (uintptr_t)my_cxa_guard_release);
+  hook_x64(so_symbol(&mod_game, "__cxa_guard_abort"), (uintptr_t)my_cxa_guard_abort);
+}
+
 /* ---- orquestração de thread (porta do bully-NX, adaptada x86_64) ----
  * O engine lê handle[0x69]=running (OS_ThreadIsRunning) e handle[0x28]=pthread_t
  * (OS_ThreadWait). Sem gerenciar isso, o sync de thread quebra e o renderer/
@@ -333,6 +360,8 @@ void jni_load(void) {
   hook_nvapk();
   hook_egl();
   hook_threads(); /* gerência de thread Switch-safe -> destrava GameMain/whitetexture */
+  hook_screen();  /* OS_ScreenGetWidth/Height + render gates como função */
+  hook_cxa();     /* __cxa_guard simples -> statics C++ (whitetexture?) inicializam */
   asset_archive_init();
 
   /* resolve as funcoes nativas estaticas (JNI estatico, v1.4.311) */
