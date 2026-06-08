@@ -254,3 +254,13 @@ glClear cor) -> MENU/MUNDO na TV. swap via eglSwapBuffers do game + SDL_GL_SwapW
 **Screenshot: /home/felipe/BULLY-MALI450-PRIMEIRO-RENDER.png**
 **FALTA (polish):** controle (jni_shim ja tem SDL gamecontroller; testar/gptokeyb), audio (OpenAL,
 funcionava no PC), empacotar ES, gerar gamecontrollerdb. Mas o CORE esta FEITO.
+
+## 🎮🏆 CONTROLE FUNCIONANDO + MENU PRINCIPAL (2026-06-08) — JOGÁVEL
+Felipe: "controle PERFEITO". O jogo NÃO faz polling (GetGamepadButtons nunca chamado); usa EVENTOS
+JNI. FIX: pump_gamepad() no loop empurra implOnGamepadButtonDown/Up/AxesChanged/CountChanged a cada
+frame (abre SDL_GameController "USB Gamepad" via gamecontrollerdb do sistema; init SDL_INIT_GAMECONTROLLER
++ jni_init_input que NUNCA eram chamados). Mapa SDL->GamepadButton enum libGame (0=A 1=B 2=X 3=Y
+4=START 5=BACK 6=L3 7=R3 8-11=NAV 12-15=DPAD 16=LB 18=RB 17/19=gatilhos). **MENU PRINCIPAL renderiza
+PERFEITO** (arte da capa Jimmy, logo, cores) — navegável. Screenshot bully_MENU_PRINCIPAL.png.
+BULLY JOGÁVEL no Mali-450 (render+som+controle). Commit 81d496b. Falta: corpos 3D dos personagens
+(skinning), empacotar ES.
