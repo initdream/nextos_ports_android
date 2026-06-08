@@ -206,6 +206,29 @@ int main(int argc, char *argv[]) {
   // ---- Módulo B: libreVC.so (a engine) ----
   load_module(GAME_SO, GAME_HEAP_MB, comb, comb_n);
 
+  // PATCH menu de Gráficos (fix crash): o desenho da resolução faz
+  // AsciiToUnicode(_psGetVideoModeList()[m_nDisplayVideoMode]); m_nDisplayVideoMode
+  // fica corrompido/OOB com nossa resolução forçada -> string nula -> SIGSEGV.
+  // Em 0x1a645c o código carrega o índice: `ldrsw x8,[x19,#96]` (0xb9816e68).
+  // Trocamos por `movz x8,#1` (0xd2800028) -> sempre usa a 1ª entrada exclusiva
+  // (válida) da lista. (0x2d2890 confirmado = _psGetVideoModeList.)
+  {
+    uintptr_t addr = (uintptr_t)text_base + 0x1a645c;
+    uint32_t *p = (uint32_t *)addr;
+    uintptr_t pg = addr & ~0xFFFUL;
+    if (mprotect((void *)pg, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+      if (*p == 0xb9806268) { // confirma `ldrsw x8,[x19,#96]` antes de patchar
+        *p = 0xd2800028;      // movz x8, #1
+        debugPrintf("patch: menu Graphics resolução -> índice fixo 1 (fix crash)\n");
+      } else {
+        debugPrintf("patch: opcode inesperado em 0x1a645c (0x%x), NÃO patcheado\n",
+                    *p);
+      }
+      mprotect((void *)pg, 0x2000, PROT_READ | PROT_EXEC);
+      so_flush_caches();
+    }
+  }
+
 
   // ---- Entrada SDL_main ----
   void (*sdl_set_main_ready)(void) = dlsym(RTLD_DEFAULT, "SDL_SetMainReady");
