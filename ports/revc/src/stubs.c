@@ -259,6 +259,53 @@ static void my_glViewport(int x, int y, int w, int h) {
 static void (*real_glVAP)(unsigned, int, unsigned, unsigned char, int,
                           const void *) = NULL;
 static int g_vap_log = 0;
+// SKIN fix: o upload das matrizes de osso é glUniformMatrix4fv(loc, 64, ...);
+// como reduzimos o array do shader p/ [52], limitamos o count (só o de ossos
+// tem count grande; u_proj/view/world têm count=1).
+// FIX peds pretos/bugados: librw usa GL_TEXTURE_MAX_LEVEL (GLES3/desktop, NÃO
+// existe em GLES2) p/ limitar a cadeia de mipmaps. No GLES2 isso é ignorado ->
+// texturas com mipmap incompleto ficam INCOMPLETAS -> renderizam PRETO. Os NPCs
+// usam texturas mipmapeadas (cadeia parcial) -> pretas; o player não. Forçamos
+// o min filter p/ GL_LINEAR (sem mipmap) -> completude não exigida -> renderiza.
+static void (*real_glTexParameteri)(unsigned, unsigned, int) = NULL;
+static void my_glTexParameteri(unsigned target, unsigned pname, int param) {
+  if (pname == 0x2801) { // GL_TEXTURE_MIN_FILTER
+    if (param == 0x2700 || param == 0x2701 || param == 0x2702 ||
+        param == 0x2703)        // *_MIPMAP_*
+      param = 0x2601;           // GL_LINEAR
+  }
+  if (pname == 0x813D)          // GL_TEXTURE_MAX_LEVEL (inválido em GLES2)
+    return;                     // ignora (evita GL_INVALID_ENUM)
+  if (real_glTexParameteri)
+    real_glTexParameteri(target, pname, param);
+}
+
+// DIAG: peds usam textura comprimida (DXT/s3tc)? Mali-450 raw não suporta.
+static void (*real_glCompressedTexImage2D)(unsigned, int, unsigned, int, int,
+                                           int, int, const void *) = NULL;
+static int g_ctex_log = 0;
+static void my_glCompressedTexImage2D(unsigned tgt, int lvl, unsigned ifmt,
+                                      int w, int h, int border, int isz,
+                                      const void *data) {
+  if (g_ctex_log < 30) {
+    fprintf(stderr, "[CTEX] internalformat=0x%x %dx%d size=%d\n", ifmt, w, h,
+            isz);
+    fflush(stderr);
+    g_ctex_log++;
+  }
+  if (real_glCompressedTexImage2D)
+    real_glCompressedTexImage2D(tgt, lvl, ifmt, w, h, border, isz, data);
+}
+
+#define REVC_BONES 52
+static void (*real_glUniformMatrix4fv)(int, int, unsigned char,
+                                       const float *) = NULL;
+static void my_glUniformMatrix4fv(int loc, int count, unsigned char transpose,
+                                  const float *v) {
+  // pass-through (clamp de osso revertido — não era a causa)
+  if (real_glUniformMatrix4fv)
+    real_glUniformMatrix4fv(loc, count, transpose, v);
+}
 static void my_glVertexAttribPointer(unsigned idx, int size, unsigned type,
                                      unsigned char norm, int stride,
                                      const void *ptr) {
@@ -284,8 +331,28 @@ static void my_glLinkProgram(unsigned prog) {
   if (real_glGetProgramiv)
     real_glGetProgramiv(prog, 0x8B82 /*LINK_STATUS*/, &st);
   static int n = 0;
-  if (n++ < 8)
+  if (n++ < 12)
     fprintf(stderr, "[GLDIAG] glLinkProgram %u -> link_status=%d\n", prog, st);
+  if (n == 1) {
+    void (*gi)(unsigned, int *) =
+        (void (*)(unsigned, int *))dlsym(RTLD_DEFAULT, "glGetIntegerv");
+    const char *(*gs)(unsigned) =
+        (const char *(*)(unsigned))dlsym(RTLD_DEFAULT, "glGetString");
+    int vu = -1, va = -1, vt = -1;
+    if (gi) {
+      gi(0x8DFB, &vu); // GL_MAX_VERTEX_UNIFORM_VECTORS
+      gi(0x8869, &va); // GL_MAX_VERTEX_ATTRIBS
+      gi(0x8B4C, &vt); // GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS
+    }
+    fprintf(stderr,
+            "[GLCAPS] MAX_VERTEX_UNIFORM_VECTORS=%d MAX_VERTEX_ATTRIBS=%d "
+            "MAX_VERTEX_TEXTURE_UNITS=%d\n",
+            vu, va, vt);
+    if (gs)
+      fprintf(stderr, "[GLCAPS] RENDERER=%s | VERSION=%s\n", gs(0x1F01),
+              gs(0x1F02));
+    fflush(stderr);
+  }
 }
 
 // patch 012: GLES2 não aceita internalformat "sized" (GL_RGBA8 etc.) no
@@ -297,9 +364,10 @@ static int g_tex_log = 0;
 static void my_glTexImage2D(unsigned tgt, int lvl, int ifmt, int w, int h,
                             int bord, unsigned fmt, unsigned type,
                             const void *px) {
-  if (g_tex_log < 80 && lvl == 0) {
-    fprintf(stderr, "[TEX] ifmt=0x%x fmt=0x%x type=0x%x %dx%d\n", ifmt, fmt,
-            type, w, h);
+  if (g_tex_log < 400 && lvl == 0) {
+    int npot = ((w & (w - 1)) != 0) || ((h & (h - 1)) != 0);
+    fprintf(stderr, "[TEX] ifmt=0x%x fmt=0x%x type=0x%x %dx%d%s\n", ifmt, fmt,
+            type, w, h, npot ? " NPOT!" : "");
     g_tex_log++;
   }
   switch (ifmt) {
@@ -357,6 +425,21 @@ void *my_SDL_GL_GetProcAddress(const char *name) {
       real_glVAP = (void (*)(unsigned, int, unsigned, unsigned char, int,
                              const void *))p;
       return (void *)&my_glVertexAttribPointer;
+    }
+    if (!strcmp(name, "glUniformMatrix4fv")) {
+      real_glUniformMatrix4fv =
+          (void (*)(int, int, unsigned char, const float *))p;
+      return (void *)&my_glUniformMatrix4fv;
+    }
+    if (!strcmp(name, "glTexParameteri")) {
+      real_glTexParameteri = (void (*)(unsigned, unsigned, int))p;
+      return (void *)&my_glTexParameteri;
+    }
+    if (!strcmp(name, "glCompressedTexImage2D")) {
+      real_glCompressedTexImage2D =
+          (void (*)(unsigned, int, unsigned, int, int, int, int,
+                    const void *))p;
+      return (void *)&my_glCompressedTexImage2D;
     }
     if (!strcmp(name, "glLinkProgram")) {
       real_glLinkProgram = (void (*)(unsigned))p;
