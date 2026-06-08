@@ -68,10 +68,6 @@ struct SDL_Window *egl_shim_get_window(void);
 // Pre-create the SDL window+context from main thread
 void egl_shim_create_window(void);
 
-// Input capture (SDL -> Android keycode) for nativeInjectEvent
-void egl_shim_open_input(void);
-int egl_shim_next_key(int *action, int *keycode, int *source);
-
 // Mutex hooks — call from pthread_mutex_lock/unlock wrappers
 // to detect outermost EndCriticalSectionGL and release GL
 void egl_shim_on_mutex_post_lock(void *mutex_id);

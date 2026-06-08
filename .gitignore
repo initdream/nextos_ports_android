@@ -36,3 +36,17 @@ ports/*/*.swap
 ports/bully/bully
 mem.log
 bully.log
+
+# dados/libs locais GRANDES (>100MB, NUNCA stagear)
+experiments/*/gamefiles/
+experiments/*/gamefiles-arm64/
+experiments/*-pc/gamefiles/
+
+# referencias de terceiros (nao distribuir)
+experiments/bully/ref-*/
+
+# binarios compilados (build artifacts -- gerados por build.sh)
+ports/gtavc/gtavc
+ports/revc/revc
+experiments/hollow-recon/hollow-recon-no
+experiments/hollow-recon/evdev2key

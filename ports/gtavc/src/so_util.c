@@ -1,13 +1,19 @@
 /*
- * so_util.c -- utils to load and hook .so modules
+ * so_util.c (armhf / ARM 32-bit) -- carrega e faz hook de .so Android armeabi-v7a
  *
- * Based on max_arm64 by Jaakko Lukkari / fgsfds / Andy Nguyen
+ * Port do so_util arm64 do framework nextos_ports_android p/ ARM 32-bit.
+ * Diferenças-chave vs arm64:
+ *   - Elf32_* em vez de Elf64_*, ELFCLASS32, EM_ARM
+ *   - Relocações REL (.rel.dyn/.rel.plt, Elf32_Rel SEM r_addend) — o addend é
+ *     o valor IMPLÍCITO já gravado no alvo (*ptr). Android armeabi-v7a usa REL.
+ *   - Tipos R_ARM_* (ABS32=2, GLOB_DAT=21, JUMP_SLOT=22, RELATIVE=23)
+ *   - hook_arm (ARM + Thumb) em vez de hook_arm64
  */
-
 #include <assert.h>
 #include <elf.h>
 #include <errno.h>
 #include <malloc.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,8 +24,20 @@
 #include "so_util.h"
 #include "util.h"
 
-#ifndef EM_AARCH64
-#define EM_AARCH64 183
+#ifndef EM_ARM
+#define EM_ARM 40
+#endif
+#ifndef R_ARM_ABS32
+#define R_ARM_ABS32 2
+#endif
+#ifndef R_ARM_GLOB_DAT
+#define R_ARM_GLOB_DAT 21
+#endif
+#ifndef R_ARM_JUMP_SLOT
+#define R_ARM_JUMP_SLOT 22
+#endif
+#ifndef R_ARM_RELATIVE
+#define R_ARM_RELATIVE 23
 #endif
 
 void *text_base, *text_virtbase;
@@ -33,53 +51,31 @@ static size_t load_size;
 
 static void *so_base;
 
-static Elf64_Ehdr *elf_hdr;
-static Elf64_Phdr *prog_hdr;
-static Elf64_Shdr *sec_hdr;
-static Elf64_Sym *syms;
+static Elf32_Ehdr *elf_hdr;
+static Elf32_Phdr *prog_hdr;
+static Elf32_Shdr *sec_hdr;
+static Elf32_Sym *syms;
 static int num_syms;
 
 static char *shstrtab;
 static char *dynstrtab;
 
-/* ===== multi-modulo: salva/restaura o estado dos globais ===== */
-struct so_module {
-  void *text_base, *text_virtbase, *data_base, *data_virtbase;
-  void *load_base, *load_virtbase, *so_base;
-  size_t text_size, data_size, load_size;
-  Elf64_Ehdr *elf_hdr; Elf64_Phdr *prog_hdr; Elf64_Shdr *sec_hdr;
-  Elf64_Sym *syms; int num_syms; char *shstrtab, *dynstrtab;
-};
-so_module *so_save(void) {
-  so_module *m = (so_module *)malloc(sizeof(so_module));
-  m->text_base = text_base; m->text_virtbase = text_virtbase;
-  m->data_base = data_base; m->data_virtbase = data_virtbase;
-  m->load_base = load_base; m->load_virtbase = load_virtbase;
-  m->so_base = so_base;
-  m->text_size = text_size; m->data_size = data_size; m->load_size = load_size;
-  m->elf_hdr = elf_hdr; m->prog_hdr = prog_hdr; m->sec_hdr = sec_hdr;
-  m->syms = syms; m->num_syms = num_syms;
-  m->shstrtab = shstrtab; m->dynstrtab = dynstrtab;
-  return m;
-}
-void so_use(so_module *m) {
-  text_base = m->text_base; text_virtbase = m->text_virtbase;
-  data_base = m->data_base; data_virtbase = m->data_virtbase;
-  load_base = m->load_base; load_virtbase = m->load_virtbase;
-  so_base = m->so_base;
-  text_size = m->text_size; data_size = m->data_size; load_size = m->load_size;
-  elf_hdr = m->elf_hdr; prog_hdr = m->prog_hdr; sec_hdr = m->sec_hdr;
-  syms = m->syms; num_syms = m->num_syms;
-  shstrtab = m->shstrtab; dynstrtab = m->dynstrtab;
-}
-
-void hook_arm64(uintptr_t addr, uintptr_t dst) {
+/* Hook ARM 32-bit. Detecta Thumb pelo bit0 do endereço (ponteiros Thumb têm LSB=1). */
+void hook_arm(uintptr_t addr, uintptr_t dst) {
   if (addr == 0)
     return;
-  uint32_t *hook = (uint32_t *)addr;
-  hook[0] = 0x58000051u; // LDR X17, #0x8
-  hook[1] = 0xd61f0220u; // BR X17
-  *(uint64_t *)(hook + 2) = dst;
+  if (addr & 1) {
+    /* Thumb-2: LDR.W PC, [PC] ; .word dst  (alinhar em 2 bytes) */
+    uint16_t *hook = (uint16_t *)(addr & ~1u);
+    hook[0] = 0xf8df; /* LDR.W PC, [PC, #0] */
+    hook[1] = 0xf000;
+    *(uint32_t *)(hook + 2) = dst;
+  } else {
+    /* ARM: LDR PC, [PC, #-4] ; .word dst */
+    uint32_t *hook = (uint32_t *)addr;
+    hook[0] = 0xe51ff004u; /* LDR PC, [PC, #-4] */
+    hook[1] = (uint32_t)dst;
+  }
 }
 
 void so_make_text_writable(void) {
@@ -120,8 +116,8 @@ static int protect_range(void *start, size_t len, int prot) {
   size_t head = addr - page_base;
   size_t plen = round_up(len + head, (size_t)ps);
   if (mprotect((void *)page_base, plen, prot) != 0) {
-    debugPrintf("mprotect(%p, %zu, 0x%x) failed: %s\n", (void *)page_base,
-                plen, prot, strerror(errno));
+    debugPrintf("mprotect(%p, %zu, 0x%x) failed: %s\n", (void *)page_base, plen,
+                prot, strerror(errno));
     return -1;
   }
   return 0;
@@ -129,12 +125,12 @@ static int protect_range(void *start, size_t len, int prot) {
 
 void so_finalize(void) {
   if (protect_range(text_virtbase, text_size, PROT_READ | PROT_EXEC) != 0) {
-    fatal_error("Error: could not set RX on text at %p (size %zu)",
-                text_virtbase, text_size);
+    fatal_error("Error: could not set RX on text at %p (size %zu)", text_virtbase,
+                text_size);
   }
   if (protect_range(data_virtbase, data_size, PROT_READ | PROT_WRITE) != 0) {
-    fatal_error("Error: could not set RW on data at %p (size %zu)",
-                data_virtbase, data_size);
+    fatal_error("Error: could not set RW on data at %p (size %zu)", data_virtbase,
+                data_size);
   }
 }
 
@@ -175,39 +171,38 @@ int so_load(const char *filename, void *base, size_t max_size) {
     goto err_free_so;
   }
 
-  elf_hdr = (Elf64_Ehdr *)so_base;
+  elf_hdr = (Elf32_Ehdr *)so_base;
 
-  if (elf_hdr->e_ident[EI_CLASS] != ELFCLASS64) {
-    debugPrintf("so_load: Not a 64-bit ELF file\n");
+  if (elf_hdr->e_ident[EI_CLASS] != ELFCLASS32) {
+    debugPrintf("so_load: Not a 32-bit ELF file\n");
     res = -1;
     goto err_free_so;
   }
 
-  if (elf_hdr->e_machine != EM_AARCH64) {
-    debugPrintf("so_load: Not an AArch64 ELF (machine=%d)\n",
-                elf_hdr->e_machine);
+  if (elf_hdr->e_machine != EM_ARM) {
+    debugPrintf("so_load: Not an ARM ELF (machine=%d)\n", elf_hdr->e_machine);
     res = -1;
     goto err_free_so;
   }
 
-  debugPrintf("so_load: ELF64 AArch64, %d program headers, %d section headers\n",
+  debugPrintf("so_load: ELF32 ARM, %d program headers, %d section headers\n",
               elf_hdr->e_phnum, elf_hdr->e_shnum);
 
-  if (elf_hdr->e_phoff + (elf_hdr->e_phnum * sizeof(Elf64_Phdr)) > so_size) {
+  if (elf_hdr->e_phoff + (elf_hdr->e_phnum * sizeof(Elf32_Phdr)) > so_size) {
     debugPrintf("so_load: Program headers extend beyond file\n");
     res = -1;
     goto err_free_so;
   }
 
-  prog_hdr = (Elf64_Phdr *)((uintptr_t)so_base + elf_hdr->e_phoff);
+  prog_hdr = (Elf32_Phdr *)((uintptr_t)so_base + elf_hdr->e_phoff);
 
-  if (elf_hdr->e_shoff + (elf_hdr->e_shnum * sizeof(Elf64_Shdr)) > so_size) {
+  if (elf_hdr->e_shoff + (elf_hdr->e_shnum * sizeof(Elf32_Shdr)) > so_size) {
     debugPrintf("so_load: Section headers extend beyond file\n");
     res = -1;
     goto err_free_so;
   }
 
-  sec_hdr = (Elf64_Shdr *)((uintptr_t)so_base + elf_hdr->e_shoff);
+  sec_hdr = (Elf32_Shdr *)((uintptr_t)so_base + elf_hdr->e_shoff);
 
   if (elf_hdr->e_shstrndx >= elf_hdr->e_shnum) {
     debugPrintf("so_load: Invalid string table index\n");
@@ -253,9 +248,10 @@ int so_load(const char *filename, void *base, size_t max_size) {
   // text
   text_size = prog_hdr[text_segno].p_memsz;
   text_virtbase =
-      (void *)(prog_hdr[text_segno].p_vaddr + (Elf64_Addr)load_virtbase);
-  text_base = (void *)(prog_hdr[text_segno].p_vaddr + (Elf64_Addr)load_base);
-  prog_hdr[text_segno].p_vaddr = (Elf64_Addr)text_virtbase;
+      (void *)(prog_hdr[text_segno].p_vaddr + (Elf32_Addr)(uintptr_t)load_virtbase);
+  text_base =
+      (void *)(prog_hdr[text_segno].p_vaddr + (Elf32_Addr)(uintptr_t)load_base);
+  prog_hdr[text_segno].p_vaddr = (Elf32_Addr)(uintptr_t)text_virtbase;
   memcpy(text_base,
          (void *)((uintptr_t)so_base + prog_hdr[text_segno].p_offset),
          prog_hdr[text_segno].p_filesz);
@@ -263,9 +259,10 @@ int so_load(const char *filename, void *base, size_t max_size) {
   // data
   data_size = prog_hdr[data_segno].p_memsz;
   data_virtbase =
-      (void *)(prog_hdr[data_segno].p_vaddr + (Elf64_Addr)load_virtbase);
-  data_base = (void *)(prog_hdr[data_segno].p_vaddr + (Elf64_Addr)load_base);
-  prog_hdr[data_segno].p_vaddr = (Elf64_Addr)data_virtbase;
+      (void *)(prog_hdr[data_segno].p_vaddr + (Elf32_Addr)(uintptr_t)load_virtbase);
+  data_base =
+      (void *)(prog_hdr[data_segno].p_vaddr + (Elf32_Addr)(uintptr_t)load_base);
+  prog_hdr[data_segno].p_vaddr = (Elf32_Addr)(uintptr_t)data_virtbase;
   memcpy(data_base,
          (void *)((uintptr_t)so_base + prog_hdr[data_segno].p_offset),
          prog_hdr[data_segno].p_filesz);
@@ -276,8 +273,8 @@ int so_load(const char *filename, void *base, size_t max_size) {
   for (int i = 0; i < elf_hdr->e_shnum; i++) {
     char *sh_name = shstrtab + sec_hdr[i].sh_name;
     if (strcmp(sh_name, ".dynsym") == 0) {
-      syms = (Elf64_Sym *)((uintptr_t)text_base + sec_hdr[i].sh_addr);
-      num_syms = sec_hdr[i].sh_size / sizeof(Elf64_Sym);
+      syms = (Elf32_Sym *)((uintptr_t)text_base + sec_hdr[i].sh_addr);
+      num_syms = sec_hdr[i].sh_size / sizeof(Elf32_Sym);
     } else if (strcmp(sh_name, ".dynstr") == 0) {
       dynstrtab = (char *)((uintptr_t)text_base + sec_hdr[i].sh_addr);
     }
@@ -298,34 +295,31 @@ err_free_so:
   return res;
 }
 
+/* REL: o addend é o valor implícito gravado em *ptr (não há r_addend). */
 int so_relocate(void) {
   for (int i = 0; i < elf_hdr->e_shnum; i++) {
     char *sh_name = shstrtab + sec_hdr[i].sh_name;
-    if (strcmp(sh_name, ".rela.dyn") == 0 ||
-        strcmp(sh_name, ".rela.plt") == 0) {
-      Elf64_Rela *rels =
-          (Elf64_Rela *)((uintptr_t)text_base + sec_hdr[i].sh_addr);
-      for (int j = 0; j < (int)(sec_hdr[i].sh_size / sizeof(Elf64_Rela)); j++) {
-        uintptr_t *ptr =
-            (uintptr_t *)((uintptr_t)text_base + rels[j].r_offset);
-        Elf64_Sym *sym = &syms[ELF64_R_SYM(rels[j].r_info)];
-
-        int type = ELF64_R_TYPE(rels[j].r_info);
+    if (strcmp(sh_name, ".rel.dyn") == 0 || strcmp(sh_name, ".rel.plt") == 0) {
+      Elf32_Rel *rels =
+          (Elf32_Rel *)((uintptr_t)text_base + sec_hdr[i].sh_addr);
+      for (int j = 0; j < (int)(sec_hdr[i].sh_size / sizeof(Elf32_Rel)); j++) {
+        uintptr_t *ptr = (uintptr_t *)((uintptr_t)text_base + rels[j].r_offset);
+        Elf32_Sym *sym = &syms[ELF32_R_SYM(rels[j].r_info)];
+        int type = ELF32_R_TYPE(rels[j].r_info);
         switch (type) {
-        case R_AARCH64_ABS64:
-          /* So aplica p/ simbolo DEFINIDO (interno). Se UNDEF (importado, ex:
-             malloc), st_value=0 -> daria base+0 (lixo); deixa p/ so_resolve. */
-          if (sym->st_shndx != SHN_UNDEF)
-            *ptr = (uintptr_t)text_virtbase + sym->st_value + rels[j].r_addend;
+        case R_ARM_ABS32:
+          /* S + A(implícito) */
+          *ptr = (uintptr_t)text_virtbase + sym->st_value + *ptr;
           break;
-        case R_AARCH64_RELATIVE:
-          *ptr = (uintptr_t)text_virtbase + rels[j].r_addend;
+        case R_ARM_RELATIVE:
+          /* B + A(implícito) */
+          *ptr = (uintptr_t)text_virtbase + *ptr;
           break;
-        case R_AARCH64_GLOB_DAT:
-        case R_AARCH64_JUMP_SLOT:
+        case R_ARM_GLOB_DAT:
+        case R_ARM_JUMP_SLOT:
+          /* só resolve os DEFINIDOS aqui; UNDEF (imports) vão em so_resolve */
           if (sym->st_shndx != SHN_UNDEF)
-            *ptr =
-                (uintptr_t)text_virtbase + sym->st_value + rels[j].r_addend;
+            *ptr = (uintptr_t)text_virtbase + sym->st_value;
           break;
         default:
           fatal_error("Error: unknown relocation type: %x\n", type);
@@ -341,36 +335,33 @@ int so_resolve(DynLibFunction *funcs, int num_funcs,
                int taint_missing_imports) {
   for (int i = 0; i < elf_hdr->e_shnum; i++) {
     char *sh_name = shstrtab + sec_hdr[i].sh_name;
-    if (strcmp(sh_name, ".rela.dyn") == 0 ||
-        strcmp(sh_name, ".rela.plt") == 0) {
-      Elf64_Rela *rels =
-          (Elf64_Rela *)((uintptr_t)text_base + sec_hdr[i].sh_addr);
-      for (int j = 0; j < (int)(sec_hdr[i].sh_size / sizeof(Elf64_Rela)); j++) {
-        uintptr_t *ptr =
-            (uintptr_t *)((uintptr_t)text_base + rels[j].r_offset);
-        Elf64_Sym *sym = &syms[ELF64_R_SYM(rels[j].r_info)];
-
-        int type = ELF64_R_TYPE(rels[j].r_info);
+    if (strcmp(sh_name, ".rel.dyn") == 0 || strcmp(sh_name, ".rel.plt") == 0) {
+      Elf32_Rel *rels =
+          (Elf32_Rel *)((uintptr_t)text_base + sec_hdr[i].sh_addr);
+      for (int j = 0; j < (int)(sec_hdr[i].sh_size / sizeof(Elf32_Rel)); j++) {
+        uintptr_t *ptr = (uintptr_t *)((uintptr_t)text_base + rels[j].r_offset);
+        Elf32_Sym *sym = &syms[ELF32_R_SYM(rels[j].r_info)];
+        int type = ELF32_R_TYPE(rels[j].r_info);
         switch (type) {
-        case R_AARCH64_ABS64:       /* ABS64 de importado (ex: malloc em .data) */
-        case R_AARCH64_GLOB_DAT:
-        case R_AARCH64_JUMP_SLOT: {
+        case R_ARM_GLOB_DAT:
+        case R_ARM_JUMP_SLOT:
+        case R_ARM_ABS32: {
           if (sym->st_shndx == SHN_UNDEF) {
             if (taint_missing_imports)
               *ptr = rels[j].r_offset;
-
             char *name = dynstrtab + sym->st_name;
             int found = 0;
             for (int k = 0; k < num_funcs; k++) {
               if (strcmp(name, funcs[k].symbol) == 0) {
-                *ptr = funcs[k].func + rels[j].r_addend;
+                *ptr = funcs[k].func;
                 found = 1;
                 break;
               }
             }
             if (!found)
-              fprintf(stderr, "*** UNRESOLVED import: \"%s\" (GOT offset 0x%lx) ***\n",
-                      name, (unsigned long)rels[j].r_offset);
+              fprintf(stderr,
+                      "*** UNRESOLVED import: \"%s\" (GOT offset 0x%x) ***\n",
+                      name, (unsigned int)rels[j].r_offset);
           }
           break;
         }
@@ -389,7 +380,8 @@ void so_execute_init_array(void) {
     if (strcmp(sh_name, ".init_array") == 0) {
       int (**init_array)() =
           (void *)((uintptr_t)text_virtbase + sec_hdr[i].sh_addr);
-      for (int j = 0; j < (int)(sec_hdr[i].sh_size / 8); j++) {
+      /* ponteiros de 4 bytes no armhf */
+      for (int j = 0; j < (int)(sec_hdr[i].sh_size / 4); j++) {
         if (init_array[j] != 0)
           init_array[j]();
       }
@@ -429,14 +421,14 @@ uintptr_t so_find_addr_rx(const char *symbol) {
 uintptr_t so_find_rel_addr(const char *symbol) {
   for (int i = 0; i < elf_hdr->e_shnum; i++) {
     char *sh_name = shstrtab + sec_hdr[i].sh_name;
-    if (strcmp(sh_name, ".rela.dyn") == 0 ||
-        strcmp(sh_name, ".rela.plt") == 0) {
-      Elf64_Rela *rels =
-          (Elf64_Rela *)((uintptr_t)text_base + sec_hdr[i].sh_addr);
-      for (int j = 0; j < (int)(sec_hdr[i].sh_size / sizeof(Elf64_Rela)); j++) {
-        Elf64_Sym *sym = &syms[ELF64_R_SYM(rels[j].r_info)];
-        int type = ELF64_R_TYPE(rels[j].r_info);
-        if (type == R_AARCH64_GLOB_DAT || type == R_AARCH64_JUMP_SLOT) {
+    if (strcmp(sh_name, ".rel.dyn") == 0 || strcmp(sh_name, ".rel.plt") == 0) {
+      Elf32_Rel *rels =
+          (Elf32_Rel *)((uintptr_t)text_base + sec_hdr[i].sh_addr);
+      for (int j = 0; j < (int)(sec_hdr[i].sh_size / sizeof(Elf32_Rel)); j++) {
+        Elf32_Sym *sym = &syms[ELF32_R_SYM(rels[j].r_info)];
+        int type = ELF32_R_TYPE(rels[j].r_info);
+        if (type == R_ARM_GLOB_DAT || type == R_ARM_JUMP_SLOT ||
+            type == R_ARM_ABS32) {
           char *name = dynstrtab + sym->st_name;
           if (strcmp(name, symbol) == 0)
             return (uintptr_t)text_base + rels[j].r_offset;
@@ -451,14 +443,14 @@ uintptr_t so_find_rel_addr(const char *symbol) {
 uintptr_t so_find_rel_addr_safe(const char *symbol) {
   for (int i = 0; i < elf_hdr->e_shnum; i++) {
     char *sh_name = shstrtab + sec_hdr[i].sh_name;
-    if (strcmp(sh_name, ".rela.dyn") == 0 ||
-        strcmp(sh_name, ".rela.plt") == 0) {
-      Elf64_Rela *rels =
-          (Elf64_Rela *)((uintptr_t)text_base + sec_hdr[i].sh_addr);
-      for (int j = 0; j < (int)(sec_hdr[i].sh_size / sizeof(Elf64_Rela)); j++) {
-        Elf64_Sym *sym = &syms[ELF64_R_SYM(rels[j].r_info)];
-        int type = ELF64_R_TYPE(rels[j].r_info);
-        if (type == R_AARCH64_GLOB_DAT || type == R_AARCH64_JUMP_SLOT) {
+    if (strcmp(sh_name, ".rel.dyn") == 0 || strcmp(sh_name, ".rel.plt") == 0) {
+      Elf32_Rel *rels =
+          (Elf32_Rel *)((uintptr_t)text_base + sec_hdr[i].sh_addr);
+      for (int j = 0; j < (int)(sec_hdr[i].sh_size / sizeof(Elf32_Rel)); j++) {
+        Elf32_Sym *sym = &syms[ELF32_R_SYM(rels[j].r_info)];
+        int type = ELF32_R_TYPE(rels[j].r_info);
+        if (type == R_ARM_GLOB_DAT || type == R_ARM_JUMP_SLOT ||
+            type == R_ARM_ABS32) {
           char *name = dynstrtab + sym->st_name;
           if (strcmp(name, symbol) == 0)
             return (uintptr_t)text_base + rels[j].r_offset;
