@@ -293,9 +293,15 @@ static void my_glLinkProgram(unsigned prog) {
 // sobem (menu sem fundo/fontes).
 static void (*real_glTexImage2D)(unsigned, int, int, int, int, int, unsigned,
                                  unsigned, const void *) = NULL;
+static int g_tex_log = 0;
 static void my_glTexImage2D(unsigned tgt, int lvl, int ifmt, int w, int h,
                             int bord, unsigned fmt, unsigned type,
                             const void *px) {
+  if (g_tex_log < 80 && lvl == 0) {
+    fprintf(stderr, "[TEX] ifmt=0x%x fmt=0x%x type=0x%x %dx%d\n", ifmt, fmt,
+            type, w, h);
+    g_tex_log++;
+  }
   switch (ifmt) {
   case 0x8058: /*GL_RGBA8*/
   case 0x8057: /*GL_RGB5_A1*/
@@ -436,16 +442,26 @@ void *my_SDL_CreateWindow(const char *title, int x, int y, int w, int h,
         RTLD_DEFAULT, "SDL_CreateWindow");
   return real ? real(title, x, y, FB_W, FB_H, flags) : NULL;
 }
+// SDL_DisplayMode = { Uint32 format(0); int w(4); int h(8); int refresh(12);
+// void* drvdata(16) }. Forçamos TODOS os campos relevantes pra valores fixos
+// (1280x720, RGBA8888=32bpp, 60Hz) — assim a librw (addVideoMode dedup por
+// w/h/format) deduplica os 18 modos do device num ÚNICO modo exclusivo →
+// lista de vídeo determinística (2 entradas) → menu Gráficos não estoura índice.
+static void force_mode(void *mode) {
+  if (!mode)
+    return;
+  *(uint32_t *)((char *)mode + 0) = 0x16462004u; // SDL_PIXELFORMAT_RGBA8888 (32bpp)
+  *(int *)((char *)mode + 4) = FB_W;
+  *(int *)((char *)mode + 8) = FB_H;
+  *(int *)((char *)mode + 12) = 60;
+}
 int my_SDL_GetCurrentDisplayMode(int disp, void *mode) {
   static int (*real)(int, void *) = NULL;
   if (!real)
     real = (int (*)(int, void *))dlsym(RTLD_DEFAULT,
                                        "SDL_GetCurrentDisplayMode");
   int r = real ? real(disp, mode) : -1;
-  if (mode) {
-    *(int *)((char *)mode + 4) = FB_W;
-    *(int *)((char *)mode + 8) = FB_H;
-  }
+  force_mode(mode);
   return r;
 }
 int my_SDL_GetDisplayMode(int disp, int idx, void *mode) {
@@ -453,10 +469,7 @@ int my_SDL_GetDisplayMode(int disp, int idx, void *mode) {
   if (!real)
     real = (int (*)(int, int, void *))dlsym(RTLD_DEFAULT, "SDL_GetDisplayMode");
   int r = real ? real(disp, idx, mode) : -1;
-  if (mode) {
-    *(int *)((char *)mode + 4) = FB_W;
-    *(int *)((char *)mode + 8) = FB_H;
-  }
+  force_mode(mode);
   return r;
 }
 void my_SDL_GetWindowSize(void *win, int *ww, int *wh) {
@@ -483,6 +496,16 @@ int my_SDL_InitSubSystem(unsigned flags) {
 // Desejado: X(Cross) acelera, Circle freia, Triangle rouba.
 //   -> quando reVC pede 1(acelera) devolve Cross(0); pede 3(freia) devolve Circle(1);
 //      pede 2(rouba) devolve Triangle(3).
+// remap: índice = enum SDL que o reVC pede; valor = botão físico SDL devolvido.
+// Derivado da fonte (reVC Xbox-branch: A->bater,B->entrar,X->acelera,Y->freio)
+// + gamecontrollerdb do Feir (Cross->A,Square->B,Circle->X,Triangle->Y).
+// Desejado: Cross=acelera(X), Circle=freio(Y), Square=bater(A), Triangle=entrar(B).
+//   reVC pede A(0,bater) -> devolve fisico Square(=B=1)
+//   reVC pede B(1,entrar)-> devolve fisico Triangle(=Y=3)
+//   reVC pede X(2,acelera)-> devolve fisico Cross(=A=0)
+//   reVC pede Y(3,freio) -> devolve fisico Circle(=X=2)
+int g_btn_remap[16] = {1, 3, 0, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+static int g_btn_seen[16] = {0};
 unsigned char my_SDL_GameControllerGetButton(void *gc, int btn) {
   static unsigned char (*real)(void *, int) = NULL;
   if (!real)
@@ -490,14 +513,14 @@ unsigned char my_SDL_GameControllerGetButton(void *gc, int btn) {
                                                  "SDL_GameControllerGetButton");
   if (!real)
     return 0;
-  int src = btn;
-  if (btn == 1)
-    src = 0; // acelera <- Cross/X
-  else if (btn == 3)
-    src = 1; // freia <- Circle
-  else if (btn == 2)
-    src = 3; // rouba/entra <- Triangle
-  return real(gc, src);
+  int src = (btn >= 0 && btn < 16) ? g_btn_remap[btn] : btn;
+  unsigned char v = real(gc, src);
+  if (v && btn >= 0 && btn < 16 && !g_btn_seen[btn]) {
+    g_btn_seen[btn] = 1;
+    fprintf(stderr, "[BTN] reVC leu (poll) enum=%d PRESSIONADO\n", btn);
+    fflush(stderr);
+  }
+  return v;
 }
 void *my_SDL_GameControllerOpen(int idx) {
   static void *(*real)(int) = NULL;
@@ -679,13 +702,25 @@ static int resolve_ci(const char *base, const char *rel, char *out,
 static int revc_redirect(const char *path, char *out, size_t osz) {
   if (!path)
     return 0;
-  // CIRÚRGICO: só os paths relativos "./models/..." da librw (base.cpp) que
-  // davam o spam de 641K (NSWBTTNS etc). Tudo mais (absolutos via symlink+
-  // casepath, e outros relativos) passa intacto.
+  // Redireciona paths RELATIVOS das pastas de dados do jogo (librw/cutscene
+  // usam ./models/, ./audio/, etc relativos ao cwd -> quebram com o chdir do
+  // reVC). Os absolutos (/storage/emulated/0/reVC) já vão via symlink+casepath.
   const char *rel = path;
   while (rel[0] == '.' && (rel[1] == '/' || rel[1] == '\\'))
     rel += 2;
-  if (strncasecmp(rel, "models/", 7) != 0 && strncasecmp(rel, "models\\", 7) != 0)
+  static const char *dirs[] = {"models", "audio", "anim",   "data",
+                               "text",   "txd",   "movies", "mp3",
+                               "neo",    "skins", "user",   NULL};
+  int ok = 0;
+  for (int i = 0; dirs[i]; i++) {
+    size_t dl = strlen(dirs[i]);
+    if (strncasecmp(rel, dirs[i], dl) == 0 &&
+        (rel[dl] == '/' || rel[dl] == '\\')) {
+      ok = 1;
+      break;
+    }
+  }
+  if (!ok)
     return 0;
   resolve_ci(REVC_DATA, rel, out, osz);
   return 1;

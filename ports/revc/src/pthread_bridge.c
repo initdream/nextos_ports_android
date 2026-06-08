@@ -17,6 +17,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "so_util.h"
 
@@ -46,29 +47,37 @@ int b_mutexattr_settype(void *a, int type) {
   return 0;
 }
 
+// ponteiro do heap (grande) vs valor mágico de inicializador estático bionic
+// (pequeno: 0, 0x4000 recursivo, 0x8000 errorcheck, etc — todos < 0x10000).
+#define IS_HEAP_PTR(v) ((uintptr_t)(v) > 0x10000u)
+
+// cria um glibc mutex RECURSIVO (seguro p/ qualquer uso; evita self-deadlock
+// quando o bionic queria recursivo via inicializador estático ou attr).
+static pthread_mutex_t *new_recursive_mutex(void) {
+  pthread_mutex_t *r = (pthread_mutex_t *)calloc(1, sizeof(pthread_mutex_t));
+  pthread_mutexattr_t a;
+  pthread_mutexattr_init(&a);
+  pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+  pthread_mutex_init(r, &a);
+  pthread_mutexattr_destroy(&a);
+  return r;
+}
+
 // ---------------- mutex ----------------
 static pthread_mutex_t *mtx_real(void *m) {
   pthread_mutex_t **slot = (pthread_mutex_t **)m;
-  if (*slot)
-    return *slot;
+  if (IS_HEAP_PTR(*slot))
+    return *slot; // já é nosso glibc mutex
   pthread_mutex_lock(&g_lock);
-  if (!*slot) {
-    pthread_mutex_t *r = (pthread_mutex_t *)calloc(1, sizeof(pthread_mutex_t));
-    pthread_mutex_init(r, NULL); // estático => normal
-    *slot = r;
-  }
+  if (!IS_HEAP_PTR(*slot)) // re-check sob lock (descarta mágica bionic estática)
+    *slot = new_recursive_mutex();
   pthread_mutex_unlock(&g_lock);
   return *slot;
 }
 int b_mutex_init(void *m, const void *attr) {
+  (void)attr; // sempre recursivo (superset seguro)
   pthread_mutex_t **slot = (pthread_mutex_t **)m;
-  pthread_mutex_t *r = (pthread_mutex_t *)calloc(1, sizeof(pthread_mutex_t));
-  pthread_mutexattr_t a;
-  pthread_mutexattr_init(&a);
-  if (attr && *(const int *)attr != 0)
-    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
-  pthread_mutex_init(r, &a);
-  pthread_mutexattr_destroy(&a);
+  pthread_mutex_t *r = new_recursive_mutex();
   pthread_mutex_lock(&g_lock);
   *slot = r;
   pthread_mutex_unlock(&g_lock);
@@ -92,10 +101,10 @@ int b_mutex_destroy(void *m) {
 // ---------------- cond (clock MONOTONIC p/ casar o default do bionic) ----------------
 static pthread_cond_t *cnd_real(void *c) {
   pthread_cond_t **slot = (pthread_cond_t **)c;
-  if (*slot)
+  if (IS_HEAP_PTR(*slot))
     return *slot;
   pthread_mutex_lock(&g_lock);
-  if (!*slot) {
+  if (!IS_HEAP_PTR(*slot)) {
     pthread_cond_t *r = (pthread_cond_t *)calloc(1, sizeof(pthread_cond_t));
     pthread_condattr_t a;
     pthread_condattr_init(&a);
@@ -139,10 +148,10 @@ int b_cond_destroy(void *c) {
 // ---------------- rwlock ----------------
 static pthread_rwlock_t *rw_real(void *r) {
   pthread_rwlock_t **slot = (pthread_rwlock_t **)r;
-  if (*slot)
+  if (IS_HEAP_PTR(*slot))
     return *slot;
   pthread_mutex_lock(&g_lock);
-  if (!*slot) {
+  if (!IS_HEAP_PTR(*slot)) {
     pthread_rwlock_t *rr =
         (pthread_rwlock_t *)calloc(1, sizeof(pthread_rwlock_t));
     pthread_rwlock_init(rr, NULL);
@@ -157,11 +166,21 @@ int b_rwlock_unlock(void *r) { return pthread_rwlock_unlock(rw_real(r)); }
 
 // ---------------- once (bionic = int) ----------------
 int b_once(void *once_ctl, void (*init)(void)) {
-  int *flag = (int *)once_ctl;
-  pthread_mutex_lock(&g_lock); // recursivo: init() pode reusar a ponte
-  if (!*flag) {
+  // bionic once_control = int. 0=não feito, 1=em progresso, 2=feito.
+  // NÃO segura g_lock durante init() (init pode esperar outra thread).
+  volatile int *st = (volatile int *)once_ctl;
+  pthread_mutex_lock(&g_lock);
+  while (*st == 1) { // outra thread inicializando: espera
+    pthread_mutex_unlock(&g_lock);
+    usleep(200);
+    pthread_mutex_lock(&g_lock);
+  }
+  if (*st == 0) {
+    *st = 1;
+    pthread_mutex_unlock(&g_lock);
     init();
-    *flag = 1;
+    pthread_mutex_lock(&g_lock);
+    *st = 2;
   }
   pthread_mutex_unlock(&g_lock);
   return 0;
