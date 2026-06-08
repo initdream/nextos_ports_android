@@ -14,8 +14,7 @@ Não recompila o jogo: **carrega o `.so` nativo do Android e roda direto** no Li
 | Jogo | Estado | Pasta |
 |---|---|---|
 | **Bully: Anniversary Edition** | ✅ **100% jogável** (Mali-450, GLES2) — mundo, escola, personagem, controle, áudio | [`ports/bully`](ports/bully/) |
-| **GTA: Vice City** (reVC, open-source) | ✅ **100% jogável** (Mali-450) — mundo, controle, áudio, menu, NPCs | [`ports/revc`](ports/revc/) |
-| **GTA: Vice City** (Android comercial) | 🚧 WIP — front-end/menu renderiza; travando no carregamento da fase | [`ports/gtavc`](ports/gtavc/) |
+| **GTA: Vice City** | ✅ **100% jogável** (Mali-450) — mundo, controle, áudio, menu, NPCs | [`ports/revc`](ports/revc/) |
 | **Hollow Knight** (Unity 2020 IL2CPP) | 🔬 pesquisa — **renderiza em GLES3** (S905X5M, Mali-G310); muro = input nativo dos menus. No Mali-450/GLES2 há parede de shader (jogo é GLES3-only) | [`experiments/hollow-recon`](experiments/hollow-recon/) |
 | Syberia (GLES1) · LEGO Star Wars: TCS (GLES2) | 📦 referência (de **mtojek**) — validam o framework no Utgard | — |
 
