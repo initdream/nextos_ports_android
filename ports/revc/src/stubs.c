@@ -41,8 +41,6 @@ static int g_req_gl_major = 0;
 int my_SDL_GL_SetAttribute(int attr, int value) {
   if (attr == SDL_GL_CONTEXT_MAJOR_VERSION)
     g_req_gl_major = value;
-  fprintf(stderr, "[GLDIAG] SDL_GL_SetAttribute(%d, %d)\n", attr, value);
-  fflush(stderr);
   static int (*real)(int, int) = NULL;
   if (!real)
     real = (int (*)(int, int))dlsym(RTLD_DEFAULT, "SDL_GL_SetAttribute");
@@ -129,12 +127,10 @@ static void my_glCompileShader(unsigned sh) {
     char log[1024] = {0};
     if (real_glGetShaderInfoLog)
       real_glGetShaderInfoLog(sh, sizeof(log) - 1, NULL, log);
-    fprintf(stderr, "[GLDIAG] *** SHADER %u COMPILE FAIL (status=%d): %s\n", sh,
+    fprintf(stderr, "[reVC] SHADER %u COMPILE FAIL (status=%d): %s\n", sh,
             status, log);
-  } else {
-    fprintf(stderr, "[GLDIAG] shader %u compilou OK\n", sh);
+    fflush(stderr);
   }
-  fflush(stderr);
 }
 
 static void (*real_glClear)(unsigned) = NULL;
@@ -168,50 +164,7 @@ static void my_glBindFramebuffer(unsigned target, unsigned fb) {
   if (real_glBindFramebuffer)
     real_glBindFramebuffer(target, fb);
 }
-static void (*real_glReadPixels)(int, int, int, int, unsigned, unsigned,
-                                 void *) = NULL;
 int my_SDL_GL_SwapWindow(void *w) {
-  g_swaps++;
-  if (g_swaps == 900) {
-    // dump do backbuffer GL (1280x720 RGBA) in-game p/ ver o mundo 3D
-    if (!real_glReadPixels)
-      real_glReadPixels = (void (*)(int, int, int, int, unsigned, unsigned,
-                                    void *))dlsym(RTLD_DEFAULT, "glReadPixels");
-    static unsigned char buf[1280 * 720 * 4];
-    if (real_glReadPixels) {
-      real_glReadPixels(0, 0, 1280, 720, 0x1908, 0x1401, buf);
-      FILE *f = fopen("/storage/roms/ports/revc/gl_dump.raw", "wb");
-      if (f) {
-        fwrite(buf, 1, sizeof(buf), f);
-        fclose(f);
-        fprintf(stderr, "[GLDIAG] backbuffer dumped (gl_dump.raw)\n");
-      }
-    }
-  }
-  if (g_swaps % 300 == 1) {
-    // lê pixels do backbuffer GL p/ saber se o RENDER produziu cor
-    if (!real_glReadPixels)
-      real_glReadPixels = (void (*)(int, int, int, int, unsigned, unsigned,
-                                    void *))dlsym(RTLD_DEFAULT, "glReadPixels");
-    unsigned char px[4 * 5] = {0};
-    int maxv = 0;
-    if (real_glReadPixels) {
-      int pts[5][2] = {{640, 360}, {200, 200}, {1000, 600}, {640, 100},
-                       {100, 600}};
-      for (int k = 0; k < 5; k++) {
-        unsigned char p4[4] = {0};
-        real_glReadPixels(pts[k][0], pts[k][1], 1, 1, 0x1908 /*RGBA*/,
-                          0x1401 /*UBYTE*/, p4);
-        for (int c = 0; c < 3; c++)
-          if (p4[c] > maxv)
-            maxv = p4[c];
-      }
-    }
-    fprintf(stderr,
-            "[GLDIAG] frame swaps=%ld draws=%ld fbo=%d backbuffer_maxRGB=%d\n",
-            g_swaps, g_draws, g_cur_fbo, maxv);
-  }
-  fflush(stderr);
   static void (*real)(void *) = NULL;
   if (!real)
     real = (void (*)(void *))dlsym(RTLD_DEFAULT, "SDL_GL_SwapWindow");
@@ -225,47 +178,26 @@ int my_SDL_GL_SwapWindow(void *w) {
 // Forçamos GL_DEPTH_TEST sempre OFF (o menu é 100% 2D). [rever p/ mundo 3D]
 #define GL_DEPTH_TEST 0x0B71
 static void (*real_glEnable)(unsigned) = NULL;
-static int g_en_log = 0;
 static void my_glEnable(unsigned cap) {
-  if (g_en_log < 30) {
-    fprintf(stderr, "[GLDIAG] glEnable(0x%x)\n", cap);
-    g_en_log++;
-  }
-  // NÃO desligar mais o GL_DEPTH_TEST globalmente: o 3D precisa de depth.
-  // O 2D do menu funciona via o im2d z-fix (gl_Position.z=0 passa o LEQUAL).
   if (real_glEnable)
     real_glEnable(cap);
 }
 static void (*real_glColorMask)(unsigned char, unsigned char, unsigned char,
                                 unsigned char) = NULL;
-static int g_cm_log = 0;
 static void my_glColorMask(unsigned char r, unsigned char g, unsigned char b,
                            unsigned char a) {
-  if (g_cm_log < 10) {
-    fprintf(stderr, "[GLDIAG] glColorMask(%d,%d,%d,%d) -> forçando 1,1,1,1\n", r,
-            g, b, a);
-    g_cm_log++;
-  }
+  (void)r; (void)g; (void)b; (void)a;
   if (real_glColorMask)
     real_glColorMask(1, 1, 1, 1); // força writes de cor sempre ON
 }
 static void (*real_glViewport)(int, int, int, int) = NULL;
-static int g_vp_log = 0;
 static void my_glViewport(int x, int y, int w, int h) {
-  if (g_vp_log < 8) {
-    fprintf(stderr, "[GLDIAG] glViewport(%d,%d,%d,%d)\n", x, y, w, h);
-    g_vp_log++;
-  }
   if (real_glViewport)
     real_glViewport(x, y, w, h);
 }
 
 static void (*real_glVAP)(unsigned, int, unsigned, unsigned char, int,
                           const void *) = NULL;
-static int g_vap_log = 0;
-// SKIN fix: o upload das matrizes de osso é glUniformMatrix4fv(loc, 64, ...);
-// como reduzimos o array do shader p/ [52], limitamos o count (só o de ossos
-// tem count grande; u_proj/view/world têm count=1).
 // FIX peds pretos/bugados: librw usa GL_TEXTURE_MAX_LEVEL (GLES3/desktop, NÃO
 // existe em GLES2) p/ limitar a cadeia de mipmaps. No GLES2 isso é ignorado ->
 // texturas com mipmap incompleto ficam INCOMPLETAS -> renderizam PRETO. Os NPCs
@@ -284,79 +216,11 @@ static void my_glTexParameteri(unsigned target, unsigned pname, int param) {
     real_glTexParameteri(target, pname, param);
 }
 
-// DIAG: peds usam textura comprimida (DXT/s3tc)? Mali-450 raw não suporta.
-static void (*real_glCompressedTexImage2D)(unsigned, int, unsigned, int, int,
-                                           int, int, const void *) = NULL;
-static int g_ctex_log = 0;
-static void my_glCompressedTexImage2D(unsigned tgt, int lvl, unsigned ifmt,
-                                      int w, int h, int border, int isz,
-                                      const void *data) {
-  if (g_ctex_log < 30) {
-    fprintf(stderr, "[CTEX] internalformat=0x%x %dx%d size=%d\n", ifmt, w, h,
-            isz);
-    fflush(stderr);
-    g_ctex_log++;
-  }
-  if (real_glCompressedTexImage2D)
-    real_glCompressedTexImage2D(tgt, lvl, ifmt, w, h, border, isz, data);
-}
-
-#define REVC_BONES 52
-static void (*real_glUniformMatrix4fv)(int, int, unsigned char,
-                                       const float *) = NULL;
-static void my_glUniformMatrix4fv(int loc, int count, unsigned char transpose,
-                                  const float *v) {
-  // pass-through (clamp de osso revertido — não era a causa)
-  if (real_glUniformMatrix4fv)
-    real_glUniformMatrix4fv(loc, count, transpose, v);
-}
 static void my_glVertexAttribPointer(unsigned idx, int size, unsigned type,
                                      unsigned char norm, int stride,
                                      const void *ptr) {
-  if (g_vap_log < 16) {
-    fprintf(stderr,
-            "[GLDIAG] glVertexAttribPointer idx=%u size=%d type=0x%x norm=%d "
-            "stride=%d ptr=%p\n",
-            idx, size, type, norm, stride, ptr);
-    g_vap_log++;
-  }
   if (real_glVAP)
     real_glVAP(idx, size, type, norm, stride, ptr);
-}
-static void (*real_glLinkProgram)(unsigned) = NULL;
-static void (*real_glGetProgramiv)(unsigned, unsigned, int *) = NULL;
-static void my_glLinkProgram(unsigned prog) {
-  if (real_glLinkProgram)
-    real_glLinkProgram(prog);
-  if (!real_glGetProgramiv)
-    real_glGetProgramiv = (void (*)(unsigned, unsigned, int *))dlsym(
-        RTLD_DEFAULT, "glGetProgramiv");
-  int st = -1;
-  if (real_glGetProgramiv)
-    real_glGetProgramiv(prog, 0x8B82 /*LINK_STATUS*/, &st);
-  static int n = 0;
-  if (n++ < 12)
-    fprintf(stderr, "[GLDIAG] glLinkProgram %u -> link_status=%d\n", prog, st);
-  if (n == 1) {
-    void (*gi)(unsigned, int *) =
-        (void (*)(unsigned, int *))dlsym(RTLD_DEFAULT, "glGetIntegerv");
-    const char *(*gs)(unsigned) =
-        (const char *(*)(unsigned))dlsym(RTLD_DEFAULT, "glGetString");
-    int vu = -1, va = -1, vt = -1;
-    if (gi) {
-      gi(0x8DFB, &vu); // GL_MAX_VERTEX_UNIFORM_VECTORS
-      gi(0x8869, &va); // GL_MAX_VERTEX_ATTRIBS
-      gi(0x8B4C, &vt); // GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS
-    }
-    fprintf(stderr,
-            "[GLCAPS] MAX_VERTEX_UNIFORM_VECTORS=%d MAX_VERTEX_ATTRIBS=%d "
-            "MAX_VERTEX_TEXTURE_UNITS=%d\n",
-            vu, va, vt);
-    if (gs)
-      fprintf(stderr, "[GLCAPS] RENDERER=%s | VERSION=%s\n", gs(0x1F01),
-              gs(0x1F02));
-    fflush(stderr);
-  }
 }
 
 // patch 012: GLES2 não aceita internalformat "sized" (GL_RGBA8 etc.) no
@@ -364,16 +228,9 @@ static void my_glLinkProgram(unsigned prog) {
 // sobem (menu sem fundo/fontes).
 static void (*real_glTexImage2D)(unsigned, int, int, int, int, int, unsigned,
                                  unsigned, const void *) = NULL;
-static int g_tex_log = 0;
 static void my_glTexImage2D(unsigned tgt, int lvl, int ifmt, int w, int h,
                             int bord, unsigned fmt, unsigned type,
                             const void *px) {
-  if (g_tex_log < 400 && lvl == 0) {
-    int npot = ((w & (w - 1)) != 0) || ((h & (h - 1)) != 0);
-    fprintf(stderr, "[TEX] ifmt=0x%x fmt=0x%x type=0x%x %dx%d%s\n", ifmt, fmt,
-            type, w, h, npot ? " NPOT!" : "");
-    g_tex_log++;
-  }
   switch (ifmt) {
   case 0x8058: /*GL_RGBA8*/
   case 0x8057: /*GL_RGB5_A1*/
@@ -399,9 +256,6 @@ void *my_SDL_GL_GetProcAddress(const char *name) {
     real_gpa = (void *(*)(const char *))dlsym(RTLD_DEFAULT,
                                               "SDL_GL_GetProcAddress");
   void *p = real_gpa ? real_gpa(name) : NULL;
-  if (name && !p)
-    fprintf(stderr, "[GLDIAG] GetProcAddress('%s') = NULL (ausente no Mali!)\n",
-            name);
   if (name) {
     if (!strcmp(name, "glClear")) {
       real_glClear = (void (*)(unsigned))p;
@@ -430,24 +284,9 @@ void *my_SDL_GL_GetProcAddress(const char *name) {
                              const void *))p;
       return (void *)&my_glVertexAttribPointer;
     }
-    if (!strcmp(name, "glUniformMatrix4fv")) {
-      real_glUniformMatrix4fv =
-          (void (*)(int, int, unsigned char, const float *))p;
-      return (void *)&my_glUniformMatrix4fv;
-    }
     if (!strcmp(name, "glTexParameteri")) {
       real_glTexParameteri = (void (*)(unsigned, unsigned, int))p;
       return (void *)&my_glTexParameteri;
-    }
-    if (!strcmp(name, "glCompressedTexImage2D")) {
-      real_glCompressedTexImage2D =
-          (void (*)(unsigned, int, unsigned, int, int, int, int,
-                    const void *))p;
-      return (void *)&my_glCompressedTexImage2D;
-    }
-    if (!strcmp(name, "glLinkProgram")) {
-      real_glLinkProgram = (void (*)(unsigned))p;
-      return (void *)&my_glLinkProgram;
     }
     if (!strcmp(name, "glBindFramebuffer")) {
       real_glBindFramebuffer = (void (*)(unsigned, unsigned))p;
@@ -477,38 +316,17 @@ void *my_SDL_GL_GetProcAddress(const char *name) {
   return p;
 }
 
-// Diagnóstico do enumerador de display modes (crash acontece logo após).
 int my_SDL_GetNumVideoDisplays(void) {
   static int (*real)(void) = NULL;
   if (!real)
     real = (int (*)(void))dlsym(RTLD_DEFAULT, "SDL_GetNumVideoDisplays");
-  int r = real ? real() : -1;
-  fprintf(stderr, "[GLDIAG] SDL_GetNumVideoDisplays() = %d\n", r);
-  fflush(stderr);
-  return r;
+  return real ? real() : -1;
 }
-extern void *text_base; // base do módulo carregado por último (libreVC)
 int my_SDL_GetNumDisplayModes(int disp) {
   static int (*real)(int) = NULL;
   if (!real)
     real = (int (*)(int))dlsym(RTLD_DEFAULT, "SDL_GetNumDisplayModes");
-  int r = real ? real(disp) : -1;
-  fprintf(stderr, "[GLDIAG] SDL_GetNumDisplayModes(%d) = %d\n", disp, r);
-  // ler o ponteiro x9 = *(libreVC+0x83d138) que o crash chama logo após
-  uintptr_t b = (uintptr_t)text_base;
-  uintptr_t obj = *(uintptr_t *)(b + 0x3b1708); // GOT slot -> memfuncs
-  fprintf(stderr, "[GLDIAG] memfuncs@0x%lx:\n", (unsigned long)(obj - b));
-  if (obj) {
-    const char *nm[] = {"rwmalloc", "rwrealloc", "rwfree", "rwmustmalloc",
-                        "rwmustrealloc"};
-    for (int i = 0; i < 5; i++) {
-      uintptr_t fp = *(uintptr_t *)(obj + i * 8);
-      fprintf(stderr, "   +%d %-13s = %p (libreVC+0x%lx)\n", i * 8, nm[i],
-              (void *)fp, (unsigned long)(fp - b));
-    }
-  }
-  fflush(stderr);
-  return r;
+  return real ? real(disp) : -1;
 }
 
 // força a resolução do fb0 (1280x720) — reVC pega 1920x1080 do display mode
@@ -520,9 +338,6 @@ void *my_SDL_CreateWindow(const char *title, int x, int y, int w, int h,
   if ((flags & SDL_WINDOW_OPENGL) && g_req_gl_major >= 3) {
     return NULL; // força fallback ES2 (próximo perfil)
   }
-  fprintf(stderr, "[GLDIAG] SDL_CreateWindow %dx%d->%dx%d flags=0x%x\n", w, h,
-          FB_W, FB_H, flags);
-  fflush(stderr);
   static void *(*real)(const char *, int, int, int, int, uint32_t) = NULL;
   if (!real)
     real = (void *(*)(const char *, int, int, int, int, uint32_t))dlsym(
@@ -569,20 +384,12 @@ void my_SDL_GetWindowSize(void *win, int *ww, int *wh) {
 // --- input/controle ---
 // força o subsistema de joystick+gamecontroller (senão não vêm eventos do pad)
 int my_SDL_InitSubSystem(unsigned flags) {
-  fprintf(stderr, "[PAD] SDL_InitSubSystem(0x%x) -> +JOYSTICK+GAMECONTROLLER\n",
-          flags);
   flags |= 0x200 | 0x2000; // SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER
   static int (*real)(unsigned) = NULL;
   if (!real)
     real = (int (*)(unsigned))dlsym(RTLD_DEFAULT, "SDL_InitSubSystem");
-  fflush(stderr);
   return real ? real(flags) : -1;
 }
-// Remap de botões (layout do Felipe). SDL: A=0(Cross/X) B=1(Circle) X=2(Square) Y=3(Triangle).
-// reVC(carro): acelera lê SDL_B(1), freia lê SDL_Y(3), rouba lê SDL_X(2).
-// Desejado: X(Cross) acelera, Circle freia, Triangle rouba.
-//   -> quando reVC pede 1(acelera) devolve Cross(0); pede 3(freia) devolve Circle(1);
-//      pede 2(rouba) devolve Triangle(3).
 // remap: índice = enum SDL que o reVC pede; valor = botão físico SDL devolvido.
 // Derivado da fonte (reVC Xbox-branch: A->bater,B->entrar,X->acelera,Y->freio)
 // + gamecontrollerdb do Feir (Cross->A,Square->B,Circle->X,Triangle->Y).
@@ -592,7 +399,6 @@ int my_SDL_InitSubSystem(unsigned flags) {
 //   reVC pede X(2,acelera)-> devolve fisico Cross(=A=0)
 //   reVC pede Y(3,freio) -> devolve fisico Circle(=X=2)
 int g_btn_remap[16] = {1, 3, 0, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
-static int g_btn_seen[16] = {0};
 unsigned char my_SDL_GameControllerGetButton(void *gc, int btn) {
   static unsigned char (*real)(void *, int) = NULL;
   if (!real)
@@ -601,48 +407,26 @@ unsigned char my_SDL_GameControllerGetButton(void *gc, int btn) {
   if (!real)
     return 0;
   int src = (btn >= 0 && btn < 16) ? g_btn_remap[btn] : btn;
-  unsigned char v = real(gc, src);
-  if (v && btn >= 0 && btn < 16 && !g_btn_seen[btn]) {
-    g_btn_seen[btn] = 1;
-    fprintf(stderr, "[BTN] reVC leu (poll) enum=%d PRESSIONADO\n", btn);
-    fflush(stderr);
-  }
-  return v;
+  return real(gc, src);
 }
 void *my_SDL_GameControllerOpen(int idx) {
   static void *(*real)(int) = NULL;
   if (!real)
     real = (void *(*)(int))dlsym(RTLD_DEFAULT, "SDL_GameControllerOpen");
-  void *r = real ? real(idx) : NULL;
-  fprintf(stderr, "[PAD] SDL_GameControllerOpen(%d) = %p\n", idx, r);
-  fflush(stderr);
-  return r;
+  return real ? real(idx) : NULL;
 }
 int my_SDL_GameControllerAddMappingsFromRW(void *rw, int freerw) {
   static int (*real)(void *, int) = NULL;
   if (!real)
     real = (int (*)(void *, int))dlsym(RTLD_DEFAULT,
                                        "SDL_GameControllerAddMappingsFromRW");
-  int r = real ? real(rw, freerw) : -1;
-  fprintf(stderr, "[PAD] AddMappingsFromRW = %d mapeamentos\n", r);
-  fflush(stderr);
-  return r;
+  return real ? real(rw, freerw) : -1;
 }
 int my_SDL_PollEvent(void *e) {
   static int (*real)(void *) = NULL;
   if (!real)
     real = (int (*)(void *))dlsym(RTLD_DEFAULT, "SDL_PollEvent");
-  int r = real ? real(e) : 0;
-  if (r && e) {
-    unsigned t = *(unsigned *)e;
-    static int n = 0;
-    if (t >= 0x600 && t <= 0x659 && n < 40) {
-      fprintf(stderr, "[PAD] evento SDL type=0x%x\n", t);
-      fflush(stderr);
-      n++;
-    }
-  }
-  return r;
+  return real ? real(e) : 0;
 }
 
 // ---- bionic errno: __errno() devolve o ponteiro de errno (glibc: __errno_location) ----
