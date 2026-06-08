@@ -6,6 +6,8 @@ Não recompila o jogo: **carrega o `.so` nativo do Android e roda direto** no Li
 
 > ✅ **Provado no Mali-450 (Utgard):** os ports de referência **Syberia** (GLES1) e **LEGO Star Wars: TCS** (GLES2) rodam perfeitos. O caminho de render (so-loader + EGL→SDL2 + GLES) está validado no Utgard.
 
+> 🏆 **Primeiro jogo portado DO ZERO com este framework: [`ports/revc`](ports/revc/README.md) — GTA: Vice City (reVC Android), 100% JOGÁVEL no Mali-450** (mundo, controle, áudio, menu, NPCs). **Leia o [README do revc](ports/revc/README.md)** — documenta a arquitetura de **so-loader 2-módulos** (libc++_shared + engine) e as **receitas Mali-450/GLES2 reutilizáveis** (ABI pthread bionic→glibc, shaders highp/MAX_LIGHTS/im2d, texturas GL_RGBA8/`GL_TEXTURE_MAX_LEVEL`-mipmap, SDL resolução/input, redirect de `fopen`, patch de runtime). **Comece por lá ao portar o próximo jogo.**
+
 ## Por que funciona tão bem
 Android é Linux. O código do jogo é **ARM nativo** rodando no ARM do device — zero emulação de CPU. GLES é GLES (mesma API). Nos teus TV boxes, é praticamente o hardware nativo do jogo (mesmo SoC/GPU classe Android). Só a "casca" Android é trocada por SDL2/glibc.
 
