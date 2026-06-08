@@ -195,3 +195,20 @@ portado destrava. Hipóteses para a próxima frente (precisam de mais ferramenta
 4. **Ordem/timing**: o gate Rockstar dispara no frame 31 e o GameMain corre pro Setup; talvez
    precise segurar até a fila async esvaziar / um gamestate específico (re-derivar offsets x86_64
    do app holder 0x12146a8 + gamestate +0x68 + tick flags).
+
+## 🎉🎉🎉 BREAKTHROUGH 2026-06-08 — CRASH DA WHITETEXTURE RESOLVIDO! (causa = DADO FALTANDO)
+**CAUSA RAIZ:** `data_2.zip/data_3.zip/data_4.zip` eram **STUBS VAZIOS** (22 bytes). A whitetexture é
+um ARQUIVO REAL `bully/whitetexture.tex` que estava DENTRO de data_2/3/4! `ResourceManager::Load
+<Texture2D>("whitetexture")` falhava (arquivo ausente) → NULL → GameRenderer::Setup 0x8a0c0d crash.
+**FIX:** extrair os data_2/3/4.zip(.idx) REAIS do APK 60FPS Mod (v1.4.311):
+  `unzip APK "assets/data_[234].zip*" -d bully-pc/gamefiles/` (1.85GB) + symlinks gamefiles/data_N.zip
+  -> assets/data_N.zip. APK tem data_0-4 completos (175M/864M/537M/537M/774M).
+**RESULTADO:** `[nvapk] open "bully/whitetexture.tex" -> OK`, **0 SIGSEGV**, engine roda CONTÍNUO
+(frame 2880+). O crash que travou o port por sessões MORREU.
+**LIÇÃO:** todo o RE de código (thread orchestration, async worker, zip_fs, etc) foi necessário pra
+CHEGAR no render, mas o muro final era simplesmente DADOS INCOMPLETOS. Sempre checar completude dos
+data files cedo. (analogia: igual reVC precisava dos dados certos).
+**PENDENTE (próximo):** `eglMakeCurrent ok=0` na render thread = NVIDIA dri2 fail (EGL DESTE PC, não
+do jogo). No device Mali-450 fbdev é outro caminho EGL (igual reVC funcionou). Próximo no PC: resolver
+o EGL/contexto multi-thread (NVIDIA surfaceless/pbuffer) OU partir pro device arm64 (extrair libGame.so
+arm64 do mesmo APK + os data já temos a receita). Engine LÓGICO já roda — falta a APRESENTAÇÃO GL.
