@@ -283,3 +283,21 @@ incl px=NULL), alpha-blend (glEnable BLEND off não ajudou), threshold (baixei 0
 => alpha é ~0), FBO incompleto (attach dá COMPLETE).
 **Fixes que FICAM (corretos):** highp->mediump (frag), LUMINANCE->RGBA, RGBA8->RGBA, glTexParameteri
 MAX_LEVEL/mipmap, glClear cor, threshold 0.04. Jogo 100% JOGÁVEL exceto a camisa do Jimmy.
+
+## 🏫✅ ESCOLA DESTRAVADA (2026-06-08) — era LIMITE DE TEXTURA DA GPU (Mali Utgard)
+Sintoma: entrar na escola (hub principal) wedgava o device DURO (SSH timeout). Investigação:
+- NÃO era OOM: mem.log mostrou sempre 200-346MB de RAM LIVRE (swap 6GB usou só 39MB).
+- NÃO era áudio: stubar vozes/multidão (speech_/ambs_) não ajudou.
+- NÃO era tempestade de RTT: contador g_fbo_binds só 1424 em 6240 frames (cresce devagar).
+- Hang ABRUPTO carregando textura de NPC (prgirl_pinky_md_n.tex), frames estáveis e param secos.
+CAUSA: o Mali-450 (Utgard) tem limite de memória/MMU de TEXTURA separado da RAM. A escola popula
+com MUITOS NPCs (cada um _d/_n/_s 512²) -> estoura o limite de textura da GPU -> driver TRAVA (sem
+erro limpo). [O GTA SA roda liso pq gerencia melhor a textura dos pedestres — sacada do o autor.]
+FIX (3 reduções de memória de textura, env no starter):
+1. BULLY_TEX_LIGHT: pula os mapas de DETALHE _n/_s (nv_open retorna NULL) = -2/3 por NPC.
+2. BULLY_TEX_HALF (a) pula MIPMAPS (lvl>0): como forço MIN_FILTER=LINEAR, mips nunca são usados
+   = desperdício puro de memória de textura. (b) reduz texturas >=512 pela METADE (512->256 = 1/4;
+   nearest, UV normalizado não quebra).
+RESULTADO: escola JOGÁVEL, sem wedge ("perfeito velho"). Texturas um pouco mais suaves (refinável).
+Também: asset_archive O(log n) (qsort+bsearch) destravou o LOADING da escola (antes: varredura
+linear 60418 x milhares de opens). Tudo confirmado NÃO-memória via monitor mem.log no starter.

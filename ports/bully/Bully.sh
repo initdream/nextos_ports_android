@@ -11,6 +11,8 @@ swapon /storage/roms/gtavc.swap 2>/dev/null
 sysctl -w vm.swappiness=80 >/dev/null 2>&1
 
 chmod 666 /dev/uinput 2>/dev/null
+export BULLY_TEX_LIGHT=1   # pula mapas _n/_s (detalhe)
+export BULLY_TEX_HALF=1    # pula mipmaps + reduz texturas >=512 pela metade (memória de textura GPU)
 # vídeo: SDL2 driver mali (faz o EGL fbdev certo -> render na TV)
 export SDL_VIDEODRIVER=mali
 export SDL2COMPAT_FORCE_FULLSCREEN_DESKTOP=1
@@ -23,8 +25,8 @@ done
 
 echo "=== Bully run $(date) | free: $(free -m | awk '/Mem/{print $7}')MB ===" > "$LOG"
 
-# loop de sync a cada 1s -> se o device travar, o log fica gravado na SD
-( while true; do sync; sleep 1; done ) &
+# loop de sync + MONITOR de memória (sobrevive ao wedge -> confirma OOM na escola)
+( while true; do echo "MEM=$(free -m|awk '/Mem/{print $3}') SWAP=$(free -m|awk '/Swap/{print $3}') livre=$(free -m|awk '/Mem/{print $4}')" >> "$GAMEDIR/mem.log"; sync; sleep 2; done ) &
 SYNCPID=$!
 
 # foreground + tee (line-buffered) -> log persistente + console

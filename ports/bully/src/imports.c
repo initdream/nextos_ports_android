@@ -232,9 +232,14 @@ static void my_glTexSubImage2D(unsigned t,int l,int xo,int yo,int w,int h,unsign
 /* status do FBO (render-to-texture da roupa) — se INCOMPLETO no Mali, a textura
  * do corpo fica vazia -> camisa preta+discard. */
 static void (*real_glBindFramebuffer)(unsigned, unsigned) = NULL;
+unsigned long g_fbo_binds = 0; /* contador p/ medir tempestade de RTT (escola) */
 static void my_glBindFramebuffer(unsigned t, unsigned fb) {
-  /* passthrough limpo (o glFinish de teste saturava o device -> removido) */
   if (!real_glBindFramebuffer) real_glBindFramebuffer = dlsym(RTLD_DEFAULT, "glBindFramebuffer");
+  if (fb != 0) {
+    g_fbo_binds++;
+    if (g_fbo_binds % 300 == 0)
+      fprintf(stderr, "[fbo] RTT binds total=%lu\n", g_fbo_binds);
+  }
   if (real_glBindFramebuffer) real_glBindFramebuffer(t, fb);
 }
 static void (*real_glFramebufferTexture2D)(unsigned,unsigned,unsigned,unsigned,int) = NULL;
@@ -271,40 +276,60 @@ static void my_glClearColor(float r, float g, float b, float a) {
   if (g_ccdbg < 8) { fprintf(stderr, "[gl] glClearColor %.2f %.2f %.2f %.2f\n", r, g, b, a); g_ccdbg++; }
   if (real_glClearColor) real_glClearColor(r, g, b, a);
 }
+static int bpp_of(unsigned fmt, unsigned type) {
+  if (type == 0x1401) return fmt == 0x1908 ? 4 : fmt == 0x1907 ? 3 : fmt == 0x190A ? 2 : 1;
+  if (type == 0x8033 || type == 0x8034 || type == 0x8363) return 2; /* 4444/5551/565 */
+  return 0; /* desconhecido -> não reduz */
+}
+static int g_tex_half = -1;
 static void (*real_glTexImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *) = NULL;
 static void my_glTexImage2D(unsigned tgt, int lvl, int ifmt, int w, int h, int bord, unsigned fmt, unsigned type, const void *px) {
   if (!real_glTexImage2D) real_glTexImage2D = dlsym(RTLD_DEFAULT, "glTexImage2D");
+  if (g_tex_half < 0) g_tex_half = getenv("BULLY_TEX_HALF") ? 1 : 0;
   if (ifmt == 0x8058) ifmt = 0x1908;       /* GL_RGBA8 -> GL_RGBA (GLES2 não aceita sized) */
   else if (ifmt == 0x8051) ifmt = 0x1907;  /* GL_RGB8 -> GL_RGB */
-  /* As texturas de PERSONAGEM (camisa/skin do Jimmy) são GL_LUMINANCE (0x1909):
-   * no Mali-450 a leitura sai errada (preto + alpha errado) -> alpha-test
-   * descarta -> invisível. CONVERTE L->RGBA8888 (L,L,L,255) na CPU -> Mali lê
-   * certo, alpha=1 passa o teste, cor cinza correta. (idem GL_LUMINANCE_ALPHA) */
+  /* pula mipmaps: como forço MIN_FILTER=LINEAR, os níveis >0 nunca são usados ->
+   * só desperdiçam memória de textura da GPU (o Mali Utgard trava ao estourar). */
+  if (g_tex_half && lvl > 0) return;
+  /* LUMINANCE vazia (px=NULL) = alvo de render-to-texture da roupa; Mali não
+   * renderiza p/ LUMINANCE -> aloca RGBA (renderável). Sem reduzir (é o alvo). */
   if ((fmt == 0x1909 || fmt == 0x190A) && type == 0x1401 && !px && w > 0 && h > 0) {
-    /* alocação VAZIA LUMINANCE (px=NULL) = alvo de render-to-texture (roupa do
-     * Jimmy). Mali-450 NÃO renderiza p/ LUMINANCE -> FBO incompleto -> textura
-     * vazia -> camisa preta+discard. Aloca como RGBA (renderável). */
-    if (lvl == 0) fprintf(stderr, "[tex] LUMINANCE VAZIA->RGBA %dx%d (alvo RTT da roupa?)\n", w, h);
     if (real_glTexImage2D) real_glTexImage2D(tgt, lvl, 0x1908, w, h, bord, 0x1908, 0x1401, NULL);
     return;
   }
+  /* monta os dados finais; converte LUMINANCE->RGBA (Mali lê L como (L,L,L,L)) */
+  const unsigned char *data = px;
+  unsigned ufmt = fmt, utype = type;
+  unsigned char *conv = NULL;
   if ((fmt == 0x1909 || fmt == 0x190A) && type == 0x1401 && px && w > 0 && h > 0) {
-    int la = (fmt == 0x190A); /* LUMINANCE_ALPHA = 2 bytes/px */
+    int la = (fmt == 0x190A);
     const unsigned char *src = px;
-    unsigned char *rgba = malloc((size_t)w * h * 4);
-    if (rgba) {
+    conv = malloc((size_t)w * h * 4);
+    if (conv) {
       for (int i = 0; i < w * h; i++) {
         unsigned char L = src[la ? i * 2 : i];
-        unsigned char A = la ? src[i * 2 + 1] : 255;
-        rgba[i*4] = L; rgba[i*4+1] = L; rgba[i*4+2] = L; rgba[i*4+3] = A;
+        conv[i*4] = L; conv[i*4+1] = L; conv[i*4+2] = L; conv[i*4+3] = la ? src[i*2+1] : 255;
       }
-      if (lvl == 0) fprintf(stderr, "[tex] LUMINANCE->RGBA convertido %dx%d (la=%d)\n", w, h, la);
-      if (real_glTexImage2D) real_glTexImage2D(tgt, lvl, 0x1908, w, h, bord, 0x1908, 0x1401, rgba);
-      free(rgba);
+      data = conv; ufmt = 0x1908; utype = 0x1401; ifmt = 0x1908;
+    }
+  }
+  /* reduz pela metade as texturas grandes (>=512): 512->256 = 1/4 da memória.
+   * UV é normalizado (0..1) -> reduzir não quebra coordenadas. */
+  int bpp = bpp_of(ufmt, utype);
+  if (g_tex_half && data && bpp > 0 && (w >= 512 || h >= 512)) {
+    int nw = w / 2, nh = h / 2;
+    unsigned char *sm = (nw > 0 && nh > 0) ? malloc((size_t)nw * nh * bpp) : NULL;
+    if (sm) {
+      for (int y = 0; y < nh; y++)
+        for (int x = 0; x < nw; x++)
+          memcpy(sm + ((size_t)y * nw + x) * bpp, data + ((size_t)(y*2) * w + x*2) * bpp, bpp);
+      if (real_glTexImage2D) real_glTexImage2D(tgt, lvl, ifmt, nw, nh, bord, ufmt, utype, sm);
+      free(sm); free(conv);
       return;
     }
   }
-  if (real_glTexImage2D) real_glTexImage2D(tgt, lvl, ifmt, w, h, bord, fmt, type, px);
+  if (real_glTexImage2D) real_glTexImage2D(tgt, lvl, ifmt, w, h, bord, ufmt, utype, data);
+  free(conv);
 }
 
 void bully_imports_init(void) { ctype_init(); }

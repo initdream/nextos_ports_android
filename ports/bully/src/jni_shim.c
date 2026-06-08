@@ -292,7 +292,27 @@ extern int   asset_getc(void *h);
 extern char *asset_gets(char *b, int m, void *h);
 
 static int   nv_init(void *a, void *b, void *c) { asset_archive_init(); return 0; }
+/* TESTE escola: stuba sons de aluno (BULLY_NO_CROWD_SND) e/ou os mapas de
+ * DETALHE _n/_s (BULLY_TEX_LIGHT) -> corta memória de textura da GPU (o Mali
+ * Utgard trava quando a escola cheia de NPCs estoura o limite de textura). */
+static int g_no_crowd_snd = -1;
+static int g_tex_light = -1;
+static int ends_with(const char *s, const char *suf) {
+  size_t ls = strlen(s), lf = strlen(suf);
+  return ls >= lf && strcmp(s + ls - lf, suf) == 0;
+}
 static void *nv_open(const char *p) {
+  if (g_no_crowd_snd < 0) g_no_crowd_snd = getenv("BULLY_NO_CROWD_SND") ? 1 : 0;
+  if (g_tex_light < 0) g_tex_light = getenv("BULLY_TEX_LIGHT") ? 1 : 0;
+  if (g_no_crowd_snd && p &&
+      (strstr(p, "speech") || strstr(p, "ambs_") || strstr(p, "_chatter") || strstr(p, "crowd"))) {
+    return NULL;
+  }
+  if (g_tex_light && p && (ends_with(p, "_n.tex") || ends_with(p, "_s.tex"))) {
+    static int n = 0;
+    if (n < 6) { fprintf(stderr, "[nvapk] SKIP detalhe \"%s\" (TEX_LIGHT)\n", p); n++; }
+    return NULL;
+  }
   void *h = asset_open(p);
   fprintf(stderr, "[nvapk] open \"%s\" -> %s\n", p ? p : "(null)", h ? "OK" : "MISS");
   return h;
@@ -626,7 +646,7 @@ void jni_load(void) {
     if (rk_signin && f > 45) { rk_signin = 0; if (OS_SignInComplete) OS_SignInComplete(); }
 
     OnDrawFrame(fake_env, NULL, 1.0f/60.0f);  /* heartbeat; GL real ocorre na render thread do jogo */
-    if (f < 5 || f % 120 == 0) fprintf(stderr, "[drv] frame %d\n", f);
+    if (f < 5 || f % 120 == 0) { extern unsigned long g_fbo_binds; fprintf(stderr, "[drv] frame %d (RTT binds=%lu)\n", f, g_fbo_binds); }
     SDL_Delay(16);
   }
 }
