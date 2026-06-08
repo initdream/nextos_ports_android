@@ -264,3 +264,22 @@ frame (abre SDL_GameController "USB Gamepad" via gamecontrollerdb do sistema; in
 PERFEITO** (arte da capa Jimmy, logo, cores) — navegável. Screenshot bully_MENU_PRINCIPAL.png.
 BULLY JOGÁVEL no Mali-450 (render+som+controle). Commit 81d496b. Falta: corpos 3D dos personagens
 (skinning), empacotar ES.
+
+## 🔎 Camisa/torso do Jimmy (jogável) invisível — INVESTIGAÇÃO PROFUNDA (2026-06-08)
+SÓ o personagem JOGÁVEL (NPCs OK). Renderiza: cabeça, pescoço, gola, mão, calça, tênis.
+NÃO renderiza: CAMISA/torso, braços (superior), brasão. = "transparente" (vê o fundo).
+**CAUSA confirmada:** alpha-test discard no fragment shader do ped:
+  `gl_FragColor = getlitcolor(texture2D(diffuse,In_uv1)); if (gl_FragColor.a < 0.7) discard; gl_FragColor *= fadeandcolor;`
+A textura `diffuse` do corpo **lê ZERO (preto + alpha 0)** no Mali -> alpha<0.7 -> discard -> some.
+(Remover o discard global -> a camisa APARECE PRETA + quebra folhagem; confirma o discard.)
+**A textura do corpo é RENDER-TO-TEXTURE** (composição de roupa do Bully, "skins"): 12 glBindFramebuffer,
+0 glReadPixels. Os FBOs com COLOR_ATTACHMENT0 (tex 588/589/713/777=personagem) dão status COMPLETE.
+**=> o FBO está OK mas o PASS de composição renderiza VAZIO no Mali** (a roupa não é desenhada na
+textura). Próximo (sessão focada): debugar o que o pass de RTT desenha (texturas-fonte da roupa +
+draws) e por que sai zero no Mali-450.
+**DESCARTADO:** bones (clamp 59/array 240), vertex-precision (highp mantido no vertex), formato
+textura (RGBA4444/RGB565 ok, 0 erro), compressed (nenhum), GL_LUMINANCE-sample (convertido L->RGBA
+incl px=NULL), alpha-blend (glEnable BLEND off não ajudou), threshold (baixei 0.7->0.04, não bastou
+=> alpha é ~0), FBO incompleto (attach dá COMPLETE).
+**Fixes que FICAM (corretos):** highp->mediump (frag), LUMINANCE->RGBA, RGBA8->RGBA, glTexParameteri
+MAX_LEVEL/mipmap, glClear cor, threshold 0.04. Jogo 100% JOGÁVEL exceto a camisa do Jimmy.
