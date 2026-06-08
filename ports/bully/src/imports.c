@@ -103,8 +103,12 @@ static FILE *w_fopen(const char *path, const char *mode) {
   static FILE *(*real)(const char *, const char *) = NULL;
   if (!real) real = dlsym(RTLD_DEFAULT, "fopen");
   FILE *f = real ? real(path, mode) : NULL;
-  if (!f && path && mode && (mode[0] == 'r'))
-    f = zip_fs_fopen(path);
+  /* device: os dados ficam em assets/ (vfat sem symlink); o jogo fopena
+   * "data_N.zip" no cwd -> redireciona p/ "assets/data_N.zip". */
+  if (!f && real && path && mode && mode[0] == 'r' && strncmp(path, "assets/", 7) != 0) {
+    char alt[1024]; snprintf(alt, sizeof(alt), "assets/%s", path);
+    f = real(alt, mode);
+  }
   return f;
 }
 
