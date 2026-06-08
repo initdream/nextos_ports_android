@@ -10,6 +10,17 @@ Não recompila o jogo: **carrega o `.so` nativo do Android e roda direto** no Li
 
 > 🥈 **Primeiro port feito DO ZERO com o framework: [`ports/revc`](ports/revc/README.md) — GTA: Vice City (reVC Android), 100% JOGÁVEL no Mali-450** (mundo, controle, áudio, menu, NPCs). Documenta a arquitetura **so-loader 2-módulos** (libc++_shared + engine) e as **receitas Mali-450/GLES2 reutilizáveis** (ABI pthread bionic→glibc, shaders highp/MAX_LIGHTS/im2d, texturas `GL_RGBA8`/`GL_TEXTURE_MAX_LEVEL`-mipmap, SDL resolução/input, redirect de `fopen`, patch de runtime). **Boa base ao portar o próximo jogo.**
 
+## Jogos portados
+| Jogo | Estado | Pasta |
+|---|---|---|
+| **Bully: Anniversary Edition** | ✅ **100% jogável** (Mali-450, GLES2) — mundo, escola, personagem, controle, áudio | [`ports/bully`](ports/bully/) |
+| **GTA: Vice City** (reVC, open-source) | ✅ **100% jogável** (Mali-450) — mundo, controle, áudio, menu, NPCs | [`ports/revc`](ports/revc/) |
+| **GTA: Vice City** (Android comercial) | 🚧 WIP — front-end/menu renderiza; travando no carregamento da fase | [`ports/gtavc`](ports/gtavc/) |
+| **Hollow Knight** (Unity 2020 IL2CPP) | 🔬 pesquisa — **renderiza em GLES3** (S905X5M, Mali-G310); muro = input nativo dos menus. No Mali-450/GLES2 há parede de shader (jogo é GLES3-only) | [`experiments/hollow-recon`](experiments/hollow-recon/) |
+| Syberia (GLES1) · LEGO Star Wars: TCS (GLES2) | 📦 referência (de **mtojek**) — validam o framework no Utgard | — |
+
+> Todos os ports são **BYO-data**: o repo traz só o código/loader; você fornece o `.so` + assets do APK que **possui legalmente**.
+
 ## Por que funciona tão bem
 Android é Linux. O código do jogo é **ARM nativo** rodando no ARM do device — zero emulação de CPU. GLES é GLES (mesma API). Nos teus TV boxes, é praticamente o hardware nativo do jogo (mesmo SoC/GPU classe Android). Só a "casca" Android é trocada por SDL2/glibc.
 
