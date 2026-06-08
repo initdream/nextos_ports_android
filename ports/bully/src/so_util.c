@@ -43,13 +43,32 @@ static int num_syms;
 static char *shstrtab;
 static char *dynstrtab;
 
+/* Pool de trampolins na CAUDA do heap do libGame (dentro de ±128MB de todo o
+ * .text). Cada hook escreve só 4 bytes no entry (um B p/ o slot do pool) -> não
+ * overflowa funções pequenas (NvAPKSize/NvAPKClose têm 4 bytes e ficam 4 bytes
+ * de NvAPKRead/NvAPKGetc; o trampolim antigo de 16 bytes corrompia o vizinho). */
+static uint8_t *g_tramp_pool = NULL;
+static int g_tramp_used = 0;
+
 void hook_arm64(uintptr_t addr, uintptr_t dst) {
   if (addr == 0)
     return;
+  if (g_tramp_pool == NULL) {
+    /* cauda do módulo carregado (data_base+data_size), RWX (mmap original) */
+    g_tramp_pool = (uint8_t *)(((uintptr_t)data_base + data_size + 15) & ~(uintptr_t)15);
+  }
+  uint32_t *slot = (uint32_t *)(g_tramp_pool + (size_t)g_tramp_used * 16);
+  g_tramp_used++;
+  slot[0] = 0x58000051u;          // LDR X17, #0x8
+  slot[1] = 0xd61f0220u;          // BR X17
+  *(uint64_t *)(slot + 2) = dst;  // alvo (64-bit)
+  __builtin___clear_cache((char *)slot, (char *)slot + 16);
+
+  /* entry: B slot (4 bytes) — alcance ±128MB; pool está a poucos MB do .text */
   uint32_t *hook = (uint32_t *)addr;
-  hook[0] = 0x58000051u; // LDR X17, #0x8
-  hook[1] = 0xd61f0220u; // BR X17
-  *(uint64_t *)(hook + 2) = dst;
+  intptr_t off = (intptr_t)((uintptr_t)slot - addr);
+  hook[0] = 0x14000000u | (((uint32_t)(off >> 2)) & 0x03FFFFFFu);
+  __builtin___clear_cache((char *)hook, (char *)hook + 4);
 }
 
 void so_make_text_writable(void) {

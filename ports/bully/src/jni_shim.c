@@ -218,11 +218,28 @@ static void *nv_open(const char *p) {
   fprintf(stderr, "[nvapk] open \"%s\" -> %s\n", p ? p : "(null)", h ? "OK" : "MISS");
   return h;
 }
-static size_t nv_read(void *buf, size_t s, size_t n, void *h) { return h ? asset_read(buf, s, n, h) : 0; }
-static int   nv_seek(void *h, long o, int w) { return h ? asset_seek(h, o, w) : -1; }
+static int g_nvdbg = 0; /* loga as primeiras N chamadas p/ ver o padrão do loop */
+static size_t nv_read(void *buf, size_t s, size_t n, void *h) {
+  size_t r = h ? asset_read(buf, s, n, h) : 0;
+  if (g_nvdbg < 90) { fprintf(stderr, "[nv] read h=%p s=%zu n=%zu -> %zu\n", h, s, n, r); g_nvdbg++; }
+  return r;
+}
+static int   nv_seek(void *h, long o, int w) {
+  int r = h ? asset_seek(h, o, w) : -1;
+  if (g_nvdbg < 90) { fprintf(stderr, "[nv] seek h=%p o=%ld w=%d -> %d\n", h, o, w, r); g_nvdbg++; }
+  return r;
+}
 static void  nv_close(void *h) { asset_close(h); }
-static long  nv_tell(void *h) { return h ? asset_tell(h) : -1; }
-static long  nv_size(void *h) { return h ? asset_size(h) : 0; }
+static long  nv_tell(void *h) {
+  long r = h ? asset_tell(h) : -1;
+  if (g_nvdbg < 90) { fprintf(stderr, "[nv] tell h=%p -> %ld\n", h, r); g_nvdbg++; }
+  return r;
+}
+static long  nv_size(void *h) {
+  long r = h ? asset_size(h) : 0;
+  if (g_nvdbg < 90) { fprintf(stderr, "[nv] size h=%p -> %ld\n", h, r); g_nvdbg++; }
+  return r;
+}
 static int   nv_eof(void *h) { return h ? asset_eof(h) : 1; }
 static int   nv_getc(void *h) { return h ? asset_getc(h) : -1; }
 static char *nv_gets(char *b, int m, void *h) { return h ? asset_gets(b, m, h) : NULL; }
