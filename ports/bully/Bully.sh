@@ -50,12 +50,6 @@ if [ ! -f "$GAMEDIR/libGame.so" ] || [ ! -f "$GAMEDIR/assets/data_0.zip" ]; then
   exit 1
 fi
 
-# ---------- swap (device 832MB -- so seguranca) ----------
-$ESUDO swapon "$GAMEDIR/bully.swap" 2>/dev/null
-$ESUDO swapon /storage/roms/gtavc.swap 2>/dev/null
-$ESUDO sysctl -w vm.swappiness=80 >/dev/null 2>&1
-$ESUDO chmod 666 /dev/uinput 2>/dev/null
-
 # ---------- ambiente ----------
 export LD_LIBRARY_PATH="/usr/lib:$GAMEDIR:$LD_LIBRARY_PATH"
 export SDL_GAMECONTROLLERCONFIG="$sdl_controllerconfig"
