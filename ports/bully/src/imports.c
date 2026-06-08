@@ -148,8 +148,34 @@ static void my_glShaderSource(unsigned sh, int count, const char *const *str, co
   char *cat = malloc(total); cat[0] = 0;
   for (int i = 0; i < count; i++) if (str && str[i]) strcat(cat, str[i]);
   /* Utgard (Mali-400/450 GP) não suporta highp -> mediump (cores lavadas) */
-  char *s1 = str_replace_all(cat, "highp", "mediump");
+  /* Mali-450: a GP (vertex) É FP32 e SUPORTA highp; só a PP (fragment) não tem.
+   * Forçar mediump no VERTEX quebra a precisão do skinning -> braços/corpo do
+   * Jimmy (muita deformação) colapsam/NaN -> invisíveis. Então só troca
+   * highp->mediump nos shaders de FRAGMENTO (mantém highp no vertex). */
+  int is_vertex = strstr(cat, "gl_Position") != NULL;
+  char *s0 = is_vertex ? strdup(cat) : str_replace_all(cat, "highp", "mediump");
   free(cat);
+  /* PALETTE DE OSSOS: o engine gerou bones[180]=60 ossos (limite Mali-450 256
+   * uniforms). O Jimmy (jogável) tem >60 ossos -> braços/camisa referenciam
+   * índice 60+ -> fora do array -> colapsa -> INVISÍVEL. Aumenta p/ 80 ossos
+   * (bones[240]: 240+overhead ainda <256). */
+  /* TESTE: clampa o índice de osso ao range realmente enviado (0..59). Se o
+   * jogo só faz upload de 60 ossos e o corpo do Jimmy referencia 60+, eles leem
+   * ZERO -> matriz zero -> vértice no origin (colapsa). Clampar usa um osso
+   * válido -> corpo VISÍVEL (mesmo que deformado) e confirma a causa. */
+  char *sb = str_replace_all(s0, "ivec4(Attr2)", "ivec4(clamp(Attr2,0.0,59.0))");
+  free(s0);
+  /* alpha-test do Jimmy: `if (gl_FragColor.a < 0.7) discard`. No Mali a LUMINANCE
+   * é amostrada como (L,L,L,L) -> alpha = L (escuro) < 0.7 -> descarta a camisa.
+   * Baixa o limiar p/ 0.04 (só descarta alpha quase-zero = recortes reais de
+   * folhagem; a camisa, L>0.04, passa). Combina com a conversão LUMINANCE->RGBA. */
+  char *s1 = str_replace_all(sb, "< 0.7)", "< 0.04)");
+  free(sb);
+  if (!is_vertex && strstr(s1, "discard")) {
+    static int dc = 0;
+    char p[128]; snprintf(p, sizeof(p), "/storage/roms/ports/bully/shaders/disc_%d.glsl", dc++);
+    FILE *f = fopen(p, "w"); if (f) { fputs(s1, f); fclose(f); }
+  }
   const char *one = s1;
   if (real_glShaderSource) real_glShaderSource(sh, 1, &one, NULL);
   free(s1);
@@ -162,12 +188,74 @@ static void my_glTexParameteri(unsigned target, unsigned pname, int param) {
     param = 0x2601;                                             /* *_MIPMAP_* -> GL_LINEAR (sem mipmap completo = preto) */
   if (real_glTexParameteri) real_glTexParameteri(target, pname, param);
 }
+/* log de erros de compile/link de shader (achar o shader do Jimmy que falha) */
+static void (*real_glCompileShader)(unsigned) = NULL;
+static void my_glCompileShader(unsigned sh) {
+  if (!real_glCompileShader) real_glCompileShader = dlsym(RTLD_DEFAULT, "glCompileShader");
+  if (real_glCompileShader) real_glCompileShader(sh);
+  void (*giv)(unsigned, unsigned, int *) = dlsym(RTLD_DEFAULT, "glGetShaderiv");
+  void (*gil)(unsigned, int, int *, char *) = dlsym(RTLD_DEFAULT, "glGetShaderInfoLog");
+  int ok = 1; if (giv) giv(sh, 0x8B81, &ok); /* GL_COMPILE_STATUS */
+  if (!ok) { char log[1500] = {0}; if (gil) gil(sh, 1500, NULL, log); fprintf(stderr, "[shader] COMPILE FAIL sh=%u: %s\n", sh, log); }
+}
+static void (*real_glLinkProgram)(unsigned) = NULL;
+static void my_glLinkProgram(unsigned p) {
+  if (!real_glLinkProgram) real_glLinkProgram = dlsym(RTLD_DEFAULT, "glLinkProgram");
+  if (real_glLinkProgram) real_glLinkProgram(p);
+  void (*giv)(unsigned, unsigned, int *) = dlsym(RTLD_DEFAULT, "glGetProgramiv");
+  void (*gil)(unsigned, int, int *, char *) = dlsym(RTLD_DEFAULT, "glGetProgramInfoLog");
+  int ok = 1; if (giv) giv(p, 0x8B82, &ok); /* GL_LINK_STATUS */
+  if (!ok) { char log[1500] = {0}; if (gil) gil(p, 1500, NULL, log); fprintf(stderr, "[shader] LINK FAIL p=%u: %s\n", p, log); }
+}
+/* texturas comprimidas: Mali-450 só faz ETC1 (0x8D64). Loga formatos p/ achar
+ * se a camisa/skin do Jimmy usa um formato que o Mali rejeita -> transparente. */
+static void (*real_glCompressedTexImage2D)(unsigned,int,unsigned,int,int,int,int,const void*) = NULL;
+static void my_glCompressedTexImage2D(unsigned t,int l,unsigned ifmt,int w,int h,int b,int sz,const void*d) {
+  if (!real_glCompressedTexImage2D) real_glCompressedTexImage2D = dlsym(RTLD_DEFAULT, "glCompressedTexImage2D");
+  static int n = 0;
+  if (n < 40) { fprintf(stderr, "[tex] compressed fmt=0x%x %dx%d sz=%d\n", ifmt, w, h, sz); n++; }
+  if (real_glCompressedTexImage2D) real_glCompressedTexImage2D(t,l,ifmt,w,h,b,sz,d);
+}
+/* TESTE: ignora glEnable(GL_BLEND) -> se a camisa do Jimmy aparecer OPACA,
+ * confirma que ela some por alpha-blend (alpha~0). (Quebra transparências
+ * legítimas; é só p/ diagnóstico.) */
+static void (*real_glEnable)(unsigned) = NULL;
+static void my_glEnable(unsigned cap) {
+  if (!real_glEnable) real_glEnable = dlsym(RTLD_DEFAULT, "glEnable");
+  if (real_glEnable) real_glEnable(cap); /* (skip de GL_BLEND revertido: não era blend) */
+}
 static void (*real_glClear)(unsigned) = NULL;
 static int g_cleardbg = 0;
 static void my_glClear(unsigned mask) {
   if (!real_glClear) real_glClear = dlsym(RTLD_DEFAULT, "glClear");
   if (g_cleardbg < 8) { fprintf(stderr, "[gl] glClear mask=0x%x -> 0x%x\n", mask, mask | 0x4000); g_cleardbg++; }
   if (real_glClear) real_glClear(mask | 0x4000); /* força limpar COR (GL_COLOR_BUFFER_BIT) */
+}
+/* glTexStorage2D (GLES3) — a camisa do Jimmy pode vir por aqui (não pelo
+ * glTexImage2D). Loga formato/níveis. */
+static void (*real_glTexStorage2D)(unsigned, int, unsigned, int, int) = NULL;
+static void my_glTexStorage2D(unsigned t, int levels, unsigned ifmt, int w, int h) {
+  if (!real_glTexStorage2D) real_glTexStorage2D = dlsym(RTLD_DEFAULT, "glTexStorage2D");
+  static int n = 0;
+  if (n < 30) { fprintf(stderr, "[tex] STORAGE levels=%d ifmt=0x%x %dx%d\n", levels, ifmt, w, h); n++; }
+  if (real_glTexStorage2D) real_glTexStorage2D(t, levels, ifmt, w, h);
+}
+static void (*real_glTexSubImage2D)(unsigned,int,int,int,int,int,unsigned,unsigned,const void*) = NULL;
+static void my_glTexSubImage2D(unsigned t,int l,int xo,int yo,int w,int h,unsigned fmt,unsigned type,const void*px) {
+  if (!real_glTexSubImage2D) real_glTexSubImage2D = dlsym(RTLD_DEFAULT, "glTexSubImage2D");
+  static int n = 0;
+  if (n < 30 && l == 0) { fprintf(stderr, "[tex] SUB fmt=0x%x type=0x%x %dx%d\n", fmt, type, w, h); n++; }
+  if (real_glTexSubImage2D) real_glTexSubImage2D(t,l,xo,yo,w,h,fmt,type,px);
+}
+/* status do FBO (render-to-texture da roupa) — se INCOMPLETO no Mali, a textura
+ * do corpo fica vazia -> camisa preta+discard. */
+static unsigned (*real_glCheckFramebufferStatus)(unsigned) = NULL;
+static unsigned my_glCheckFramebufferStatus(unsigned t) {
+  if (!real_glCheckFramebufferStatus) real_glCheckFramebufferStatus = dlsym(RTLD_DEFAULT, "glCheckFramebufferStatus");
+  unsigned s = real_glCheckFramebufferStatus ? real_glCheckFramebufferStatus(t) : 0;
+  static int n = 0;
+  if (n < 20) { fprintf(stderr, "[fbo] CheckStatus=0x%x %s\n", s, s == 0x8CD5 ? "COMPLETE" : "INCOMPLETO!"); n++; }
+  return s;
 }
 static void (*real_glClearColor)(float, float, float, float) = NULL;
 static int g_ccdbg = 0;
@@ -181,6 +269,34 @@ static void my_glTexImage2D(unsigned tgt, int lvl, int ifmt, int w, int h, int b
   if (!real_glTexImage2D) real_glTexImage2D = dlsym(RTLD_DEFAULT, "glTexImage2D");
   if (ifmt == 0x8058) ifmt = 0x1908;       /* GL_RGBA8 -> GL_RGBA (GLES2 não aceita sized) */
   else if (ifmt == 0x8051) ifmt = 0x1907;  /* GL_RGB8 -> GL_RGB */
+  /* As texturas de PERSONAGEM (camisa/skin do Jimmy) são GL_LUMINANCE (0x1909):
+   * no Mali-450 a leitura sai errada (preto + alpha errado) -> alpha-test
+   * descarta -> invisível. CONVERTE L->RGBA8888 (L,L,L,255) na CPU -> Mali lê
+   * certo, alpha=1 passa o teste, cor cinza correta. (idem GL_LUMINANCE_ALPHA) */
+  if ((fmt == 0x1909 || fmt == 0x190A) && type == 0x1401 && !px && w > 0 && h > 0) {
+    /* alocação VAZIA LUMINANCE (px=NULL) = alvo de render-to-texture (roupa do
+     * Jimmy). Mali-450 NÃO renderiza p/ LUMINANCE -> FBO incompleto -> textura
+     * vazia -> camisa preta+discard. Aloca como RGBA (renderável). */
+    if (lvl == 0) fprintf(stderr, "[tex] LUMINANCE VAZIA->RGBA %dx%d (alvo RTT da roupa?)\n", w, h);
+    if (real_glTexImage2D) real_glTexImage2D(tgt, lvl, 0x1908, w, h, bord, 0x1908, 0x1401, NULL);
+    return;
+  }
+  if ((fmt == 0x1909 || fmt == 0x190A) && type == 0x1401 && px && w > 0 && h > 0) {
+    int la = (fmt == 0x190A); /* LUMINANCE_ALPHA = 2 bytes/px */
+    const unsigned char *src = px;
+    unsigned char *rgba = malloc((size_t)w * h * 4);
+    if (rgba) {
+      for (int i = 0; i < w * h; i++) {
+        unsigned char L = src[la ? i * 2 : i];
+        unsigned char A = la ? src[i * 2 + 1] : 255;
+        rgba[i*4] = L; rgba[i*4+1] = L; rgba[i*4+2] = L; rgba[i*4+3] = A;
+      }
+      if (lvl == 0) fprintf(stderr, "[tex] LUMINANCE->RGBA convertido %dx%d (la=%d)\n", w, h, la);
+      if (real_glTexImage2D) real_glTexImage2D(tgt, lvl, 0x1908, w, h, bord, 0x1908, 0x1401, rgba);
+      free(rgba);
+      return;
+    }
+  }
   if (real_glTexImage2D) real_glTexImage2D(tgt, lvl, ifmt, w, h, bord, fmt, type, px);
 }
 
@@ -212,6 +328,13 @@ DynLibFunction bully_stub_table[] = {
   {"glTexImage2D", (uintptr_t)my_glTexImage2D},
   {"glClear", (uintptr_t)my_glClear},
   {"glClearColor", (uintptr_t)my_glClearColor},
+  {"glCompileShader", (uintptr_t)my_glCompileShader},
+  {"glLinkProgram", (uintptr_t)my_glLinkProgram},
+  {"glCompressedTexImage2D", (uintptr_t)my_glCompressedTexImage2D},
+  {"glEnable", (uintptr_t)my_glEnable},
+  {"glTexStorage2D", (uintptr_t)my_glTexStorage2D},
+  {"glTexSubImage2D", (uintptr_t)my_glTexSubImage2D},
+  {"glCheckFramebufferStatus", (uintptr_t)my_glCheckFramebufferStatus},
   {"fopen", (uintptr_t)w_fopen},
   {"_ZTH7gString", (uintptr_t)tl_noop}, {"_ZTH8gString2", (uintptr_t)tl_noop},
   {"_ZTHN10ALCcontext13sLocalContextE", (uintptr_t)tl_noop},
