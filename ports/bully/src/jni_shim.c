@@ -627,6 +627,7 @@ void jni_load(void) {
   extern volatile int g_rk_pending_initial, g_rk_pending_gate, g_rk_pending_gate_type;
   int rk_fired = 0, rk_signin = 0;
   for (int f = 0; OnDrawFrame; f++) {
+    extern unsigned long g_frame_no; g_frame_no = (unsigned long)f; /* p/ proteger glFinish do RTT (só in-game) */
     SDL_Event e; while (SDL_PollEvent(&e)) if (e.type == SDL_QUIT) return;
     pump_gamepad(); /* empurra eventos de controle pro jogo (Down/Up/Axes) */
     if (canRender) *canRender = 1;

@@ -152,12 +152,20 @@ static void my_glShaderSource(unsigned sh, int count, const char *const *str, co
    * Forçar mediump no VERTEX quebra a precisão do skinning -> braços/corpo do
    * Jimmy (muita deformação) colapsam/NaN -> invisíveis. Então só troca
    * highp->mediump nos shaders de FRAGMENTO (mantém highp no vertex). */
-  /* só fragment: highp->mediump (Utgard PP não tem highp). Vertex mantém highp
-   * (skinning). NÃO mexer no threshold do alpha-test (0.04 dava contorno preto
-   * na folhagem) — fica o 0.7 original. */
+  /* só fragment: highp->mediump (Utgard PP não tem highp). Vertex mantém highp (skinning). */
   int is_vertex = strstr(cat, "gl_Position") != NULL;
-  char *s1 = is_vertex ? strdup(cat) : str_replace_all(cat, "highp", "mediump");
+  char *s0 = is_vertex ? strdup(cat) : str_replace_all(cat, "highp", "mediump");
   free(cat);
+  /* alpha-test SÓ nos shaders de PERSONAGEM (têm `fadeandcolor`, exclusivo de
+   * peds/Jimmy): a roupa do Jimmy é composta numa textura (RTT, 163 draws OK),
+   * mas o alpha da textura composta sai baixo no Mali -> `if (a<0.7) discard`
+   * corta a roupa -> aparece e some. Baixa p/ 0.04 só nesses shaders (folhagem
+   * NÃO tem fadeandcolor -> intacta). */
+  char *s1 = s0;
+  if (!is_vertex && strstr(s0, "fadeandcolor")) {
+    s1 = str_replace_all(s0, "< 0.7)", "< 0.04)");
+    free(s0);
+  }
   const char *one = s1;
   if (real_glShaderSource) real_glShaderSource(sh, 1, &one, NULL);
   free(s1);
@@ -208,10 +216,26 @@ static void my_glEnable(unsigned cap) {
 }
 static void (*real_glClear)(unsigned) = NULL;
 static int g_cleardbg = 0;
+unsigned g_pending_clear = 0;   /* clear adiado dentro de FBO (só efetiva se vier draw) */
+static int g_defer_clear = -1;
+void bully_flush_pending_clear(void) { /* chamado pelos draws dentro do FBO */
+  if (g_pending_clear) {
+    if (!real_glClear) real_glClear = dlsym(RTLD_DEFAULT, "glClear");
+    if (real_glClear) real_glClear(g_pending_clear);
+    g_pending_clear = 0;
+  }
+}
 static void my_glClear(unsigned mask) {
+  extern int g_in_fbo, g_rtt_clears;
+  if (g_defer_clear < 0) g_defer_clear = getenv("BULLY_DEFER_CLEAR") ? 1 : 0;
   if (!real_glClear) real_glClear = dlsym(RTLD_DEFAULT, "glClear");
+  /* dentro de render-to-texture: ADIA o clear. Se vier um draw -> limpa+desenha
+   * (composição normal). Se NÃO vier draw (composite "clear-only") -> pula o
+   * clear no unbind -> a roupa já composta NÃO é apagada. */
+  if (g_defer_clear && g_in_fbo) { g_rtt_clears++; g_pending_clear = mask | 0x4000; return; }
+  if (g_in_fbo) g_rtt_clears++;
   if (g_cleardbg < 8) { fprintf(stderr, "[gl] glClear mask=0x%x -> 0x%x\n", mask, mask | 0x4000); g_cleardbg++; }
-  if (real_glClear) real_glClear(mask | 0x4000); /* força limpar COR (GL_COLOR_BUFFER_BIT) */
+  if (real_glClear) real_glClear(mask | 0x4000);
 }
 /* glTexStorage2D (GLES3) — a camisa do Jimmy pode vir por aqui (não pelo
  * glTexImage2D). Loga formato/níveis. */
@@ -232,18 +256,43 @@ static void my_glTexSubImage2D(unsigned t,int l,int xo,int yo,int w,int h,unsign
 /* status do FBO (render-to-texture da roupa) — se INCOMPLETO no Mali, a textura
  * do corpo fica vazia -> camisa preta+discard. */
 static void (*real_glBindFramebuffer)(unsigned, unsigned) = NULL;
-unsigned long g_fbo_binds = 0; /* contador p/ medir tempestade de RTT (escola) */
+unsigned long g_fbo_binds = 0; /* contador p/ medir RTT */
+unsigned long g_frame_no = 0;  /* setado pelo loop de render (jni_shim) */
+int g_in_fbo = 0;              /* >0 = dentro de um render-to-texture */
+int g_rtt_draws = 0, g_rtt_clears = 0; /* trace: draws/clears no FBO atual */
+unsigned g_rtt_tex = 0;        /* textura anexada ao FBO atual */
+static int g_rtt_trace = 0;
 static void my_glBindFramebuffer(unsigned t, unsigned fb) {
   if (!real_glBindFramebuffer) real_glBindFramebuffer = dlsym(RTLD_DEFAULT, "glBindFramebuffer");
-  if (fb != 0) {
-    g_fbo_binds++;
-    if (g_fbo_binds % 300 == 0)
-      fprintf(stderr, "[fbo] RTT binds total=%lu\n", g_fbo_binds);
-  }
+  if (g_rtt_trace == 0) g_rtt_trace = getenv("BULLY_RTT_TRACE") ? 1 : 0;
+  if (fb != 0) { g_in_fbo = 1; g_fbo_binds++; g_rtt_draws = 0; g_rtt_clears = 0; g_rtt_tex = 0; g_pending_clear = 0; }
   if (real_glBindFramebuffer) real_glBindFramebuffer(t, fb);
+  /* ao SAIR do render-to-texture (roupa do Jimmy), o Mali Utgard não GRAVA o
+   * render na textura sem sync -> modelo amostra vazio (roupa pisca e some).
+   * glFinish ESPERA a GPU gravar antes de amostrar. Só DEPOIS do frame 300
+   * (loading pesado já passou -> não satura o device). */
+  if (fb == 0 && g_in_fbo) {
+    g_in_fbo = 0;
+    g_pending_clear = 0; /* pula clear-only (não apaga a roupa já composta) */
+    if (g_rtt_trace && g_frame_no > 60) {
+      static int tn = 0;
+      if (tn < 400) { fprintf(stderr, "[rtt] composite tex=%u draws=%d clears=%d (frame %lu)\n", g_rtt_tex, g_rtt_draws, g_rtt_clears, g_frame_no); tn++; }
+    }
+    if (g_frame_no > 300) {
+      static void (*fin)(void) = NULL;
+      if (!fin) fin = dlsym(RTLD_DEFAULT, "glFinish");
+      if (fin) fin();
+    } else {
+      static void (*fl)(void) = NULL;
+      if (!fl) fl = dlsym(RTLD_DEFAULT, "glFlush");
+      if (fl) fl();
+    }
+  }
 }
 static void (*real_glFramebufferTexture2D)(unsigned,unsigned,unsigned,unsigned,int) = NULL;
 static void my_glFramebufferTexture2D(unsigned t,unsigned att,unsigned tt,unsigned tex,int lvl) {
+  extern unsigned g_rtt_tex;
+  if (att == 0x8CE0) g_rtt_tex = tex;     /* trace: textura-cor anexada ao FBO atual */
   if (!real_glFramebufferTexture2D) real_glFramebufferTexture2D = dlsym(RTLD_DEFAULT, "glFramebufferTexture2D");
   if (real_glFramebufferTexture2D) real_glFramebufferTexture2D(t,att,tt,tex,lvl);
   static int n = 0;
@@ -332,6 +381,22 @@ static void my_glTexImage2D(unsigned tgt, int lvl, int ifmt, int w, int h, int b
   free(conv);
 }
 
+/* trace: conta os desenhos dentro de cada render-to-texture (roupa) */
+static void (*real_glDrawElements)(unsigned, int, unsigned, const void *) = NULL;
+static void my_glDrawElements(unsigned mode, int count, unsigned type, const void *idx) {
+  extern int g_in_fbo, g_rtt_draws; extern void bully_flush_pending_clear(void);
+  if (g_in_fbo) { bully_flush_pending_clear(); g_rtt_draws++; }
+  if (!real_glDrawElements) real_glDrawElements = dlsym(RTLD_DEFAULT, "glDrawElements");
+  if (real_glDrawElements) real_glDrawElements(mode, count, type, idx);
+}
+static void (*real_glDrawArrays)(unsigned, int, int) = NULL;
+static void my_glDrawArrays(unsigned mode, int first, int count) {
+  extern int g_in_fbo, g_rtt_draws; extern void bully_flush_pending_clear(void);
+  if (g_in_fbo) { bully_flush_pending_clear(); g_rtt_draws++; }
+  if (!real_glDrawArrays) real_glDrawArrays = dlsym(RTLD_DEFAULT, "glDrawArrays");
+  if (real_glDrawArrays) real_glDrawArrays(mode, first, count);
+}
+
 void bully_imports_init(void) { ctype_init(); }
 
 /* tabela de overrides (resolvida ANTES do fallback dlsym do so_resolve) */
@@ -370,6 +435,8 @@ DynLibFunction bully_stub_table[] = {
   {"glBindFramebuffer", (uintptr_t)my_glBindFramebuffer},
   {"glReadPixels", (uintptr_t)my_glReadPixels},
   {"glFramebufferTexture2D", (uintptr_t)my_glFramebufferTexture2D},
+  {"glDrawElements", (uintptr_t)my_glDrawElements},
+  {"glDrawArrays", (uintptr_t)my_glDrawArrays},
   {"fopen", (uintptr_t)w_fopen},
   {"_ZTH7gString", (uintptr_t)tl_noop}, {"_ZTH8gString2", (uintptr_t)tl_noop},
   {"_ZTHN10ALCcontext13sLocalContextE", (uintptr_t)tl_noop},
