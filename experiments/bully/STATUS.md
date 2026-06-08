@@ -226,3 +226,17 @@ Engine: boot->JNI->gates->Rockstar->GameMain->resources(data_0-4)->whitetexture 
 PC (window surface NVIDIA / SDL window) p/ ver, OU (b) PIVÔ DEVICE arm64 (libGame.so arm64 já temos
 no APK 60FPS + data_0-4 + receita; Mali fbdev faz render visível, igual reVC). Recomendo (b): o PC
 já provou a engine; o device é o alvo. Commit pós-8162e14.
+
+## arm64 EXTRAÍDO/PRONTO pro device (2026-06-08)
+gamefiles-arm64/lib/arm64-v8a/: libGame.so + libc++_shared + libopenal + libVendor_mpg123 + libz
+(todos ARM aarch64). **libGame.so arm64 BuildID 6139a628aa7a... = MESMA VERSÃO do x86_64** -> mesmos
+offsets conceituais, 38 impl* (contrato JNI idêntico). **TODA a lógica do PC reaproveita** (jni_shim,
+asset_archive, thread orchestration, async worker, zip_fs, hooks make/unmake/screen/cxa).
+### PLANO FASE DEVICE (ports/bully/, igual ports/revc):
+1. so_util: trocar so_util_x64 pelo core AArch64 (core/so_util.c) — relocs R_AARCH64_*.
+2. egl_shim: trocar pbuffer EGL pelo caminho Mali fbdev (SDL2-mali-fbdev OU EGL fbdev direto, igual
+   reVC) -> render VISÍVEL na TV.
+3. Cross-build aarch64 (toolchain NextOS Amlogic-old). data_0-4 + libs no /storage/roms/ports/bully.
+4. Aplicar receitas Mali-450 GLES2 do reVC: shaders highp->mediump/MAX_LIGHTS, GL_RGBA8->GLES2,
+   GL_TEXTURE_MAX_LEVEL->força GL_LINEAR, pthread ABI bionic->glibc (já temos pthread_bridge no reVC).
+5. Deploy + teste no device (precisa device ON/SSH). gptokeyb p/ controle.
