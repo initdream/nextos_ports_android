@@ -301,3 +301,17 @@ FIX (3 reduções de memória de textura, env no starter):
 RESULTADO: escola JOGÁVEL, sem wedge ("perfeito velho"). Texturas um pouco mais suaves (refinável).
 Também: asset_archive O(log n) (qsort+bsearch) destravou o LOADING da escola (antes: varredura
 linear 60418 x milhares de opens). Tudo confirmado NÃO-memória via monitor mem.log no starter.
+
+## 🏆👕 ROUPA DO JIMMY RESOLVIDA (2026-06-08) — JOGO 100%
+Sintoma: a roupa do player (torso/camisa/braços) APARECIA e SUMIA (no guarda-roupa, parado ou mexendo).
+CAUSA-RAIZ (achada com o o autor — "algo que mexemos no código"): o my_glClear forçava
+GL_COLOR_BUFFER_BIT em TODO glClear (fix antigo de tela preta). A composição de roupa (render-to-
+texture) faz clear só de PROFUNDIDADE no estado estável -> o nosso force-COLOR APAGAVA a cor (a roupa
+já composta) -> some. Pistas decisivas: aparece-e-some (renderiza OK); trocar roupa RÁPIDO mantém
+visível (re-compõe sem parar); some PARADO e MEXENDO (descarta skinning/animação); BULLY_DEFER_CLEAR
+(pular clear-only) deu TELA PRETA (o force-COLOR também era da FBO da cena).
+FIX: forçar COR só FORA de FBO (a tela); DENTRO de FBO respeita a máscara do jogo -> um clear de
+profundidade não apaga a roupa. `unsigned m = g_in_fbo ? mask : (mask | 0x4000);`
+RESULTADO: Jimmy VESTIDO (colete Bullworth, braços, tudo), fixo. Jogo 100% jogável/lindo/estável.
+Diagnóstico que levou lá: trace draws/clears por RTT (g_in_fbo, g_rtt_draws/clears) — mostrou as
+composições "draws=0 clears=1" (os clears de profundidade que o force-COLOR transformava em erase).

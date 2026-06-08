@@ -314,7 +314,7 @@ static void *nv_open(const char *p) {
     return NULL;
   }
   void *h = asset_open(p);
-  fprintf(stderr, "[nvapk] open \"%s\" -> %s\n", p ? p : "(null)", h ? "OK" : "MISS");
+  if (!h) fprintf(stderr, "[nvapk] MISS \"%s\"\n", p ? p : "(null)");
   return h;
 }
 static int g_nvdbg = 0; /* loga as primeiras N chamadas p/ ver o padrão do loop */
