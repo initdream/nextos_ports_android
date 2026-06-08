@@ -86,6 +86,9 @@ static int GetGamepadButtons(int port) {
   };
   for (unsigned i = 0; i < sizeof(map)/sizeof(map[0]); i++)
     if (SDL_GameControllerGetButton(g_pad, map[i].b)) m |= map[i].mask;
+  static int last_m = 0, calls = 0;
+  if (calls < 3) { fprintf(stderr, "[pad] GetGamepadButtons CHAMADO (poll #%d) m=0x%x\n", calls, m); calls++; }
+  if (m != last_m) { fprintf(stderr, "[pad] buttons=0x%x\n", m); last_m = m; }
   return m;
 }
 static float GetGamepadAxis(int port, int axis) {
@@ -96,6 +99,63 @@ static float GetGamepadAxis(int port, int axis) {
   if (axis < 0 || axis > 5) return 0.0f;
   float v = SDL_GameControllerGetAxis(g_pad, ax[axis]) / 32768.0f;
   return fabsf(v) > 0.25f ? v : 0.0f;
+}
+
+/* ---- pump de eventos de controle (o jogo NÃO faz polling; usa eventos JNI,
+ * igual bully-NX). GamepadButton enum do libGame: 0=A 1=B 2=X 3=Y 4=START
+ * 5=BACK 6=L3 7=R3 8-11=NAV(menu) 12-15=DPAD 16=LB 17=LT 18=RB 19=RT. ---- */
+static const struct { int sdl; int game; } g_btnmap[] = {
+  {SDL_CONTROLLER_BUTTON_A,0},{SDL_CONTROLLER_BUTTON_B,1},
+  {SDL_CONTROLLER_BUTTON_X,2},{SDL_CONTROLLER_BUTTON_Y,3},
+  {SDL_CONTROLLER_BUTTON_START,4},{SDL_CONTROLLER_BUTTON_BACK,5},
+  {SDL_CONTROLLER_BUTTON_LEFTSTICK,6},{SDL_CONTROLLER_BUTTON_RIGHTSTICK,7},
+  {SDL_CONTROLLER_BUTTON_DPAD_UP,8},{SDL_CONTROLLER_BUTTON_DPAD_DOWN,9},
+  {SDL_CONTROLLER_BUTTON_DPAD_LEFT,10},{SDL_CONTROLLER_BUTTON_DPAD_RIGHT,11},
+  {SDL_CONTROLLER_BUTTON_LEFTSHOULDER,16},{SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,18},
+};
+static void pump_gamepad(void) {
+  static void (*down)(void*,void*,int,int) = NULL;
+  static void (*up)(void*,void*,int,int) = NULL;
+  static void (*axesfn)(void*,void*,int,float,float,float,float,float,float) = NULL;
+  static void (*countfn)(void*,void*,int) = NULL;
+  static int inited = 0, last[20] = {0};
+  static float la[6] = {0};
+  if (!g_pad) return;
+  if (!inited) {
+#define GP(n) (void*)so_symbol(&mod_game, "Java_com_rockstargames_oswrapper_GameNative_" n)
+    down = GP("implOnGamepadButtonDown"); up = GP("implOnGamepadButtonUp");
+    axesfn = GP("implOnGamepadAxesChanged"); countfn = GP("implOnGamepadCountChanged");
+#undef GP
+    if (countfn) countfn(fake_env, NULL, 1); /* avisa: 1 controle conectado */
+    inited = 1;
+  }
+  SDL_GameControllerUpdate();
+  /* botões */
+  for (unsigned i = 0; i < sizeof(g_btnmap)/sizeof(g_btnmap[0]); i++) {
+    int g = g_btnmap[i].game;
+    int p = SDL_GameControllerGetButton(g_pad, g_btnmap[i].sdl) ? 1 : 0;
+    if (p != last[g]) {
+      if (p) { if (down) down(fake_env, NULL, 0, g); }
+      else   { if (up)   up(fake_env, NULL, 0, g); }
+      last[g] = p;
+    }
+  }
+  /* gatilhos como botões 17(LT)/19(RT) */
+  int lt = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT)  > 12000 ? 1 : 0;
+  int rt = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 12000 ? 1 : 0;
+  if (lt != last[17]) { if (lt) { if(down) down(fake_env,NULL,0,17);} else if(up) up(fake_env,NULL,0,17); last[17]=lt; }
+  if (rt != last[19]) { if (rt) { if(down) down(fake_env,NULL,0,19);} else if(up) up(fake_env,NULL,0,19); last[19]=rt; }
+  /* eixos (sticks) */
+  float a[6];
+  a[0] = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_LEFTX)/32768.0f;
+  a[1] = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_LEFTY)/32768.0f;
+  a[2] = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_RIGHTX)/32768.0f;
+  a[3] = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_RIGHTY)/32768.0f;
+  a[4] = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT)/32768.0f;
+  a[5] = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT)/32768.0f;
+  int ch = 0;
+  for (int i = 0; i < 6; i++) if (fabsf(a[i]-la[i]) > 0.02f) { ch = 1; break; }
+  if (ch && axesfn) { axesfn(fake_env, NULL, 0, a[0],a[1],a[2],a[3],a[4],a[5]); for(int i=0;i<6;i++) la[i]=a[i]; }
 }
 
 /* ---- dispatchers JNI ---- */
@@ -196,8 +256,27 @@ static void build_env(void) {
 }
 
 void jni_init_input(void) {
-  for (int i = 0; i < SDL_NumJoysticks(); i++)
-    if (SDL_IsGameController(i)) { g_pad = SDL_GameControllerOpen(i); break; }
+  int n = SDL_NumJoysticks();
+  fprintf(stderr, "[pad] SDL_NumJoysticks=%d\n", n);
+  for (int i = 0; i < n; i++) {
+    fprintf(stderr, "[pad]  js%d: \"%s\" isGameController=%d\n",
+            i, SDL_JoystickNameForIndex(i), SDL_IsGameController(i));
+    if (SDL_IsGameController(i) && !g_pad) {
+      g_pad = SDL_GameControllerOpen(i);
+      fprintf(stderr, "[pad]  -> abriu como GameController: %s\n", g_pad ? "OK" : SDL_GetError());
+    }
+  }
+  /* fallback: se nenhum tem mapeamento, abre o 1º joystick como pad genérico */
+  if (!g_pad && n > 0) {
+    SDL_GameControllerAddMapping(
+      "03000000000000000000000000000000,USB Gamepad,"
+      "a:b2,b:b1,x:b3,y:b0,start:b9,back:b8,"
+      "leftshoulder:b4,rightshoulder:b5,"
+      "dpup:h0.1,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,"
+      "leftx:a0,lefty:a1,rightx:a2,righty:a3,platform:Linux,");
+    g_pad = SDL_GameControllerOpen(0);
+    fprintf(stderr, "[pad]  fallback genérico: %s\n", g_pad ? "OK" : SDL_GetError());
+  }
 }
 
 /* ---- NvAPK hooks -> asset_archive (le dos data_*.zip reais) ---- */
@@ -485,6 +564,11 @@ void jni_load(void) {
 
   /* contexto GL (EGL real) + sincroniza nos globais OS_EGL* do jogo */
   bully_init_gl();
+  /* inicializa + abre o controle (SDL gamecontroller) — sem isso g_pad=NULL e
+   * GetGamepadButtons/Axis sempre retornam 0 (jni_init_input nunca era chamado) */
+  if (SDL_InitSubSystem(SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER) != 0)
+    fprintf(stderr, "[pad] InitSubSystem: %s\n", SDL_GetError());
+  jni_init_input();
   uintptr_t egl_d=0, egl_s=0, egl_c=0; bully_egl_objects(&egl_d, &egl_s, &egl_c);
   volatile uintptr_t *OS_EGLDisplay = srp ? (volatile uintptr_t*)(srp - 0x2d0) : NULL;
   volatile uintptr_t *OS_EGLSurface = srp ? (volatile uintptr_t*)(srp - 0x2c8) : NULL;
@@ -524,6 +608,7 @@ void jni_load(void) {
   int rk_fired = 0, rk_signin = 0;
   for (int f = 0; OnDrawFrame; f++) {
     SDL_Event e; while (SDL_PollEvent(&e)) if (e.type == SDL_QUIT) return;
+    pump_gamepad(); /* empurra eventos de controle pro jogo (Down/Up/Axes) */
     if (canRender) *canRender = 1;
 
     /* completa o gate Rockstar (igual bully-NX) */

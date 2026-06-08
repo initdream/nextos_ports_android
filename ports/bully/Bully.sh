@@ -15,7 +15,11 @@ chmod 666 /dev/uinput 2>/dev/null
 export SDL_VIDEODRIVER=mali
 export SDL2COMPAT_FORCE_FULLSCREEN_DESKTOP=1
 export SDL_VIDEO_FULLSCREEN_DESKTOP=1
-export SDL_GAMECONTROLLERCONFIG_FILE="$GAMEDIR/gamecontrollerdb.txt"
+# DB de mapeamento de controle do sistema (pro SDL reconhecer o USB Gamepad)
+for db in "$GAMEDIR/gamecontrollerdb.txt" /storage/roms/ports/PortMaster/gamecontrollerdb.txt /usr/share/gamecontrollerdb.txt; do
+  [ -f "$db" ] && export SDL_GAMECONTROLLERCONFIG_FILE="$db" && break
+done
+[ -n "$sdl_controllerconfig" ] && export SDL_GAMECONTROLLERCONFIG="$sdl_controllerconfig"
 
 echo "=== Bully run $(date) | free: $(free -m | awk '/Mem/{print $7}')MB ===" > "$LOG"
 
