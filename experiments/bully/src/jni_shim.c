@@ -14,6 +14,7 @@
 #include "so_util_x64.h"
 #include "jni_shim.h"
 #include "util.h"   /* ret0 */
+#include "zip_fs.h"
 
 extern Module mod_game;
 extern void bully_swap_buffers(void);  /* egl_shim */
@@ -211,7 +212,11 @@ extern int   asset_getc(void *h);
 extern char *asset_gets(char *b, int m, void *h);
 
 static int   nv_init(void *a, void *b, void *c) { asset_archive_init(); return 0; }
-static void *nv_open(const char *p) { return asset_open(p); }
+static void *nv_open(const char *p) {
+  void *h = asset_open(p);
+  fprintf(stderr, "[nvapk] open \"%s\" -> %s\n", p ? p : "(null)", h ? "OK" : "MISS");
+  return h;
+}
 static size_t nv_read(void *buf, size_t s, size_t n, void *h) { return h ? asset_read(buf, s, n, h) : 0; }
 static int   nv_seek(void *h, long o, int w) { return h ? asset_seek(h, o, w) : -1; }
 static void  nv_close(void *h) { asset_close(h); }
@@ -363,6 +368,7 @@ void jni_load(void) {
   hook_screen();  /* OS_ScreenGetWidth/Height + render gates como função */
   hook_cxa();     /* __cxa_guard simples -> statics C++ (whitetexture?) inicializam */
   asset_archive_init();
+  zip_fs_init(); /* serve recursos (whitetexture etc) de DENTRO dos data zips via fopen */
 
   /* resolve as funcoes nativas estaticas (JNI estatico, v1.4.311) */
 #define R(n) so_symbol(&mod_game, "Java_com_rockstargames_oswrapper_GameNative_" n)

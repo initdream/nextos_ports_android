@@ -10,6 +10,7 @@ add_executable(bully-pc
     src/egl_shim.c
     src/imports.c
     src/asset_archive.c
+    src/zip_fs.c
     src/util.c
     src/error.c
 )
@@ -17,5 +18,5 @@ target_include_directories(bully-pc PRIVATE src ${SDL2_INCLUDE_DIRS})
 target_compile_definitions(bully-pc PRIVATE GAMEDIR="${CMAKE_SOURCE_DIR}/gamefiles")
 # -rdynamic: dlsym(RTLD_DEFAULT) enxerga libc/GLESv2/openal/z linkadas
 target_link_options(bully-pc PRIVATE -rdynamic)
-target_link_libraries(bully-pc PRIVATE ${SDL2_LIBRARIES} GLESv2 EGL openal z m dl pthread)
+target_link_libraries(bully-pc PRIVATE ${SDL2_LIBRARIES} GLESv2 EGL openal z m dl pthread minizip)
 target_compile_options(bully-pc PRIVATE -Wall -Wno-unused-parameter -Wno-unused-function)

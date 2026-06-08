@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "jni_shim.h"
+#include "zip_fs.h"
 
 /* ---- bionic libc bridges ---- */
 static int *bionic___errno(void) { extern int *__errno_location(void); return __errno_location(); }
@@ -93,11 +94,15 @@ static long aa_getLength64(void *h) { AAsset *a = h; return a ? a->len : 0; }
 static long aa_getRemainingLength64(void *h) { AAsset *a = h; return a ? a->len - ftell(a->fp) : 0; }
 static void aa_close(void *h) { AAsset *a = h; if (a) { fclose(a->fp); free(a); } }
 
-/* ---- ESPIÃO de I/O: loga todo fopen/open do jogo (descobrir o que o GameMain pede) ---- */
+/* ---- fopen: tenta disco; se falhar (modo leitura), serve de DENTRO dos
+ * data_*.zip via zip_fs (Resource::LoadVerified abre recursos como a
+ * whitetexture via fopen, e eles estão dentro dos zips). ---- */
 static FILE *w_fopen(const char *path, const char *mode) {
   static FILE *(*real)(const char *, const char *) = NULL;
   if (!real) real = dlsym(RTLD_DEFAULT, "fopen");
   FILE *f = real ? real(path, mode) : NULL;
+  if (!f && path && mode && (mode[0] == 'r'))
+    f = zip_fs_fopen(path);
   fprintf(stderr, "[fopen] \"%s\" (%s) -> %s\n", path ? path : "(null)", mode ? mode : "?", f ? "OK" : "FALHA");
   return f;
 }
