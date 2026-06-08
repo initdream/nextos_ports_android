@@ -145,3 +145,31 @@ GameMain criar os recursos default (whitetexture). No jogo real há sync. PRÓXI
    OU o populate de "default resources" no init. Ver QUE thread/quando cria.
 3. Alternativa brute-force: portar TODOS os 101 hooks do bully-NX patch_game de uma vez (bully-NX
    RODA no Switch), confirmar que passa, depois bisectar qual hook era essencial.
+
+## SESSÃO 2026-06-08 (autônoma, profunda) — whitetexture caracterizada
+**Cadeia do crash:** `BullyGameRenderer::Setup` (0x109f360) → `GameRenderer::Setup` (0x8a0c0d, +0x47d)
+→ a whitetexture deveria existir mas é NULL. GameRenderer::Setup chama `Resource::LoadVerified()` 6×
+(→ `ResourceManager::Reload(Resource*)`) + cria Material/Effect/SceneView.
+**Origem da whitetexture = OPACA:** as 4 refs à string "whitetexture" (0x88a852 XMLParser,
+0x8a09d1 GameRenderer::Setup, 0x97ef2e Material::CreateNew, 0xedb0fb GameSprite::Draw) são TODAS
+GET/uso — nenhuma CRIA. Não vem de fopen (jogo só fopena data zips+resource_files.list) NEM de
+NvAPK (nv_open só pede data zips+resource_files.list=MISS). BullyGameRenderer::Setup é chamado por
+VTABLE (sem call direto -> caller não-rastreável por xref).
+**DESCARTADO (não é a causa):** GL context (eglMakeCurrent ok=1 na thread), gamestate (forcing é
+frame>240, crash é frame 31), screen dims/render-gates (hookados, sem efeito), __cxa_guard (idem),
+fopen/zip_fs (whitetexture não usa fopen), NvAPK (não pede), resource_files.list (bully-NX roda sem
+ele), RACE (só Thread 54 no libGame; ~119 threads idle em pool -> ninguém criando concorrente).
+**CONCLUSÃO:** a etapa que CRIA a whitetexture (provável: programática 1x1 numa init de renderer/
+default-resources, OU de um IMG pack via um caminho não-logado) simplesmente NÃO RODA na nossa
+ordem/setup. bully-NX (mesmo lib arm64) RODA -> tem hook/sequência que dispara isso.
+**PRÓXIMO ATAQUE (brute-force / match do bully-NX):**
+1. Comparar driver jni_load (nosso) vs jni_patch.c jni_start (bully-NX) PASSO A PASSO — achar a
+   chamada/sequência de init que bully-NX faz e nós não (esp. o que dispara create-defaults).
+2. Re-derivar p/ x86_64 os offsets do frame-loop do bully-NX: tick flags (Switch 0x126bb70/74,
+   "both=1 p/ Application::Tick rodar") + Application holder (0x12146a8) + gamestate (+0x68).
+   No x86_64 são outros offsets -> achar por RE (Application::Tick, CreateApplication).
+3. Se nada, portar TODOS os ~101 hooks do bully-NX patch_game de uma vez, confirmar que passa,
+   bisectar. Hooks ainda não portados relevantes: OrigInitialize(trace), BullySettings_Load/
+   ResetDisplay, AND_MiscInitialize, AND_MovieInitialize, OS_Movie*/Playlist* (provável irrelevantes).
+**Já portado e funcionando:** thread orchestration (GameMain launcha), zip_fs (fopencookie+minizip),
+EGL re-seed pós-surface, screen/cxa hooks. Crash continua 0x8a0c0d. Commits até 2096513+.
