@@ -249,6 +249,37 @@ static void my_glTexSubImage2D(unsigned t,int l,int xo,int yo,int w,int h,unsign
 }
 /* status do FBO (render-to-texture da roupa) — se INCOMPLETO no Mali, a textura
  * do corpo fica vazia -> camisa preta+discard. */
+static void (*real_glBindFramebuffer)(unsigned, unsigned) = NULL;
+static void my_glBindFramebuffer(unsigned t, unsigned fb) {
+  if (!real_glBindFramebuffer) real_glBindFramebuffer = dlsym(RTLD_DEFAULT, "glBindFramebuffer");
+  if (real_glBindFramebuffer) real_glBindFramebuffer(t, fb);
+  static int n = 0;
+  if (fb != 0 && n < 14) {
+    unsigned (*chk)(unsigned) = dlsym(RTLD_DEFAULT, "glCheckFramebufferStatus");
+    unsigned s = chk ? chk(0x8D40) : 0; /* GL_FRAMEBUFFER */
+    fprintf(stderr, "[fbo] BIND fbo=%u status=0x%x %s\n", fb, s, s == 0x8CD5 ? "COMPLETE" : (s ? "INCOMPLETO!" : "?"));
+    n++;
+  }
+}
+static void (*real_glFramebufferTexture2D)(unsigned,unsigned,unsigned,unsigned,int) = NULL;
+static void my_glFramebufferTexture2D(unsigned t,unsigned att,unsigned tt,unsigned tex,int lvl) {
+  if (!real_glFramebufferTexture2D) real_glFramebufferTexture2D = dlsym(RTLD_DEFAULT, "glFramebufferTexture2D");
+  if (real_glFramebufferTexture2D) real_glFramebufferTexture2D(t,att,tt,tex,lvl);
+  static int n = 0;
+  if (n < 14) {
+    unsigned (*chk)(unsigned) = dlsym(RTLD_DEFAULT, "glCheckFramebufferStatus");
+    unsigned s = chk ? chk(0x8D40) : 0;
+    fprintf(stderr, "[fbo] ATTACH att=0x%x tex=%u lvl=%d -> status=0x%x %s\n", att, tex, lvl, s, s == 0x8CD5 ? "OK" : "INCOMPLETO");
+    n++;
+  }
+}
+static void (*real_glReadPixels)(int,int,int,int,unsigned,unsigned,void*) = NULL;
+static void my_glReadPixels(int x,int y,int w,int h,unsigned fmt,unsigned type,void*px) {
+  if (!real_glReadPixels) real_glReadPixels = dlsym(RTLD_DEFAULT, "glReadPixels");
+  static int n = 0;
+  if (n < 12) { fprintf(stderr, "[fbo] READPIXELS %dx%d fmt=0x%x type=0x%x\n", w, h, fmt, type); n++; }
+  if (real_glReadPixels) real_glReadPixels(x,y,w,h,fmt,type,px);
+}
 static unsigned (*real_glCheckFramebufferStatus)(unsigned) = NULL;
 static unsigned my_glCheckFramebufferStatus(unsigned t) {
   if (!real_glCheckFramebufferStatus) real_glCheckFramebufferStatus = dlsym(RTLD_DEFAULT, "glCheckFramebufferStatus");
@@ -335,6 +366,9 @@ DynLibFunction bully_stub_table[] = {
   {"glTexStorage2D", (uintptr_t)my_glTexStorage2D},
   {"glTexSubImage2D", (uintptr_t)my_glTexSubImage2D},
   {"glCheckFramebufferStatus", (uintptr_t)my_glCheckFramebufferStatus},
+  {"glBindFramebuffer", (uintptr_t)my_glBindFramebuffer},
+  {"glReadPixels", (uintptr_t)my_glReadPixels},
+  {"glFramebufferTexture2D", (uintptr_t)my_glFramebufferTexture2D},
   {"fopen", (uintptr_t)w_fopen},
   {"_ZTH7gString", (uintptr_t)tl_noop}, {"_ZTH8gString2", (uintptr_t)tl_noop},
   {"_ZTHN10ALCcontext13sLocalContextE", (uintptr_t)tl_noop},
