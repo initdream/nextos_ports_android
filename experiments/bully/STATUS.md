@@ -212,3 +212,17 @@ data files cedo. (analogia: igual reVC precisava dos dados certos).
 do jogo). No device Mali-450 fbdev é outro caminho EGL (igual reVC funcionou). Próximo no PC: resolver
 o EGL/contexto multi-thread (NVIDIA surfaceless/pbuffer) OU partir pro device arm64 (extrair libGame.so
 arm64 do mesmo APK + os data já temos a receita). Engine LÓGICO já roda — falta a APRESENTAÇÃO GL.
+
+## 🎉🎉🎉🎉 JOGO RODANDO 2026-06-08 — ÁUDIO + GL MULTI-THREAD OK (o autor ouviu o som!)
+**FIX multi-thread GL:** hookado `_Z22OS_ThreadUnmakeCurrentv` -> bully_release_current (pareia com
+OS_ThreadMakeCurrent). Antes o GameMain segurava o ctx EGL (single-thread) e a render thread falhava
+(ok=0). Agora intercala release/make -> **ok=1: 2172, ok=0: 0** (render thread pega GL todo frame).
+**ESTADO: O JOGO RODA.** o autor OUVIU o som do jogo no PC. Logs mostram carga de gameplay:
+sfx_*.snd (efeitos), mx_ms_runninglow.snd (música), hud_jump/punch.tex (HUD), mission_bg.tex.
+Engine: boot->JNI->gates->Rockstar->GameMain->resources(data_0-4)->whitetexture OK->render loop
+(frame 2280+) com áudio OpenAL tocando. PC bring-up ESSENCIALMENTE COMPLETO (engine roda o jogo).
+**ÚNICA limitação PC:** render é offscreen (pbuffer) — NVIDIA+X11 não faz window surface EGL fácil
+(dri2 fail). Por isso não-VISÍVEL no PC, mas RODA (áudio prova). **PRÓXIMO:** (a) render VISÍVEL no
+PC (window surface NVIDIA / SDL window) p/ ver, OU (b) PIVÔ DEVICE arm64 (libGame.so arm64 já temos
+no APK 60FPS + data_0-4 + receita; Mali fbdev faz render visível, igual reVC). Recomendo (b): o PC
+já provou a engine; o device é o alvo. Commit pós-8162e14.

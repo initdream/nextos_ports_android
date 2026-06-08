@@ -236,11 +236,19 @@ static void os_thread_makecurrent(void) {
   fprintf(stderr, "[gl] OS_ThreadMakeCurrent tid=%lu -> eglMakeCurrent ok=%d\n",
           (unsigned long)pthread_self(), ok);
 }
+/* SOLTA o NOSSO contexto na thread chamadora — pareia com makecurrent. Sem isso
+ * o GameMain segura o ctx (EGL é single-thread) e a render thread falha (ok=0). */
+static void os_thread_unmakecurrent(void) {
+  bully_release_current();
+  fprintf(stderr, "[gl] OS_ThreadUnmakeCurrent tid=%lu -> released\n",
+          (unsigned long)pthread_self());
+}
 
 static void hook_egl(void) {
   hook_x64(so_symbol(&mod_game, "_Z20AND_CreateEglSurfacev"), (uintptr_t)and_create_egl);
   hook_x64(so_symbol(&mod_game, "_Z21AND_DestroyEglSurfacev"), (uintptr_t)and_destroy_egl);
   hook_x64(so_symbol(&mod_game, "_Z20OS_ThreadMakeCurrentv"), (uintptr_t)os_thread_makecurrent);
+  hook_x64(so_symbol(&mod_game, "_Z22OS_ThreadUnmakeCurrentv"), (uintptr_t)os_thread_unmakecurrent);
 }
 
 /* ---- hooks de tela/render como FUNÇÃO (bully-NX hooka; nós só setávamos flags
