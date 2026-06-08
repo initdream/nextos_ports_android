@@ -127,6 +127,63 @@ static int b_system_property_get(const char *name, char *value) { (void)name; if
 /* ---- C++ thread-local init helpers (_ZTH*): no-op ---- */
 static void tl_noop(void) {}
 
+/* ================= GLES2 fixes Mali-450 Utgard (receitas do reVC) ============
+ * O game importa glShaderSource/glTexImage2D/glTexParameteri direto -> a tabela
+ * resolve p/ estes wrappers, que corrigem p/ o Utgard e chamam o real (Mali). */
+static char *str_replace_all(const char *src, const char *find, const char *repl) {
+  size_t fl = strlen(find), rl = strlen(repl), n = 0;
+  for (const char *p = src; (p = strstr(p, find)); p += fl) n++;
+  char *out = malloc(strlen(src) + n * (rl > fl ? rl - fl : 0) + 1);
+  char *o = out; const char *p = src, *q;
+  while ((q = strstr(p, find))) { memcpy(o, p, q - p); o += q - p; memcpy(o, repl, rl); o += rl; p = q + fl; }
+  strcpy(o, p);
+  return out;
+}
+static void (*real_glShaderSource)(unsigned, int, const char *const *, const int *) = NULL;
+static void my_glShaderSource(unsigned sh, int count, const char *const *str, const int *len) {
+  (void)len;
+  if (!real_glShaderSource) real_glShaderSource = dlsym(RTLD_DEFAULT, "glShaderSource");
+  size_t total = 1;
+  for (int i = 0; i < count; i++) if (str && str[i]) total += strlen(str[i]);
+  char *cat = malloc(total); cat[0] = 0;
+  for (int i = 0; i < count; i++) if (str && str[i]) strcat(cat, str[i]);
+  /* Utgard (Mali-400/450 GP) não suporta highp -> mediump (cores lavadas) */
+  char *s1 = str_replace_all(cat, "highp", "mediump");
+  free(cat);
+  const char *one = s1;
+  if (real_glShaderSource) real_glShaderSource(sh, 1, &one, NULL);
+  free(s1);
+}
+static void (*real_glTexParameteri)(unsigned, unsigned, int) = NULL;
+static void my_glTexParameteri(unsigned target, unsigned pname, int param) {
+  if (!real_glTexParameteri) real_glTexParameteri = dlsym(RTLD_DEFAULT, "glTexParameteri");
+  if (pname == 0x813D) return;                                  /* GL_TEXTURE_MAX_LEVEL: inexistente em GLES2 */
+  if ((pname == 0x2801 || pname == 0x2800) && param >= 0x2700 && param <= 0x2703)
+    param = 0x2601;                                             /* *_MIPMAP_* -> GL_LINEAR (sem mipmap completo = preto) */
+  if (real_glTexParameteri) real_glTexParameteri(target, pname, param);
+}
+static void (*real_glClear)(unsigned) = NULL;
+static int g_cleardbg = 0;
+static void my_glClear(unsigned mask) {
+  if (!real_glClear) real_glClear = dlsym(RTLD_DEFAULT, "glClear");
+  if (g_cleardbg < 8) { fprintf(stderr, "[gl] glClear mask=0x%x -> 0x%x\n", mask, mask | 0x4000); g_cleardbg++; }
+  if (real_glClear) real_glClear(mask | 0x4000); /* força limpar COR (GL_COLOR_BUFFER_BIT) */
+}
+static void (*real_glClearColor)(float, float, float, float) = NULL;
+static int g_ccdbg = 0;
+static void my_glClearColor(float r, float g, float b, float a) {
+  if (!real_glClearColor) real_glClearColor = dlsym(RTLD_DEFAULT, "glClearColor");
+  if (g_ccdbg < 8) { fprintf(stderr, "[gl] glClearColor %.2f %.2f %.2f %.2f\n", r, g, b, a); g_ccdbg++; }
+  if (real_glClearColor) real_glClearColor(r, g, b, a);
+}
+static void (*real_glTexImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *) = NULL;
+static void my_glTexImage2D(unsigned tgt, int lvl, int ifmt, int w, int h, int bord, unsigned fmt, unsigned type, const void *px) {
+  if (!real_glTexImage2D) real_glTexImage2D = dlsym(RTLD_DEFAULT, "glTexImage2D");
+  if (ifmt == 0x8058) ifmt = 0x1908;       /* GL_RGBA8 -> GL_RGBA (GLES2 não aceita sized) */
+  else if (ifmt == 0x8051) ifmt = 0x1907;  /* GL_RGB8 -> GL_RGB */
+  if (real_glTexImage2D) real_glTexImage2D(tgt, lvl, ifmt, w, h, bord, fmt, type, px);
+}
+
 void bully_imports_init(void) { ctype_init(); }
 
 /* tabela de overrides (resolvida ANTES do fallback dlsym do so_resolve) */
@@ -150,6 +207,11 @@ DynLibFunction bully_stub_table[] = {
   {"AAsset_getLength64", (uintptr_t)aa_getLength64}, {"AAsset_getRemainingLength64", (uintptr_t)aa_getRemainingLength64},
   {"AAsset_close", (uintptr_t)aa_close},
   {"glGetString", (uintptr_t)w_glGetString},
+  {"glShaderSource", (uintptr_t)my_glShaderSource},
+  {"glTexParameteri", (uintptr_t)my_glTexParameteri},
+  {"glTexImage2D", (uintptr_t)my_glTexImage2D},
+  {"glClear", (uintptr_t)my_glClear},
+  {"glClearColor", (uintptr_t)my_glClearColor},
   {"fopen", (uintptr_t)w_fopen},
   {"_ZTH7gString", (uintptr_t)tl_noop}, {"_ZTH8gString2", (uintptr_t)tl_noop},
   {"_ZTHN10ALCcontext13sLocalContextE", (uintptr_t)tl_noop},
