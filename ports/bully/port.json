@@ -1,0 +1,28 @@
+{
+    "version": 3,
+    "name": "bully",
+    "items": [
+        "Bully.sh",
+        "bully"
+    ],
+    "items_opt": [],
+    "attr": {
+        "title": "Bully: Anniversary Edition",
+        "porter": [
+            "felc18-blip"
+        ],
+        "desc": "Bully: Anniversary Edition (v1.4.311) via so-loader do libGame.so Android. Primeiro port em aarch64/Linux/PortMaster (Mali-450). BYO-data: requer seu APK legal do Bully 1.4.311 (veja README.md).",
+        "inst": "Copie seu APK do Bully 1.4.311 para a pasta 'bully/' e abra o jogo -- ele extrai os dados sozinho na 1a vez.",
+        "genres": [
+            "action",
+            "adventure"
+        ],
+        "image": {},
+        "rtr": false,
+        "runtime": "",
+        "reqs": [
+            "aarch64",
+            "gles2"
+        ]
+    }
+}
