@@ -116,6 +116,10 @@ static const unsigned char *w_glGetString(unsigned name) {
   return r ? r : (const unsigned char *)"";
 }
 
+/* ---- bionic-only (não existem na glibc; libc++/libGame usam) ---- */
+static void b_set_abort_message(const char *m) { fprintf(stderr, "[abort_msg] %s\n", m ? m : "?"); }
+static int b_system_property_get(const char *name, char *value) { (void)name; if (value) value[0] = 0; return 0; }
+
 /* ---- C++ thread-local init helpers (_ZTH*): no-op ---- */
 static void tl_noop(void) {}
 
@@ -127,6 +131,8 @@ DynLibFunction bully_stub_table[] = {
   {"__strlen_chk", (uintptr_t)b_strlen_chk}, {"__strrchr_chk", (uintptr_t)b_strrchr_chk},
   {"__strchr_chk", (uintptr_t)b_strchr_chk}, {"__strncpy_chk2", (uintptr_t)b_strncpy_chk2},
   {"__android_log_print", (uintptr_t)b_android_log},
+  {"android_set_abort_message", (uintptr_t)b_set_abort_message},
+  {"__system_property_get", (uintptr_t)b_system_property_get},
   {"__sF", (uintptr_t)bionic_sF},
   {"fprintf", (uintptr_t)w_fprintf}, {"vfprintf", (uintptr_t)w_vfprintf}, {"fwrite", (uintptr_t)w_fwrite},
   {"fputs", (uintptr_t)w_fputs}, {"fputc", (uintptr_t)w_fputc}, {"fflush", (uintptr_t)w_fflush},
