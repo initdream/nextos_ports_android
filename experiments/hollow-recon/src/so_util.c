@@ -313,7 +313,10 @@ int so_relocate(void) {
         int type = ELF64_R_TYPE(rels[j].r_info);
         switch (type) {
         case R_AARCH64_ABS64:
-          *ptr = (uintptr_t)text_virtbase + sym->st_value + rels[j].r_addend;
+          /* So aplica p/ simbolo DEFINIDO (interno). Se UNDEF (importado, ex:
+             malloc), st_value=0 -> daria base+0 (lixo); deixa p/ so_resolve. */
+          if (sym->st_shndx != SHN_UNDEF)
+            *ptr = (uintptr_t)text_virtbase + sym->st_value + rels[j].r_addend;
           break;
         case R_AARCH64_RELATIVE:
           *ptr = (uintptr_t)text_virtbase + rels[j].r_addend;
@@ -349,6 +352,7 @@ int so_resolve(DynLibFunction *funcs, int num_funcs,
 
         int type = ELF64_R_TYPE(rels[j].r_info);
         switch (type) {
+        case R_AARCH64_ABS64:       /* ABS64 de importado (ex: malloc em .data) */
         case R_AARCH64_GLOB_DAT:
         case R_AARCH64_JUMP_SLOT: {
           if (sym->st_shndx == SHN_UNDEF) {
@@ -359,7 +363,7 @@ int so_resolve(DynLibFunction *funcs, int num_funcs,
             int found = 0;
             for (int k = 0; k < num_funcs; k++) {
               if (strcmp(name, funcs[k].symbol) == 0) {
-                *ptr = funcs[k].func;
+                *ptr = funcs[k].func + rels[j].r_addend;
                 found = 1;
                 break;
               }

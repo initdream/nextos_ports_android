@@ -110,7 +110,7 @@ static const char *mid_name(void *tag) {
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
-#define ASSET_BASE "/storage/hollow-recon/assets/"
+#define ASSET_BASE "/storage/roms/hollow-recon/assets/"
 
 static int g_assetmgr;   /* tag do objeto AssetManager */
 static int g_empty_list; /* tag de uma java.util.List vazia */
@@ -207,11 +207,33 @@ static jint jni_GetVersion(void *env) {
   return 0x00010006;
 }
 
+/* ===== Injeção de input p/ nativeInjectEvent (KeyEvent) =====
+   nativeInjectEvent lê o evento via JNI (getAction/getKeyCode/...). Setamos
+   g_hk_inject ANTES de chamar nativeInjectEvent e os métodos retornam daqui. */
+struct hk_inject_s { int action, keycode, source, deviceId, metaState, repeat,
+                     scancode, flags, unicode; long eventTime, downTime; };
+struct hk_inject_s g_hk_inject;       /* exportado p/ main_recon */
+static int g_obj_keyevent;            /* sentinela do objeto KeyEvent */
+void *hk_keyevent_object(void) { return &g_obj_keyevent; }
+
+/* classes distintas por nome (Unity compara KeyEvent.class vs MotionEvent.class) */
+static struct { const char *name; int tag; } g_classreg[128];
+static int g_classreg_n = 0;
+static void *class_for(const char *name) {
+  if (!name) name = "?";
+  for (int i = 0; i < g_classreg_n; i++)
+    if (g_classreg[i].name == name ||
+        (g_classreg[i].name && strcmp(g_classreg[i].name, name) == 0))
+      return &g_classreg[i].tag;
+  if (g_classreg_n >= 128) g_classreg_n = 0;
+  int i = g_classreg_n++;
+  g_classreg[i].name = name;
+  return &g_classreg[i].tag;
+}
 static void *jni_FindClass(void *env, const char *name) {
   (void)env;
   debugPrintf("jni_shim: FindClass(%s)\n", name);
-  static int fake_class;
-  return &fake_class;
+  return class_for(name);
 }
 
 static void *jni_GetMethodID(void *env, void *clazz, const char *name,
@@ -277,6 +299,21 @@ static void *jni_CallObjectMethodV(void *env, void *obj, void *methodID,
         strcmp(nm, "setData") == 0 || strcmp(nm, "setAction") == 0 ||
         strcmp(nm, "append") == 0)
       return obj;
+    /* diretorios de dados -> path REAL gravavel (persistentDataPath do Unity).
+       Sem isso (=""), PlayerPrefs/save quebram -> jogo trava em "first run". */
+    if (strcmp(nm, "getFilesDir") == 0 || strcmp(nm, "getExternalFilesDir") == 0 ||
+        strcmp(nm, "getCacheDir") == 0 || strcmp(nm, "getExternalCacheDir") == 0 ||
+        strcmp(nm, "getDataDir") == 0 || strcmp(nm, "getExternalStorageDirectory") == 0 ||
+        strcmp(nm, "getPath") == 0 || strcmp(nm, "getAbsolutePath") == 0 ||
+        strcmp(nm, "getCanonicalPath") == 0)
+      return make_jstring("/storage/roms/hollow-recon/userdata");
+    /* SharedPreferences.getString(key, default) -> loga a chave + retorna default */
+    if (strcmp(nm, "getString") == 0) {
+      void *keystr = va_arg(ap, void *);
+      void *defstr = va_arg(ap, void *);
+      debugPrintf("[PREFS] getString key='%s'\n", resolve_jstring(keystr));
+      return defstr ? defstr : make_jstring("");
+    }
     if (strcmp(nm, "toString") == 0)
       return make_jstring("");
   }
@@ -307,7 +344,21 @@ static jint jni_CallIntMethodV(void *env, void *obj, void *methodID,
                                va_list ap) {
   (void)env;
   const char *nm = mid_name(methodID);
-  if (nm && strcmp(nm, "size") == 0) return 0; /* List/Collection vazia */
+  if (nm) {
+    /* ---- KeyEvent (nativeInjectEvent) ---- */
+    if (strcmp(nm, "getAction") == 0) { debugPrintf("[KEYEV] getAction->%d\n", g_hk_inject.action); return g_hk_inject.action; }
+    if (strcmp(nm, "getKeyCode") == 0) { debugPrintf("[KEYEV] getKeyCode->%d\n", g_hk_inject.keycode); return g_hk_inject.keycode; }
+    if (strcmp(nm, "getSource") == 0) return g_hk_inject.source;
+    if (strcmp(nm, "getDeviceId") == 0) return g_hk_inject.deviceId;
+    if (strcmp(nm, "getMetaState") == 0) return g_hk_inject.metaState;
+    if (strcmp(nm, "getRepeatCount") == 0) return g_hk_inject.repeat;
+    if (strcmp(nm, "getScanCode") == 0) return g_hk_inject.scancode;
+    if (strcmp(nm, "getInt") == 0) { void *k = va_arg(ap, void *); int d = va_arg(ap, int);
+      debugPrintf("[PREFS] getInt key='%s' def=%d\n", resolve_jstring(k), d); return d; }
+    if (strcmp(nm, "getFlags") == 0) return g_hk_inject.flags;
+    if (strcmp(nm, "getUnicodeChar") == 0) return g_hk_inject.unicode;
+    if (strcmp(nm, "size") == 0) return 0; /* List/Collection vazia */
+  }
   struct astream *s = astream_find(obj);
   if (s && nm) {
     if (strcmp(nm, "read") == 0) {
@@ -461,9 +512,33 @@ static void jni_DeleteLocalRef(void *env, void *obj) {
 }
 static void *jni_GetObjectClass(void *env, void *obj) {
   (void)env;
-  (void)obj;
+  if (obj == &g_obj_keyevent) return class_for("android/view/KeyEvent");
   static int fake_obj_class;
   return &fake_obj_class;
+}
+static unsigned char jni_IsInstanceOf(void *env, void *obj, void *clazz) {
+  (void)env;
+  if (obj == &g_obj_keyevent) return clazz == class_for("android/view/KeyEvent");
+  return 1; /* permissivo p/ outros casts */
+}
+static unsigned char jni_IsSameObject(void *env, void *a, void *b) {
+  (void)env; return a == b;
+}
+/* CallLongMethod V — getEventTime/getDownTime do KeyEvent (retornam long) */
+static long jni_CallLongMethodV(void *env, void *obj, void *methodID, va_list ap) {
+  (void)env; (void)obj; (void)ap;
+  const char *nm = mid_name(methodID);
+  if (nm) {
+    if (strcmp(nm, "getEventTime") == 0) return g_hk_inject.eventTime;
+    if (strcmp(nm, "getDownTime") == 0) return g_hk_inject.downTime;
+  }
+  return 0;
+}
+static long jni_CallLongMethod(void *env, void *obj, void *methodID, ...) {
+  va_list ap; va_start(ap, methodID);
+  long r = jni_CallLongMethodV(env, obj, methodID, ap);
+  va_end(ap);
+  return r;
 }
 
 /* Exception handling */
@@ -508,7 +583,7 @@ static jint vm_DetachCurrentThread(void *vm) {
 static jint vm_GetEnv(void *vm, void **penv, jint version) {
   (void)vm;
   (void)version;
-  debugPrintf("jni_shim: GetEnv(version=0x%x)\n", version);
+  /* GetEnv e' chamado milhares de vezes (cada thread/icall) -> silenciado */
   if (penv)
     *penv = &jni_env_ptr;
   return 0;
@@ -624,8 +699,12 @@ void jni_shim_init(void **out_vm, void **out_env) {
   jni_env_vtable[22] = (uintptr_t)jni_DeleteGlobalRef;
   jni_env_vtable[23] = (uintptr_t)jni_DeleteLocalRef;
   jni_env_vtable[25] = (uintptr_t)jni_NewLocalRef;
+  jni_env_vtable[24] = (uintptr_t)jni_IsSameObject;
   jni_env_vtable[31] = (uintptr_t)jni_GetObjectClass;
+  jni_env_vtable[32] = (uintptr_t)jni_IsInstanceOf;
   jni_env_vtable[33] = (uintptr_t)jni_GetMethodID;
+  jni_env_vtable[52] = (uintptr_t)jni_CallLongMethod;
+  jni_env_vtable[53] = (uintptr_t)jni_CallLongMethodV;
   jni_env_vtable[34] = (uintptr_t)jni_CallObjectMethod;
   jni_env_vtable[35] = (uintptr_t)jni_CallObjectMethodV;   /* V variant (va_list) */
   jni_env_vtable[37] = (uintptr_t)jni_CallBooleanMethod;

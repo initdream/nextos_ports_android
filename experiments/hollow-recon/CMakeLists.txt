@@ -15,6 +15,7 @@ add_executable(hollow-recon
     src/error.c
 )
 target_include_directories(hollow-recon PRIVATE src ${SDL2_INCLUDE_DIRS})
-target_link_options(hollow-recon PRIVATE -Wl,--no-as-needed -rdynamic)
-target_link_libraries(hollow-recon PRIVATE ${SDL2_LIBRARIES} GLESv2 EGL m dl pthread)
+target_link_options(hollow-recon PRIVATE -Wl,--no-as-needed -rdynamic -no-pie)
+target_compile_options(hollow-recon PRIVATE -fno-pie)
+target_link_libraries(hollow-recon PRIVATE ${SDL2_LIBRARIES} GLESv2 EGL m dl pthread z)
 target_compile_options(hollow-recon PRIVATE -Wall -Wno-unused-parameter -Wno-unused-function -Wno-unused-variable)
