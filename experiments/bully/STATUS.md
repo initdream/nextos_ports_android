@@ -173,3 +173,25 @@ ordem/setup. bully-NX (mesmo lib arm64) RODA -> tem hook/sequência que dispara 
    ResetDisplay, AND_MiscInitialize, AND_MovieInitialize, OS_Movie*/Playlist* (provável irrelevantes).
 **Já portado e funcionando:** thread orchestration (GameMain launcha), zip_fs (fopencookie+minizip),
 EGL re-seed pós-surface, screen/cxa hooks. Crash continua 0x8a0c0d. Commits até 2096513+.
+
+### + async file worker portado (ainda 0x8a0c0d):
+Portado o async_file_worker do bully-NX (thread chama AND_FileUpdated(delta) enquanto
+AndroidFile::firstAsyncFile != 0; ambos resolvidos por símbolo: _Z14AND_FileUpdated +
+_ZN11AndroidFile14firstAsyncFileE). Worker inicia após OnResume. **Crash IDÊNTICO 0x8a0c0d.**
+### ESTADO: portei TODOS os mecanismos-chave do bully-NX e o crash NÃO MOVE:
+thread orchestration (GameMain launcha) + async file worker + EGL re-seed + gates (srp-rel) +
+zip_fs (fopencookie) + screen/render-gate hooks + cxa_guard. Sempre crash em GameRenderer::Setup
+0x8a0c0d (whitetexture NULL), frame ~31, logo após o gate Rockstar.
+### CONCLUSÃO: muro FUNDAMENTAL — a whitetexture/resource não é criada e nenhum mecanismo
+portado destrava. Hipóteses para a próxima frente (precisam de mais ferramenta/RE):
+1. **Gate flags em offset ERRADO p/ x86_64**: nossos gates são srp-relativos (srp-0x174/-0x17c/
+   -0x2e8) re-derivados; o Rockstar gate passa, mas talvez o flag que habilita o LOAD de recursos
+   (bully-NX: implIsInitialized 0x158aad4, OS_CanGameRender 0x158a960 — offsets ARM64) esteja em
+   outro lugar no x86_64 -> achar os símbolos/globais reais (nm: procurar isInitialized/gamestate).
+2. **Trace do bully-NX rodando** (Switch/emu) p/ ver EXATAMENTE quando/como a whitetexture é
+   criada — sem isso é adivinhação. Build do bully-NX seria a referência definitiva.
+3. **Deep trace ResourceManager::Reload + a população do registro de recursos no x86_64**
+   (a whitetexture é um Resource registrado em algum init que não roda).
+4. **Ordem/timing**: o gate Rockstar dispara no frame 31 e o GameMain corre pro Setup; talvez
+   precise segurar até a fila async esvaziar / um gamestate específico (re-derivar offsets x86_64
+   do app holder 0x12146a8 + gamestate +0x68 + tick flags).

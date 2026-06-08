@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "so_util_x64.h"
 #include "jni_shim.h"
@@ -269,6 +270,39 @@ static void hook_cxa(void) {
   hook_x64(so_symbol(&mod_game, "__cxa_guard_abort"), (uintptr_t)my_cxa_guard_abort);
 }
 
+/* ---- ASYNC FILE WORKER (porta do bully-NX) — A PEÇA QUE FALTAVA ----
+ * No Android os arquivos carregam ASSÍNCRONO: uma fila (AndroidFile::
+ * firstAsyncFile) é avançada por AND_FileUpdated(delta) a cada frame por um
+ * worker. Sem ele, os loads de recurso (incl. a whitetexture / default
+ * resources) NUNCA completam -> GameRenderer::Setup pega NULL -> crash. */
+static void (*g_AND_FileUpdated)(double) = NULL;
+static volatile uintptr_t *g_first_async = NULL;
+static void *async_file_worker(void *a) {
+  (void)a;
+  for (;;) {
+    if (g_AND_FileUpdated && g_first_async &&
+        __atomic_load_n(g_first_async, __ATOMIC_ACQUIRE))
+      g_AND_FileUpdated(0.002);
+    else
+      usleep(2000);
+  }
+  return NULL;
+}
+static void start_async_file_worker(void) {
+  g_AND_FileUpdated = (void (*)(double))so_symbol(&mod_game, "_Z14AND_FileUpdated");
+  g_first_async =
+      (volatile uintptr_t *)so_symbol(&mod_game, "_ZN11AndroidFile14firstAsyncFileE");
+  fprintf(stderr, "[async] AND_FileUpdated=%p firstAsyncFile=%p\n",
+          (void *)g_AND_FileUpdated, (void *)g_first_async);
+  if (g_AND_FileUpdated && g_first_async) {
+    pthread_t t;
+    if (pthread_create(&t, NULL, async_file_worker, NULL) == 0) {
+      pthread_detach(t);
+      fprintf(stderr, "[async] worker started\n");
+    }
+  }
+}
+
 /* ---- orquestração de thread (porta do bully-NX, adaptada x86_64) ----
  * O engine lê handle[0x69]=running (OS_ThreadIsRunning) e handle[0x28]=pthread_t
  * (OS_ThreadWait). Sem gerenciar isso, o sync de thread quebra e o renderer/
@@ -444,6 +478,7 @@ void jni_load(void) {
   fprintf(stderr, "[drv] OS_EGL globals RE-SEED pós-surface: d=%p s=%p c=%p\n",
           (void*)egl_d, (void*)egl_s, (void*)egl_c);
   if (OnResume) { fprintf(stderr, "[drv] implOnResume...\n"); OnResume(fake_env, NULL); }
+  start_async_file_worker(); /* processa a fila de loads async -> recursos/whitetexture carregam */
 
   /* callbacks Rockstar (gate online): no Android vem async do Java; aqui disparamos no loop */
   void (*OS_StateChanged)(int) = (void*)so_symbol(&mod_game, "_Z25OS_OnRockstarStateChangedb");
