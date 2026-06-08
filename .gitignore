@@ -25,3 +25,14 @@ global-metadata.dat
 # OS
 .DS_Store
 experiments/*/build/
+
+# dados/libs/binarios do jogo (BYO-data estilo PortMaster -- NUNCA no repo)
+ports/*/assets/
+ports/*/*.zip
+ports/*/*.idx
+ports/*/*.obb
+ports/*/*.so
+ports/*/*.swap
+ports/bully/bully
+mem.log
+bully.log
