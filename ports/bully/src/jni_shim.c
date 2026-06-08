@@ -403,12 +403,17 @@ void jni_load(void) {
   *(uintptr_t *)(fake_vm + 0x30) = (uintptr_t)GetEnv;               /* idx 6 */
   *(uintptr_t *)(fake_vm + 0x38) = (uintptr_t)AttachCurrentThread;  /* idx 7 daemon */
 
+  /* hooks patcham a TEXT do libGame (que está RX após so_finalize) -> torna
+   * gravável durante o hooking, depois volta p/ executável (device AArch64). */
+  so_make_text_writable();
   /* hooka NvAPK ANTES de qualquer init (asset reading vem dos data_*.zip) */
   hook_nvapk();
   hook_egl();
   hook_threads(); /* gerência de thread Switch-safe -> destrava GameMain/whitetexture */
   hook_screen();  /* OS_ScreenGetWidth/Height + render gates como função */
   hook_cxa();     /* __cxa_guard simples -> statics C++ (whitetexture?) inicializam */
+  so_make_text_executable();
+  so_flush_caches();
   asset_archive_init();
   zip_fs_init(); /* serve recursos (whitetexture etc) de DENTRO dos data zips via fopen */
 
