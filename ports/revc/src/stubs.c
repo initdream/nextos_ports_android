@@ -96,9 +96,13 @@ static void my_glShaderSource(unsigned sh, int count, const char *const *str,
   //       Mali -> 2D do menu some; corrigir p/ só xy*=w e z=0)
   char *s1 = str_replace_all(cat, "MAX_LIGHTS 8", "MAX_LIGHTS 4");
   char *s2 = str_replace_all(s1, "highp", "mediump");
+  // im2d (2D) z-fix: `gl_Position.xyz *= w` estoura o Z no Mali -> 2D some (preto).
+  // Em vez de z=0 (que achata TODO 2D e quebra a máscara de depth do radar ->
+  // mapa quadrado vaza), escalamos o z por um fator pequeno: fica no range (menu
+  // aparece) E preserva a ordem máscara<mapa do DrawRadarMask (radar recorta).
   char *s3 =
       str_replace_all(s2, "gl_Position.xyz *= gl_Position.w;",
-                      "gl_Position.xy *= gl_Position.w; gl_Position.z = 0.0;");
+                      "gl_Position.xy *= gl_Position.w; gl_Position.z *= 0.01;");
   free(cat);
   free(s1);
   free(s2);
