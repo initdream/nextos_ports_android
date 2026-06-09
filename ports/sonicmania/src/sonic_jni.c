@@ -117,6 +117,7 @@ static void audio_cb(void *ud, Uint8 *stream, int len) {
 }
 
 static void (*g_onkey)(void *, void *, int, int) = NULL;
+static void (*g_copyslot)(void *, unsigned) = NULL;
 static int sdl_key_to_android(int sc) {
   switch (sc) {
     case SDL_SCANCODE_UP: return 19; case SDL_SCANCODE_DOWN: return 20;
@@ -202,11 +203,16 @@ void jni_run(void) {
   { uintptr_t sa=so_find_addr_safe("_ZN4RSDK5Audio15deviceAvailableE"); uintptr_t si=so_find_addr_safe("_ZN4RSDK5Audio11initializedE");
     if(sa){ fprintf(stderr,"[audio] deviceAvailable era %d -> 1\n", *(int*)sa); *(int*)sa=1; }
     if(si){ fprintf(stderr,"[audio] initialized era %d -> 1\n", *(int*)si); *(int*)si=1; } }
-  { uintptr_t ci = so_find_addr_safe("_ZN4RSDK3SKU18AndroidInputDevice10Controller4InitEv");
+  { uintptr_t ai = so_find_addr_safe("_ZN4RSDK3SKU18AndroidInputDevice4InitEv");
+    if (ai) { fprintf(stderr, "[input] AndroidInputDevice::Init()\n"); ((void(*)(void))ai)(); }
+    uintptr_t ci = so_find_addr_safe("_ZN4RSDK3SKU18AndroidInputDevice10Controller4InitEv");
     if (ci) { fprintf(stderr, "[input] Controller::Init()\n"); ((void(*)(void))ci)(); } }
   g_onkey = (void (*)(void *, void *, int, int))so_find_addr_safe("Java_com_netflix_NGP_SonicMania_MainActivity_OnKeyEvent");
+  g_copyslot = (void (*)(void *, unsigned))so_find_addr_safe("_ZN4RSDK3SKU18AndroidInputDevice10CopyToSlotEh");
+  fprintf(stderr, "[input] CopyToSlot=%p\n", (void *)g_copyslot);
   fprintf(stderr, "[input] OnKeyEvent=%p\n", (void *)g_onkey);
-  { int nj = SDL_NumJoysticks(); for (int i=0;i<nj;i++) if (SDL_IsGameController(i)) SDL_GameControllerOpen(i); }
+  { int nj = SDL_NumJoysticks(); fprintf(stderr, "[input] %d joysticks\n", nj);
+    for (int i=0;i<nj;i++){ if (SDL_IsGameController(i)) { SDL_GameControllerOpen(i); fprintf(stderr,"[input] gamecontroller %d aberto\n",i);} else { SDL_JoystickOpen(i); fprintf(stderr,"[input] joystick RAW %d aberto (%s)\n",i,SDL_JoystickNameForIndex(i)); } } }
   fprintf(stderr, "[drv] entrando no loop step\n");
   for (long f = 0; st; f++) {
     SDL_Event ev;
@@ -216,14 +222,26 @@ void jni_run(void) {
         int kc = sdl_key_to_android(ev.key.keysym.scancode);
         if (kc && g_onkey) g_onkey(fake_env, fake_thiz, kc, ev.type == SDL_KEYDOWN ? 1 : 0);
       } else if (ev.type == SDL_CONTROLLERBUTTONDOWN || ev.type == SDL_CONTROLLERBUTTONUP) {
+        fprintf(stderr, "[ev] CBUTTON %d %s\n", ev.cbutton.button, ev.type==SDL_CONTROLLERBUTTONDOWN?"down":"up");
         int kc = sdl_btn_to_android(ev.cbutton.button);
         if (kc && g_onkey) g_onkey(fake_env, fake_thiz, kc, ev.type == SDL_CONTROLLERBUTTONDOWN ? 1 : 0);
+      } else if (ev.type == SDL_JOYBUTTONDOWN || ev.type == SDL_JOYBUTTONUP) {
+        fprintf(stderr, "[ev] JOYBUTTON %d %s\n", ev.jbutton.button, ev.type==SDL_JOYBUTTONDOWN?"down":"up");
+        /* mapa raw: 0=A 1=B 2=X 3=Y 9=START 8=SELECT (ajusta conforme log) */
+        int kc=0; switch(ev.jbutton.button){case 0:kc=96;break;case 1:kc=97;break;case 2:kc=99;break;case 3:kc=100;break;case 9:case 6:kc=108;break;case 8:case 4:kc=109;break;}
+        if (kc && g_onkey) g_onkey(fake_env, fake_thiz, kc, ev.type == SDL_JOYBUTTONDOWN ? 1 : 0);
+      } else if (ev.type == SDL_JOYHATMOTION) {
+        fprintf(stderr, "[ev] JOYHAT %d\n", ev.jhat.value);
+        int v=ev.jhat.value; if(g_onkey){ g_onkey(fake_env,fake_thiz,19,(v&SDL_HAT_UP)?1:0); g_onkey(fake_env,fake_thiz,20,(v&SDL_HAT_DOWN)?1:0); g_onkey(fake_env,fake_thiz,21,(v&SDL_HAT_LEFT)?1:0); g_onkey(fake_env,fake_thiz,22,(v&SDL_HAT_RIGHT)?1:0);}
+      } else if (ev.type == SDL_JOYAXISMOTION && (ev.jaxis.value>16000||ev.jaxis.value<-16000)) {
+        fprintf(stderr, "[ev] JOYAXIS %d=%d\n", ev.jaxis.axis, ev.jaxis.value);
       } else if (ev.type == SDL_CONTROLLERDEVICEADDED) SDL_GameControllerOpen(ev.cdevice.which);
     }
     /* auto-teste: aperta START no frame 250/255 p/ ver se a cena avança */
     if (g_onkey && (f==700||f==1000||f==1300)) { fprintf(stderr, "[input] AUTO START f=%ld\n", f); g_onkey(fake_env, fake_thiz, 108, 1); }
     if (g_onkey && (f==706||f==1006||f==1306)) { g_onkey(fake_env, fake_thiz, 108, 0); }
     { static uintptr_t sa2=0; if(!sa2) sa2=so_find_addr_safe("_ZN4RSDK5Audio15deviceAvailableE"); if(sa2)*(int*)sa2=1; }
+    if (g_copyslot) { g_copyslot(fake_thiz, 0); g_copyslot(fake_thiz, 1); }
     ((void (*)(void *, void *, float))st)(fake_env, fake_thiz, 60.0f);
     /* { extern void opensles_shim_pump_callbacks(void); opensles_shim_pump_callbacks(); } DISABLED p/ isolar crash */
     { extern int g_drawcount; static int last=0;
