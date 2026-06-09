@@ -421,6 +421,7 @@ static void sdl_audio_callback(void *userdata, Uint8 *stream, int len) {
     float av = fabsf(mix_buf[s]);
     if (av > mix_peak) mix_peak = av;
   }
+  { static int pkc=0; if(pkc++%80==0) fprintf(stderr,"[sl] mixpeak=%.0f active=%d\n", mix_peak, num_active); }
   if (jump_l > 8000 || jump_r > 8000) {
     click_count++;
     debugPrintf("opensles_shim: CLICK #%u cb#%u jump L=%d R=%d prev=%d/%d new=%d/%d mixpeak=%.0f active=%d\n",
@@ -1069,6 +1070,7 @@ void opensles_shim_pump_callbacks(void) {
         p->debug_callback_logs++;
       } */
       p->callback(&p->bq_ptr, p->callback_context);
+      { static int fc=0; if(fc++%150==0) fprintf(stderr,"[sl] bq_cb#%d enq %u->%u\n", fc, counter_before, p->enqueue_counter); }
 
       if (p->ever_enqueued && !p->decoder_done &&
           p->enqueue_counter == counter_before) {

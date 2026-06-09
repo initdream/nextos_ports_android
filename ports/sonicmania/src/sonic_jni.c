@@ -187,6 +187,7 @@ void jni_run(void) {
       if (ev.type == SDL_QUIT) return;
     { static uintptr_t sa2=0; if(!sa2) sa2=so_find_addr_safe("_ZN4RSDK5Audio15deviceAvailableE"); if(sa2)*(int*)sa2=1; }
     ((void (*)(void *, void *, float))st)(fake_env, fake_thiz, 60.0f);
+    { extern void opensles_shim_pump_callbacks(void); opensles_shim_pump_callbacks(); }
     { extern int g_drawcount; static int last=0;
       if (f%30==0) { fprintf(stderr, "[loop] frame %ld draws=%d (+%d) glErr=0x%x\n", f, g_drawcount, g_drawcount-last, glGetError()); last=g_drawcount; }
       if (f%120==1) fprintf(stderr, "[state] running=%d container=%d info=%d %d %d %d\n",
