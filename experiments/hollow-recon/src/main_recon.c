@@ -54,6 +54,7 @@ int g_egl_nslots = 0;
 static unsigned long g_got_skips = 0, g_got_emul = 0;
 static unsigned long g_null_recov = 0;
 static unsigned long g_gc_recov = 0;
+static unsigned long g_nullcall_recov = 0;
 /* tracepoints brk: addr patchado -> insn original (restaura+continua no SIGTRAP).
    kind 0 = restaura+continua (1-shot). kind 1 = GUARDADO: so loga (x0) quando
    g_in_inject (nossa injecao); nas outras chamadas EMULA `cbz x0,arg` e mantem
@@ -68,6 +69,29 @@ static inline int cur_tid(void) { return (int)syscall(SYS_gettid); }
 static void on_segv(int sig, siginfo_t *si, void *uc_) {
   ucontext_t *uc = (ucontext_t *)uc_;
   uintptr_t tb0 = (uintptr_t)text_base;
+  /* CHAMADA NULL/wild: o pc aterrissou em endereco nulo/baixo -- ex: a Unity chama
+     uma funcao GLES3 ausente via ponteiro NULL (Mali-450 = GLES2). Nao da pra ler a
+     insn (pc=0) -> retorna pra lr com x0=0 (a funcao vira no-op que "retorna 0") e segue.
+     CHECAR ANTES do null-deref (que tenta ler a insn em pc e re-crasharia). */
+  if (sig == 11 && uc->uc_mcontext.pc < 0x10000) {
+    g_nullcall_recov++;
+    if (g_nullcall_recov > 200000) { /* trava de seguranca: nunca girar pra sempre */
+      const char *m = "[NULLCALL] excesso -> abort\n";
+      if (write(2, m, 27) < 0) {}
+      _exit(68);
+    }
+    if (g_nullcall_recov <= 40 || g_nullcall_recov % 100000 == 0) {
+      char lb[112];
+      int ln = snprintf(lb, sizeof lb,
+                        "[NULLCALL-RECOV] #%lu pc=0x%lx -> ret lr=il2+0x%lx (x0=0)\n",
+                        g_nullcall_recov, (unsigned long)uc->uc_mcontext.pc,
+                        (unsigned long)(uc->uc_mcontext.regs[30] - 0x500000000UL));
+      if (write(2, lb, ln) < 0) {}
+    }
+    uc->uc_mcontext.pc = uc->uc_mcontext.regs[30]; /* volta pro caller (lr) */
+    uc->uc_mcontext.regs[0] = 0;                    /* valor de retorno = 0/NULL */
+    return;
+  }
   /* RECUPERACAO GENERICA de NULL-deref: tipos C# stripados/ausentes viram NULL e
      sao lidos por acessores il2cpp (ldr/ldrb de [NULL+off]). Fault em endereco
      baixo -> zera o reg destino (Rt) e avanca pc. Limite evita loop infinito. */
@@ -394,11 +418,29 @@ static void patch_nullsafe_accessor(char *func, char **tramp) {
 volatile unsigned long g_recon_utb;
 void recon_bp(void *utb) { g_recon_utb = (unsigned long)utb; __asm__ __volatile__("" ::: "memory"); }
 
+#include <pthread.h>
+/* WATCHDOG: thread independente que auto-encerra o processo apos N segundos, p/ NUNCA
+   deixar o device travado num bloqueio/spin de userspace. (GPU-hang D-state nao salva.) */
+static void *hk_watchdog(void *arg) {
+  int secs = (int)(long)arg;
+  for (int i = 0; i < secs; i++) { struct timespec ts = {1, 0}; nanosleep(&ts, NULL); }
+  static const char m[] = "[WATCHDOG] tempo esgotado -> _exit\n";
+  if (write(2, m, sizeof(m) - 1) < 0) {}
+  _exit(70);
+  return NULL;
+}
+
 int main(int argc, char **argv) {
   (void)argc; (void)argv;
   stderr_fake = stderr;
   setvbuf(stderr, NULL, _IOLBF, 0);
   g_main_tid = cur_tid();
+
+  /* watchdog de seguranca (HK_WD segundos, default 30) -- iteracao sem travar o device */
+  {
+    int wd = getenv("HK_WD") ? atoi(getenv("HK_WD")) : 30;
+    if (wd > 0) { pthread_t t; pthread_create(&t, NULL, hk_watchdog, (void *)(long)wd); pthread_detach(t); }
+  }
 
   /* GC conservativo do il2cpp (BDWGC) escaneia pilha/heap e crasha de-referenciando
      candidatos-lixo no ambiente bionic-sobre-glibc. Desabilitar = jogo roda contInuo
@@ -652,6 +694,40 @@ int main(int argc, char **argv) {
       } else {
         fprintf(stderr, "[SWAPPY] AVISO: opcode inesperado @0x690f2c = %08x\n", *pw);
       }
+      /* 2o vsync-wait do Choreographer @0x6927c4 (cbz x0,0x6927b4 = b4ffff80) -> NOP.
+         Sem ele a engine trava no frame ~3 montando o UnityChoreographer (HandlerThread
+         + getLooper + FrameCallback esperando VSync do Android que nunca vem). */
+      unsigned int *pw2 = (unsigned int *)(utbg + 0x6927c4);
+      if (*pw2 == 0xb4ffff80) {
+        *pw2 = 0xd503201f;
+        __builtin___clear_cache((char *)pw2, (char *)pw2 + 4);
+        fprintf(stderr, "[SWAPPY] 2o patch vsync-wait aplicado @ unity+0x6927c4\n");
+      } else {
+        fprintf(stderr, "[SWAPPY] AVISO: opcode inesperado @0x6927c4 = %08x\n", *pw2);
+      }
+      /* 3o+4o waits do Choreographer: o skip simples REGREDIU (11->3 frames) -> a thread do
+         Choreographer E NECESSARIA (nao da pra so pular). Gated atras de HK_SWAPPY34. */
+      if (!getenv("HK_NOSWAPPY34")) { /* default ON: passa do Choreographer */
+      unsigned int *pw3 = (unsigned int *)(utbg + 0x69159c);
+      if (*pw3 == 0xb40000e8) {
+        *pw3 = 0x14000007;
+        __builtin___clear_cache((char *)pw3, (char *)pw3 + 4);
+        fprintf(stderr, "[SWAPPY] 3o patch vsync-wait aplicado @ unity+0x69159c\n");
+      } else {
+        fprintf(stderr, "[SWAPPY] AVISO: opcode inesperado @0x69159c = %08x\n", *pw3);
+      }
+      /* 4o = O BLOQUEIO do Choreographer @0x693124: apos pthread_create, cond_wait esperando
+         a thread sinalizar (Looper pronto) que nunca vem. Patch @0x693118
+         (cbnz w8,0x693130 = 350000c8) -> b 0x693130 (14000006) = pula a espera da thread. */
+      unsigned int *pw4 = (unsigned int *)(utbg + 0x693118);
+      if (*pw4 == 0x350000c8) {
+        *pw4 = 0x14000006;
+        __builtin___clear_cache((char *)pw4, (char *)pw4 + 4);
+        fprintf(stderr, "[SWAPPY] 4o patch (Choreographer getLooper) aplicado @ unity+0x693118\n");
+      } else {
+        fprintf(stderr, "[SWAPPY] AVISO: opcode inesperado @0x693118 = %08x\n", *pw4);
+      }
+      } /* fim HK_SWAPPY34 */
     }
     /* input: nativeInjectEvent(env, this, KeyEvent) — jni_shim responde os
        getAction/getKeyCode/etc. a partir de g_hk_inject (setado por evento SDL). */
@@ -687,7 +763,19 @@ int main(int argc, char **argv) {
     /* loop de render INFINITO (ate morto). HK_FRAMES limita (0=infinito). */
     long cap = getenv("HK_FRAMES") ? atol(getenv("HK_FRAMES")) : 0;
     long pace = getenv("HK_PACE_US") ? atol(getenv("HK_PACE_US")) : 14000;
+    /* CHOREOGRAPHER nativo: chamar nOnChoreographer a cada frame = dirige o vsync do Swappy
+       SEM Looper Java. Sem isso o jogo TRAVA no init esperando o frame-callback. HK_NOCHOREO desliga. */
+    /* nOnChoreographer(env,thiz,x2) e um thunk que faz virtual-call em x2 (objeto Swappy),
+       nao aceita frametime cru -> crasha. Precisa do objeto de contexto real. Gated HK_CHOREO. */
+    void *choreo = 0;
+    if (getenv("HK_CHOREO")) {
+      so_module *sv = so_save(); so_use(g_m_unity);
+      choreo = (void *)so_find_addr("Java_com_google_androidgamesdk_ChoreographerCallback_nOnChoreographer");
+      so_use(sv); free(sv);
+      fprintf(stderr, "[CHOREO] nOnChoreographer @ %p\n", choreo);
+    }
     for (long frame = 0; cap == 0 || frame < cap; frame++) {
+      if (choreo) ((void (*)(void *, void *, long long))choreo)(fake_env, &t, (long long)frame * 16666666LL);
       unsigned char r = rf(fake_env, &t);
       /* TESTE sem teclado fisico: HK_AUTOKEY=<keycode> aperta a tecla a cada ~3s
          (depois do frame 240) p/ validar a injecao por SSH (66=ENTER, 23=DPAD_CENTER) */

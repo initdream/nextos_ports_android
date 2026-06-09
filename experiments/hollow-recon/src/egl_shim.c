@@ -279,15 +279,24 @@ EGLBoolean egl_shim_MakeCurrent(EGLDisplay dpy, EGLSurface draw,
 
 EGLBoolean egl_shim_SwapBuffers(EGLDisplay dpy, EGLSurface surface) {
   (void)dpy; (void)surface;
+  static int g_swapcall = 0;
+  if (++g_swapcall <= 12 || g_swapcall % 30 == 0)
+    fprintf(stderr, "[SWAPCALL] #%d win=%p real_gl=%d ctx=%p pbuf=%d\n", g_swapcall,
+            (void *)egl_window, has_real_gl, (void *)current_context,
+            current_context ? current_context->is_pbuffer : -1);
   if (!egl_window) return EGL_TRUE;
 
   if (has_real_gl && current_context && !current_context->is_pbuffer) {
+    if (getenv("HK_CLEARTEST")) { /* DEBUG: enche a tela de azul antes do swap (testa present/viewport) */
+      glBindFramebuffer(0x8D40, 0);          /* GL_FRAMEBUFFER -> default (tela) */
+      glViewport(0, 0, g_win_w, g_win_h);
+      glClearColor(0.0f, 0.0f, 0.7f, 1.0f);
+      glClear(0x4000);                       /* GL_COLOR_BUFFER_BIT */
+    }
     SDL_GL_SwapWindow(egl_window);
     int fc = ++frame_count;
-    if (fc <= 10 || fc % 60 == 0) {
-      //debugPrintf("egl_shim: SwapBuffers #%d [tid=%lx]\n",
-      //            fc, (unsigned long)pthread_self());
-    }
+    if (fc <= 10 || fc % 30 == 0)
+      fprintf(stderr, "[SWAP] #%d\n", fc);
   } else {
     static int noswap_log = 0;
     if (noswap_log < 3) {

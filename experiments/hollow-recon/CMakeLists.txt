@@ -10,6 +10,7 @@ add_executable(hollow-recon
     src/imports_unity.gen.c
     src/jni_idx_stubs.gen.c
     src/recon_egl.c
+    src/pthread_shim.c
     src/egl_shim.c
     src/util.c
     src/error.c
