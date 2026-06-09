@@ -123,7 +123,7 @@ static long my_sysconf(int name){
     case 96: case 97: /* bionic _SC_NPROCESSORS_CONF / _ONLN */
       /* 2 CPUs -> Unity cria 1 job worker que PROCESSA os jobs do WaitForJobGroup (com 1 core
          dava 0 workers e o WaitForJobGroup travava sem ninguem rodar os jobs inline). */
-      fprintf(stderr,"[SYSCONF] bionic NPROC(%d) -> 1\n",name); return 1;
+      fprintf(stderr,"[SYSCONF] bionic NPROC(%d) -> 2\n",name); return 2;
     case 98: /* bionic _SC_PHYS_PAGES */
       fprintf(stderr,"[SYSCONF] bionic PHYS_PAGES -> 512MB\n"); return (512L*1024*1024)/ps;
     case 99: /* bionic _SC_AVPHYS_PAGES */
@@ -185,15 +185,15 @@ static FILE* my_fopen(const char*p,const char*m){ if(p&&(strstr(p,"proc")||strst
   /* core count vem daqui (/sys/.../possible|present) -> Unity dimensiona job workers. Forcamos 1
      core ("0") -> jobs INLINE, sem workers, sem WaitForJobGroup deadlock. */
   if(p&&(!strcmp(p,"/sys/devices/system/cpu/possible")||!strcmp(p,"/sys/devices/system/cpu/present")||!strcmp(p,"/sys/devices/system/cpu/online"))){
-    fprintf(stderr,"[FOPEN] %s -> fake 1 core\n",p); FILE*t=tmpfile(); if(t){ fputs("0\n",t); rewind(t); return t; } }
+    fprintf(stderr,"[FOPEN] %s -> fake 2 cores\n",p); FILE*t=tmpfile(); if(t){ fputs("0-1\n",t); rewind(t); return t; } }
   return fopen(p,m); }
 static int my_open(const char*p,int fl,...){ if(p&&(strstr(p,"proc")||strstr(p,"mem"))) fprintf(stderr,"[OPEN] %s\n",p);
   /* /proc/cpuinfo: Unity conta cores p/ dimensionar o job worker pool. Forcamos 1 core (1 entrada
      "processor") -> jobs rodam INLINE, sem workers, sem WaitForJobGroup deadlock. */
   if(p&&!strcmp(p,"/proc/cpuinfo")){ FILE*t=tmpfile();
-    if(t){ fputs("processor\t: 0\nmodel name\t: ARMv7 Processor rev 1 (v7l)\nFeatures\t: half thumb fastmult vfp edsp neon vfpv3\nCPU implementer\t: 0x41\nCPU architecture: 7\n\n",t); fflush(t); int fd=dup(fileno(t)); fclose(t); lseek(fd,0,SEEK_SET); fprintf(stderr,"[OPEN] cpuinfo -> fake 1 core (fd=%d)\n",fd); return fd; } }
+    if(t){ fputs("processor\t: 0\nmodel name\t: ARMv7 Processor rev 1 (v7l)\nFeatures\t: half thumb fastmult vfp edsp neon vfpv3\nCPU implementer\t: 0x41\nCPU architecture: 7\n\nprocessor\t: 1\nmodel name\t: ARMv7 Processor rev 1 (v7l)\nFeatures\t: half thumb fastmult vfp edsp neon vfpv3\nCPU implementer\t: 0x41\nCPU architecture: 7\n\n",t); fflush(t); int fd=dup(fileno(t)); fclose(t); lseek(fd,0,SEEK_SET); fprintf(stderr,"[OPEN] cpuinfo -> fake 2 cores (fd=%d)\n",fd); return fd; } }
   if(p&&(!strcmp(p,"/sys/devices/system/cpu/possible")||!strcmp(p,"/sys/devices/system/cpu/present")||!strcmp(p,"/sys/devices/system/cpu/online"))){
-    FILE*t=tmpfile(); if(t){ fputs("0\n",t); fflush(t); int fd=dup(fileno(t)); fclose(t); lseek(fd,0,SEEK_SET); fprintf(stderr,"[OPEN] %s -> fake 1 core\n",p); return fd; } }
+    FILE*t=tmpfile(); if(t){ fputs("0-1\n",t); fflush(t); int fd=dup(fileno(t)); fclose(t); lseek(fd,0,SEEK_SET); fprintf(stderr,"[OPEN] %s -> fake 2 cores\n",p); return fd; } }
   va_list ap; va_start(ap,fl); int mo=va_arg(ap,int); va_end(ap); return open(p,fl,mo); }
 /* ANativeWindow: a Unity (nativeRecreateGfxState) chama ANativeWindow_fromSurface(env,surface)
    e ESPERA num cond ate o global de window virar !=NULL. Estavam STUBADOS (retornavam NULL)

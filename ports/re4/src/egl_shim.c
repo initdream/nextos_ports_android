@@ -25,11 +25,29 @@ typedef struct {
   EGLBoolean is_pbuffer;
   int id;
   unsigned long owner_tid; /* thread dona do SDL context (SDL-mali amarra a thread criadora) */
+  void *real_ctx;          /* contexto EGL REAL compartilhado (1 por eglCreateContext da Unity) */
 } _egl_context;
 
 static SDL_Window *egl_window = NULL;
 static SDL_GLContext egl_share_root = NULL;
 static pthread_mutex_t egl_context_create_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* === ABORDAGEM BULLY: usar os objetos EGL REAIS que o SDL2-mali criou + o eglMakeCurrent REAL
+   (via dlsym do libEGL). O wrapper SDL_GL_MakeCurrent amarra o contexto a thread criadora ->
+   EGL_BAD_ACCESS quando a Unity renderiza em outra thread. O eglMakeCurrent REAL permite handoff
+   cross-thread (basta a outra thread soltar). Capturamos dpy/surf/ctx reais apos o SDL criar. === */
+#include <dlfcn.h>
+#define EGL_DRAW_ATTR 0x3059
+static void *(*r_getCurDisplay)(void);
+static void *(*r_getCurSurface)(int);
+static void *(*r_getCurContext)(void);
+static unsigned (*r_makeCurrent)(void*,void*,void*,void*);
+static unsigned (*r_swapBuffers)(void*,void*);
+static int (*r_getError)(void);
+static void *(*r_createContext)(void*,void*,void*,const int*);
+static unsigned (*r_chooseConfig)(void*,const int*,void*,int,int*);
+static void *g_real_dpy=NULL, *g_real_surf=NULL, *g_real_ctx=NULL, *g_real_cfg=NULL;
+static int g_use_real_egl=0;
 static int frame_count = 0;
 static int next_context_id = 1;
 
@@ -68,7 +86,27 @@ void egl_shim_create_window(void) {
   }
   debugPrintf("egl_shim: GL share-root context created\n");
 
-  SDL_GL_MakeCurrent(egl_window, NULL);
+  /* captura os objetos EGL REAIS criados pelo SDL2-mali (contexto current agora=share_root) */
+  r_getCurDisplay=dlsym(RTLD_DEFAULT,"eglGetCurrentDisplay");
+  r_getCurSurface=dlsym(RTLD_DEFAULT,"eglGetCurrentSurface");
+  r_getCurContext=dlsym(RTLD_DEFAULT,"eglGetCurrentContext");
+  r_makeCurrent  =dlsym(RTLD_DEFAULT,"eglMakeCurrent");
+  r_swapBuffers  =dlsym(RTLD_DEFAULT,"eglSwapBuffers");
+  r_getError     =dlsym(RTLD_DEFAULT,"eglGetError");
+  r_createContext=dlsym(RTLD_DEFAULT,"eglCreateContext");
+  r_chooseConfig =dlsym(RTLD_DEFAULT,"eglChooseConfig");
+  if(r_getCurDisplay&&r_getCurSurface&&r_getCurContext&&r_makeCurrent&&r_createContext&&r_chooseConfig){
+    g_real_dpy=r_getCurDisplay(); g_real_surf=r_getCurSurface(EGL_DRAW_ATTR); g_real_ctx=r_getCurContext();
+    /* pega um EGLConfig REAL p/ criar contextos compartilhados (1 por thread) */
+    int cfgattr[]={0x3040,0x0004 /*RENDERABLE_TYPE=ES2*/, 0x3033,0x0004 /*SURFACE_TYPE=WINDOW*/, 0x3038};
+    int n=0; r_chooseConfig(g_real_dpy, cfgattr, &g_real_cfg, 1, &n);
+    if(g_real_dpy&&g_real_surf&&g_real_ctx&&g_real_cfg&&n>0){ g_use_real_egl=1;
+      debugPrintf("egl_shim: REAL EGL dpy=%p surf=%p ctx=%p cfg=%p (Bully-style, 1 ctx/thread)\n",
+                  g_real_dpy,g_real_surf,g_real_ctx,g_real_cfg); }
+  }
+  if(!g_use_real_egl) debugPrintf("egl_shim: REAL EGL indisponivel -> fallback SDL\n");
+
+  SDL_GL_MakeCurrent(egl_window, NULL); /* solta -> qualquer thread pode dar eglMakeCurrent REAL */
   debugPrintf("egl_shim: Context released, ready for game\n");
 }
 
@@ -193,7 +231,26 @@ EGLBoolean egl_shim_MakeCurrent(EGLDisplay dpy, EGLSurface draw,
   static _Thread_local int mc_count = 0;
   int mc = ++mc_count;
 
-  /* === UNBIND === */
+  /* === BULLY-STYLE: eglMakeCurrent REAL (cross-thread OK). bind: (dpy,surf,surf,ctx); unbind: 0s. */
+  if (g_use_real_egl) {
+    unsigned r;
+    if (context == NULL || draw == NULL) {
+      r = r_makeCurrent(g_real_dpy, NULL, NULL, NULL);
+      current_context = NULL; has_real_gl = 0;
+    } else {
+      current_context = context; last_context = context;
+      r = r_makeCurrent(g_real_dpy, g_real_surf, g_real_surf, g_real_ctx);
+      has_real_gl = (r != 0);
+      static _Thread_local int lg=0;
+      if (r == 0 && lg < 8) { debugPrintf("egl_shim: REAL eglMakeCurrent FALHOU [tid=%lx] err=0x%x\n",
+            (unsigned long)pthread_self(), r_getError?r_getError():0); lg++; }
+      else if (lg < 8) { debugPrintf("egl_shim: REAL eglMakeCurrent OK [tid=%lx] ctx_id=%d\n",
+            (unsigned long)pthread_self(), context->id); lg++; }
+    }
+    return EGL_TRUE;
+  }
+
+  /* === UNBIND (fallback SDL) === */
   if (context == NULL || draw == NULL) {
     current_context = NULL;
     if (egl_window) {
@@ -251,6 +308,14 @@ EGLBoolean egl_shim_MakeCurrent(EGLDisplay dpy, EGLSurface draw,
 
 EGLBoolean egl_shim_SwapBuffers(EGLDisplay dpy, EGLSurface surface) {
   (void)dpy; (void)surface;
+  if (g_use_real_egl) {
+    if (r_swapBuffers && g_real_dpy && g_real_surf) {
+      r_swapBuffers(g_real_dpy, g_real_surf);
+      int fc = ++frame_count; static int sl=0;
+      if (sl < 8) { debugPrintf("egl_shim: REAL SwapBuffers #%d [tid=%lx]\n", fc, (unsigned long)pthread_self()); sl++; }
+    }
+    return EGL_TRUE;
+  }
   if (!egl_window) return EGL_TRUE;
 
   if (has_real_gl && current_context && !current_context->is_pbuffer) {

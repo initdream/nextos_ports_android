@@ -450,7 +450,9 @@ void jni_run(void) {
             *(unsigned short*)(lc+c*56+48),*(unsigned short*)(lc+c*56+50)); }
       }
     }
-    /* { extern void opensles_shim_pump_callbacks(void); opensles_shim_pump_callbacks(); } DISABLED p/ isolar crash */
+    { extern void opensles_shim_pump_callbacks(void); static int au=-1;
+      if(au<0) au=getenv("SONIC_AUDIO")?1:0; /* áudio OFF por padrão (pump crasha; em debug) */
+      if(au && f>600) opensles_shim_pump_callbacks(); } /* só após init estável */
     { extern int g_drawcount; static int last=0;
       if (f%30==0) { fprintf(stderr, "[loop] frame %ld draws=%d (+%d) glErr=0x%x\n", f, g_drawcount, g_drawcount-last, glGetError()); last=g_drawcount; }
       if (f%120==1) fprintf(stderr, "[state] running=%d container=%d info=%d %d %d %d\n",
