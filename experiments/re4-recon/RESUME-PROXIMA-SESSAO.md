@@ -1,12 +1,29 @@
 # RE4 (Unity 2018 Mono) → Mali-450 / NextOS Amlogic-old — RESUMO PRA PRÓXIMA SESSÃO
 
-> Última sessão: 2026-06-09 (sessão 8). Atualize este arquivo ao avançar.
+> Última sessão: 2026-06-09 (sessão 9). Atualize este arquivo ao avançar.
 
-## TL;DR — onde estamos
-A **render loop do jogo RODA 100+ frames** (a main loop do RE4 executa). Banner confirma:
-`com.teamcherry.hollowknight`, Unity **2018.1.1f1**, `SystemInfo Cores=2 Memory=512mb`, extensões GL_OES.
-Falta: o jogo está em **estado de LOADING** (não chama `eglSwapBuffers` → `swap=0` → nada na tela ainda).
-Saímos de "engine não inicializa" → "main loop do jogo rodando". ~95% do caminho.
+## TL;DR — onde estamos (SESSÃO 9)
+**2 muros CAÍRAM**, 1 muro real restante:
+- ✅ **Crash do render loop RESOLVIDO** — era **MISMATCH DE ABI FLOAT** (softfp × hardfp), NÃO "race".
+  libunity/libmono são SOFTFP (passam double/float em regs inteiros r0:r1); o glibc do device é HARDFP
+  (espera em d0..d7). `modf(512.0,iptr)` lia o ponteiro do word-baixo de 512.0=0 → escrita em NULL
+  (`modfl+132 vstr d16,[r0]`). FIX = `src/softfp_shim.c` (44 wrappers `pcs("aapcs")`, roteados em
+  `re4_resolve`). **SEGV=0.** Agora a engine CARREGA assemblies Mono + assets de verdade.
+- ✅ **OOM no load RESOLVIDO** — não era RAM (rss 114MB, 500MB livre); era **contabilidade de overcommit**
+  (proc 32-bit reserva ~1GB virtual). FIX = `vm.overcommit_memory=1` + **swap 2GB persistente** (infra
+  do device, já montada e no boot — ver `reference_nextos_swap_overcommit_setup`).
+- ⛔ **MURO REAL = GC cooperativo AUTOMÁTICO durante o load.** Passando do crash+OOM, a engine entra no
+  load pesado da cena e **trava no GC** (o `RE4_NOGCCOLLECT` só cobre `GC.Collect` EXPLÍCITO; o GC
+  automático por-alocação dispara o stop-the-world cooperativo que deadlocka — mesmo muro da FASE 2i/2j).
+
+### ⚠️ ARMADILHA DESCOBERTA (sessão 9): NÃO usar `GC_DONT_GC=1`
+Desligar o GC de vez faz a memória **explodir** e martelar os 2GB de swap no eMMC lento →
+**thrash que trava o device por completo** (load avg 16 = IO-wait, nem o watchdog on-device roda o
+kill) → **precisa REBOOT físico**. O swap de 2GB virou faca de dois gumes: runaway de memória agora
+**thrasha até morrer** em vez de OOM-killar rápido. **Antes de testar runaway de memória, pôr um CAP de
+memória via cgroup v1** (igual Toziuha/Crash: `/sys/fs/cgroup/memory/<grupo>/memory.limit_in_bytes`
+~580-650MB) pra OOM-killar rápido e iterar sem reboot. O device ESTÁ travado agora (fim da sessão 9),
+aguardando reboot do Felipe.
 
 ## Como buildar / deployar / testar
 ```bash
@@ -14,31 +31,48 @@ Saímos de "engine não inicializa" → "main loop do jogo rodando". ~95% do cam
 cd ~/nextos_ports_android/ports/re4 && ./build_re4boot.sh
 scp -q re4boot nextos-87:/storage/roms/re4-recon/re4boot
 
-# rodar no device (alias ssh = nextos-87). RECEITA que chega na render loop:
-ssh nextos-87 'cd /storage/roms/re4-recon; systemctl stop emustation; sleep 1; pkill -9 re4boot
-  GC_INITIAL_HEAP_SIZE=134217728 GC_FREE_SPACE_DIVISOR=50000 RE4_NOGCCOLLECT=1 RE4_NOSIGH=1 \
-  SDL_VIDEODRIVER=mali LD_LIBRARY_PATH=/usr/lib32:/usr/lib ./re4boot > /tmp/re4.err 2>&1'
-# SEMPRE: systemctl start emustation no fim. dd if=/dev/fb0 ... pra capturar tela.
-# ⚠️ NÃO deixar loop dd em background no mesmo ssh (estoura o timeout do ssh).
+# RUNNER SEGURO (não trava o ssh; watchdog on-device mata sozinho + reinicia ES):
+#   /storage/roms/re4-recon/testrun.sh "<ENV EXTRA>" <segundos>
+# lançar destacado com NOHUP (⚠️ setsid NÃO existe no device):
+ssh nextos-87 'nohup sh /storage/roms/re4-recon/testrun.sh "" 50 </dev/null >/tmp/testrun.boot 2>&1 &'
+# depois reconectar e ler /tmp/re4.err (log) + /tmp/re4.threads (amostras de wchan a cada 5s)
+# overcommit=1 já vem do boot (nextos-swap.sh). swap 2GB ativo via /dev/loop1.
 ```
-Conferir progresso: `grep -E "\[render [0-9]" /tmp/re4.err` (loga f<5 || f%100). `swap`: `grep -c "REAL SwapBuffers"`.
+Conferir: `grep -c "\[render" /tmp/re4.err`, swap=`grep -c "REAL Swap"`, crash=`grep -c "SEGV\]"`.
+⚠️ SEMPRE rodar com timeout/watchdog — o GC-hang trava o ssh.
 
-## Os 3 MUROS restantes (ordem sugerida)
-1. **swap=0 / por que não aparece imagem** ← ATACAR PRIMEIRO. `nativeRender` roda mas nunca chama
-   `eglSwapBuffers` (egl_shim_SwapBuffers não é chamado). Jogo preso em loading: a **carga async da
-   cena** não termina. Investigar: qual thread/Task faz o load e por que não completa; achar onde
-   nativeRender decide "ainda carregando, não renderiza". Ver assets abertos (`globalgamemanagers.assets`,
-   level0, etc) e se a leitura completa.
-2. **GC cooperativo (fix REAL)** — o bypass atual (GC_INITIAL_HEAP_SIZE+FREE_SPACE_DIVISOR+NOGCCOLLECT)
-   é HACK (memória cresce → insustentável). O GC do Mono é **COOPERATIVO, não por sinal** (PTKILL=0!):
-   a coletora (main) seta flag e espera cada thread chegar num SAFEPOINT e dar `sem_post` no ack-sem
-   ESTÁTICO do libmono (mono+0x273da4). Uma thread **GC-Unsafe bloqueada** nunca dá ack → deadlock.
-   FIX: achar essa thread (provável thread NATIVA do Unity attached ao Mono, bloqueada num wait
-   não-cooperativo) e fazer ela entrar em GC-Safe region antes de bloquear; OU rotear o wait dela
-   pela API coop do Mono. (Bt da coletora travada: sh_sem_wait <- mono+0x2c3954.)
-3. **Crash de race** não-determinístico entre [render 4] e [render 100+], em
-   `unity+0xfc3704 / 0xb8e4a4 / 0x872a88` (símbolos template não confiáveis), fault=0x64de0, raise
-   deliberado. Provável race de threading no path de render/loading.
+## MURO ÚNICO RESTANTE = GC cooperativo automático no load (ordem de ataque sugerida)
+Contexto: o GC do Mono é **COOPERATIVO, não por sinal** (PTKILL=0). A coletora (main) seta flag e
+espera cada thread chegar num SAFEPOINT e dar `sem_post` no ack-sem ESTÁTICO (mono+0x273da4). Uma
+thread **GC-Unsafe bloqueada** (nativa Unity attached ao Mono, num wait não-cooperativo) nunca dá ack
+→ deadlock. (Bt da coletora travada: `sh_sem_wait <- mono+0x2c3954`.) O `RE4_NOGCCOLLECT` só no-opa o
+`GC.Collect` EXPLÍCITO; o **auto-GC por alocação** (durante o load) ainda dispara e trava.
+
+**PRIMEIRO PASSO obrigatório: cgroup memory cap** (senão runaway-memória thrasha o swap e trava o
+device — ver armadilha acima). Algo como:
+```bash
+mkdir -p /sys/fs/cgroup/memory/re4; echo 620M > /sys/fs/cgroup/memory/re4/memory.limit_in_bytes
+echo $$ > /sys/fs/cgroup/memory/re4/cgroup.procs   # no wrapper, antes do exec do re4boot
+```
+Assim, se a memória explodir, OOM-killa SÓ o re4boot (rápido), sem wedge. Integrar no testrun.sh.
+
+**Planos pro GC (do mais promissor):**
+1. **Achar a thread GC-Unsafe bloqueada** que não dá ack. Sob o cgroup cap + gdb no device:
+   `for t in /proc/PID/task/*; do echo $t $(cat $t/comm) $(cat $t/wchan); done` no momento do hang;
+   a thread em wchan de IO/futex que NÃO é a coletora é a suspeita. Provável: AsyncReadManager /
+   Worker Thread (read() de asset) OU uma thread criada por `sh_create` attached ao Mono.
+2. **Envolver os waits/blocking dela em GC-Safe region**: hookar o ponto onde ela bloqueia e chamar
+   `mono_threads_enter_gc_safe_region()` / `..._exit_gc_safe_region()` ao redor (símbolos no libmono).
+   Assim a coletora não a espera. Alternativa: `mono_thread_info_install_interrupt` / marcar como
+   não-suspendível. (Investigar os símbolos `mono_threads_*gc_safe*` / `mono_thread_state_*` no libmono.)
+3. **Reduzir a PRESSÃO de GC no load** (em vez de desligar): `GC_FREE_SPACE_DIVISOR` baixo + heap
+   inicial GRANDE o bastante p/ NÃO disparar auto-GC durante o load (mas SEM `GC_DONT_GC`, que estoura).
+   Calibrar o heap inicial pra caber sob o cgroup cap. Talvez `GC_MAXIMUM_HEAP_SIZE` ajude a estabilizar.
+4. **Plano B — SGen em vez de Boehm?** Improvável trocar; o libmono embute Boehm. Focar em 1+2.
+
+(HISTÓRICO: o antigo "muro 3 / crash de race unity+0xfc3704" foi DESMASCARADO = era o bug de ABI float,
+agora resolvido. O antigo "muro 1 / swap=0" provavelmente é consequência do load não terminar por
+causa do GC — atacar o GC primeiro deve destravar o swap junto.)
 
 ## DESTRAVES já feitos (reutilizáveis p/ QUALQUER Unity 2018 Mono so-loader)
 - **Cross-thread GL** (insight do Bully): captura EGL real (eglGetCurrent*), pega config EXATO da
