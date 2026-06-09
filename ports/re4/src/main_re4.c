@@ -329,6 +329,9 @@ static void my_abort(void){ map_caller("[ABORT]",(unsigned long)__builtin_return
   if(getenv("RE4_SUPPRESS_RAISE")) return; abort(); }
 static int my_ptkill(unsigned long t,int sig){ (void)t; map_caller("[PTKILL]",(unsigned long)__builtin_return_address(0)); fprintf(stderr,"[PTKILL] sig=%d\n",sig);
   if(getenv("RE4_SUPPRESS_RAISE")) return 0; return pthread_kill((pthread_t)t,sig); }
+/* loga quem chama exit/_exit (Unity/Mono pode sair limpo num erro fatal sem abort/raise) */
+void my_exit(int code){ map_caller("[EXIT]",(unsigned long)__builtin_return_address(0)); fprintf(stderr,"[EXIT] code=%d\n",code); fflush(stderr);
+  if(getenv("RE4_SUPPRESS_EXIT")){ static int n=0; if(n++<3)fprintf(stderr,"[EXIT-SUPPRESS]\n"); return; } _exit(code); }
 extern void *text_virtbase;
 static void on_segv(int sig, siginfo_t *si, void *uc_){
   ucontext_t *uc=(ucontext_t*)uc_;

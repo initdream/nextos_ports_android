@@ -115,6 +115,10 @@ void *re4_resolve(const char *nm){
   if(!strcmp(nm,"__sF")) return dlsym(RTLD_DEFAULT,"stdout");
   if(!strcmp(nm,"bsd_signal")||!strcmp(nm,"sysv_signal")) return dlsym(RTLD_DEFAULT,"signal");
   if(!strcmp(nm,"sigignore")) return (void*)&noop;
+  { extern void my_exit(int); if(!strcmp(nm,"exit")||!strcmp(nm,"_exit")||!strcmp(nm,"_Exit")) return (void*)my_exit; }
+  /* ABI float: libunity/libmono sao SOFTFP, glibc libm/libc e HARDFP -> wrappers
+     pcs(aapcs) (softfp_shim.c). ANTES do dlsym (que devolveria a func hardfp crua). */
+  { extern void *softfp_resolve(const char *); void *sf=softfp_resolve(nm); if(sf) return sf; }
   void *p=dlsym(RTLD_DEFAULT,nm);
   if(p) return p;
   /* Android-specific / nao-achado -> stub */
