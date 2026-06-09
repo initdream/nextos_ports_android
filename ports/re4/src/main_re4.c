@@ -176,16 +176,23 @@ static void my_assert_handler(const char* file, int line, const char* a, const c
 static FILE* my_fopen(const char*p,const char*m){ if(p&&(strstr(p,"proc")||strstr(p,"mem")||strstr(p,"sys"))) fprintf(stderr,"[FOPEN] %s\n",p);
   if(p&&!strcmp(p,"/proc/meminfo")){ fprintf(stderr,"[FOPEN] meminfo -> fake 512MB\n");
     FILE*t=tmpfile(); if(t){ fputs("MemTotal:      524288 kB\nMemFree:       262144 kB\nMemAvailable:  262144 kB\n",t); rewind(t); return t; } }
+  /* core count vem daqui (/sys/.../possible|present) -> Unity dimensiona job workers. Forcamos 1
+     core ("0") -> jobs INLINE, sem workers, sem WaitForJobGroup deadlock. */
+  if(p&&(!strcmp(p,"/sys/devices/system/cpu/possible")||!strcmp(p,"/sys/devices/system/cpu/present")||!strcmp(p,"/sys/devices/system/cpu/online"))){
+    fprintf(stderr,"[FOPEN] %s -> fake 1 core\n",p); FILE*t=tmpfile(); if(t){ fputs("0\n",t); rewind(t); return t; } }
   return fopen(p,m); }
 static int my_open(const char*p,int fl,...){ if(p&&(strstr(p,"proc")||strstr(p,"mem"))) fprintf(stderr,"[OPEN] %s\n",p);
   /* /proc/cpuinfo: Unity conta cores p/ dimensionar o job worker pool. Forcamos 1 core (1 entrada
      "processor") -> jobs rodam INLINE, sem workers, sem WaitForJobGroup deadlock. */
   if(p&&!strcmp(p,"/proc/cpuinfo")){ FILE*t=tmpfile();
     if(t){ fputs("processor\t: 0\nmodel name\t: ARMv7 Processor rev 1 (v7l)\nFeatures\t: half thumb fastmult vfp edsp neon vfpv3\nCPU implementer\t: 0x41\nCPU architecture: 7\n\n",t); fflush(t); int fd=dup(fileno(t)); fclose(t); lseek(fd,0,SEEK_SET); fprintf(stderr,"[OPEN] cpuinfo -> fake 1 core (fd=%d)\n",fd); return fd; } }
+  if(p&&(!strcmp(p,"/sys/devices/system/cpu/possible")||!strcmp(p,"/sys/devices/system/cpu/present")||!strcmp(p,"/sys/devices/system/cpu/online"))){
+    FILE*t=tmpfile(); if(t){ fputs("0\n",t); fflush(t); int fd=dup(fileno(t)); fclose(t); lseek(fd,0,SEEK_SET); fprintf(stderr,"[OPEN] %s -> fake 1 core\n",p); return fd; } }
   va_list ap; va_start(ap,fl); int mo=va_arg(ap,int); va_end(ap); return open(p,fl,mo); }
 /* ANativeWindow: a Unity (nativeRecreateGfxState) chama ANativeWindow_fromSurface(env,surface)
    e ESPERA num cond ate o global de window virar !=NULL. Estavam STUBADOS (retornavam NULL)
    -> Unity guardava NULL -> UnityMain travava p/ sempre. Retornamos window fake !=NULL + dims. */
+static int jobwait_stub(void*this_){ (void)this_; return 0; }
 static int g_anw=0xA11;
 static void *my_aw_fromSurface(void*env,void*surf){ (void)env;(void)surf; fprintf(stderr,"[ANW] fromSurface -> %p\n",(void*)&g_anw); return &g_anw; }
 static int my_aw_setgeom(void*w,int wd,int ht,int f){ (void)w;(void)wd;(void)ht;(void)f; return 0; }
@@ -352,6 +359,10 @@ int main(void){
   so_execute_init_array();
   fprintf(stderr,"[A] engine init OK (372 ctors)\n");
   g_unity_base=(uintptr_t)text_virtbase; g_m_unity=so_save();
+  /* DIAG: a UnityMain trava em WaitForJobGroup (libunity+0x3268e0) no 1o nativeRender -- os jobs
+     nunca completam (sem workers / inline-exec callback NULL). Hook p/ retornar imediato e ver
+     se a engine progride (jobs nao-criticos) ou crasha (criticos). Gated. */
+  if(getenv("RE4_SKIPJOBWAIT")){ hook_arm64(g_unity_base+0x3268e0,(uintptr_t)jobwait_stub); fprintf(stderr,"[HOOK] WaitForJobGroup @unity+0x3268e0 -> return 0\n"); }
   { size_t msz=24*1024*1024; void *mh=mmap(NULL,msz,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
     if(mh!=MAP_FAILED && so_load("libmono.so",mh,msz)>=0){ so_relocate(); so_resolve(dynlib_functions,dynlib_numfunctions,0);
       { uintptr_t a;
