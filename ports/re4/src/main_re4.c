@@ -114,7 +114,10 @@ static long my_sysconf(int name){
       fprintf(stderr,"[SYSCONF] bionic PAGESIZE(%d) -> 4096\n",name); return 4096;
     case 6:  /* bionic _SC_CLK_TCK */ return 100;
     case 96: case 97: /* bionic _SC_NPROCESSORS_CONF / _ONLN */
-      fprintf(stderr,"[SYSCONF] bionic NPROC(%d) -> 4\n",name); return 4;
+      /* 1 CPU -> o job system do Unity NAO cria worker threads e roda jobs INLINE na thread
+         que faz WaitForJobGroup. Com >1, ele cria fence e espera workers que (no so-loader)
+         nao sobem -> deadlock da UnityMain em WaitForJobGroup. */
+      fprintf(stderr,"[SYSCONF] bionic NPROC(%d) -> 1\n",name); return 1;
     case 98: /* bionic _SC_PHYS_PAGES */
       fprintf(stderr,"[SYSCONF] bionic PHYS_PAGES -> 512MB\n"); return (512L*1024*1024)/ps;
     case 99: /* bionic _SC_AVPHYS_PAGES */
@@ -175,6 +178,10 @@ static FILE* my_fopen(const char*p,const char*m){ if(p&&(strstr(p,"proc")||strst
     FILE*t=tmpfile(); if(t){ fputs("MemTotal:      524288 kB\nMemFree:       262144 kB\nMemAvailable:  262144 kB\n",t); rewind(t); return t; } }
   return fopen(p,m); }
 static int my_open(const char*p,int fl,...){ if(p&&(strstr(p,"proc")||strstr(p,"mem"))) fprintf(stderr,"[OPEN] %s\n",p);
+  /* /proc/cpuinfo: Unity conta cores p/ dimensionar o job worker pool. Forcamos 1 core (1 entrada
+     "processor") -> jobs rodam INLINE, sem workers, sem WaitForJobGroup deadlock. */
+  if(p&&!strcmp(p,"/proc/cpuinfo")){ FILE*t=tmpfile();
+    if(t){ fputs("processor\t: 0\nmodel name\t: ARMv7 Processor rev 1 (v7l)\nFeatures\t: half thumb fastmult vfp edsp neon vfpv3\nCPU implementer\t: 0x41\nCPU architecture: 7\n\n",t); fflush(t); int fd=dup(fileno(t)); fclose(t); lseek(fd,0,SEEK_SET); fprintf(stderr,"[OPEN] cpuinfo -> fake 1 core (fd=%d)\n",fd); return fd; } }
   va_list ap; va_start(ap,fl); int mo=va_arg(ap,int); va_end(ap); return open(p,fl,mo); }
 /* ANativeWindow: a Unity (nativeRecreateGfxState) chama ANativeWindow_fromSurface(env,surface)
    e ESPERA num cond ate o global de window virar !=NULL. Estavam STUBADOS (retornavam NULL)

@@ -308,8 +308,17 @@ void jni_run(void) {
     if (s_folder && memcmp((char*)s_folder,"Menu",5)==0) {
       uintptr_t tb = (uintptr_t)g_copyslot - 0x17d9bc;
       uintptr_t gp = *(uintptr_t*)(tb + 0x4a76d8);
-      if (gp) { if (*(int*)(gp+0x100a0)!=200) *(int*)(gp+0x100a0)=200;
-                if (*(int*)(gp+0x414bc)!=200) *(int*)(gp+0x414bc)=200; }
+      if (gp) { /* MenuSetup_PrerollChecks exige 4 campos == STATUS_OK(200): */
+        if (*(int*)(gp+0x100a0)!=200) *(int*)(gp+0x100a0)=200; /* saveLoaded */
+        if (*(int*)(gp+0x414bc)!=200) *(int*)(gp+0x414bc)=200; /* optionsLoaded */
+        if (*(int*)(gp+0x441778)!=200) *(int*)(gp+0x441778)=200; /* replayTableLoaded */
+        if (*(int*)(gp+0x441780)!=200) *(int*)(gp+0x441780)=200; /* taTableLoaded */ }
+      /* MenuSetup_PrerollChecks: se MenuSetup->initializedAPI(+16)!=0 retorna "done"
+       * de cara, pulando TODOS os gates de API mobile (NotifyAutosave/Notifs/Dialogs).
+       * MenuSetup = *(tb+0x4a7b20). So depois de initializedSaves(+20) setar. */
+      { uintptr_t ms=*(uintptr_t*)(tb+0x4a7b20);
+        if (ms && *(int*)(ms+20)!=0 && *(int*)(ms+16)==0) {
+          *(int*)(ms+16)=1; fprintf(stderr,"[menu] forcado MenuSetup->initializedAPI=1\n"); } }
       if (f%60==15) {
         uintptr_t pv=*(uintptr_t*)(tb+0x490e08); uintptr_t us=pv?*(uintptr_t*)pv:0;
         fprintf(stderr,"[menu] us=0x%lx auth=%d storage=%d perm=%d conflict=%d | saveLd=%d optLd=%d\n",
