@@ -125,10 +125,10 @@ DynLibFunction dynlib_functions[] = {
   {"glGetUniformLocation", (uintptr_t)&glGetUniformLocation},  // gles
   {"glTexImage2D", (uintptr_t)&my_glTexImage2D},  // gles
   {"glTexParameteri", (uintptr_t)&glTexParameteri},  // gles
-  {"glTexSubImage2D", (uintptr_t)&glTexSubImage2D},  // gles
+  {"glTexSubImage2D", (uintptr_t)&my_glTexSubImage2D},  // gles
   {"glUniform1i", (uintptr_t)&glUniform1i},  // gles
   {"glUniform2fv", (uintptr_t)&glUniform2fv},  // gles
-  {"glUseProgram", (uintptr_t)&glUseProgram},  // gles
+  {"glUseProgram", (uintptr_t)&my_glUseProgram},  // gles
   {"glVertexAttribPointer", (uintptr_t)&glVertexAttribPointer},  // gles
   {"glViewport", (uintptr_t)&my_glViewport},  // gles
   {"__gxx_personality_v0", (uintptr_t)&__gxx_personality_v0},  // cxx

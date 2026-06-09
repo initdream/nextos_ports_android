@@ -69,3 +69,26 @@ void my_glShaderSource(GLuint sh, GLsizei n, const char *const *str, const GLint
   }
   glShaderSource(sh,n,str,len);
 }
+
+/* O engine NAO cria shaders (o Java criava). Crio um programa de blit GLES2
+ * e intercepto glUseProgram pra bindar o meu (atribs pos@0/color@1/uv@2 +
+ * sampler na unidade 0, igual o formato RenderVertex do RSDK). */
+static GLuint g_blitprog = 0;
+static GLuint make_blit_program(void) {
+  const char *vs = "attribute vec3 in_pos;\nattribute vec4 in_color;\nattribute vec2 in_UV;\nvarying vec2 ex_UV;\nvarying vec4 ex_color;\nvoid main(){ gl_Position=vec4(in_pos,1.0); ex_UV=in_UV; ex_color=in_color; }\n";
+  const char *fs = "precision mediump float;\nuniform sampler2D tex;\nvarying vec2 ex_UV;\nvarying vec4 ex_color;\nvoid main(){ gl_FragColor=texture2D(tex, ex_UV); }\n";
+  GLuint v=glCreateShader(GL_VERTEX_SHADER); glShaderSource(v,1,&vs,0); glCompileShader(v);
+  GLint ok=0; glGetShaderiv(v,GL_COMPILE_STATUS,&ok); if(!ok){char l[512];glGetShaderInfoLog(v,512,0,l);fprintf(stderr,"[blit] VS FAIL: %s\n",l);}
+  GLuint f=glCreateShader(GL_FRAGMENT_SHADER); glShaderSource(f,1,&fs,0); glCompileShader(f);
+  glGetShaderiv(f,GL_COMPILE_STATUS,&ok); if(!ok){char l[512];glGetShaderInfoLog(f,512,0,l);fprintf(stderr,"[blit] FS FAIL: %s\n",l);}
+  GLuint p=glCreateProgram(); glAttachShader(p,v); glAttachShader(p,f);
+  glBindAttribLocation(p,0,"in_pos"); glBindAttribLocation(p,1,"in_color"); glBindAttribLocation(p,2,"in_UV");
+  glLinkProgram(p); glGetProgramiv(p,GL_LINK_STATUS,&ok);
+  fprintf(stderr,"[blit] programa=%u link=%d\n", p, ok);
+  return p;
+}
+void my_glUseProgram(GLuint id) {
+  (void)id;
+  if (!g_blitprog) g_blitprog = make_blit_program();
+  glUseProgram(g_blitprog);
+}

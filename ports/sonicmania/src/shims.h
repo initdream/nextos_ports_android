@@ -55,4 +55,5 @@ void my_glGenTextures(); void my_glBindTexture(); void my_glTexImage2D(); void m
 unsigned my_glCreateShader(); void my_glActiveTexture(); void my_glBufferData();
 void my_glTexSubImage2D();
 void my_glShaderSource();
+void my_glUseProgram();
 #endif
