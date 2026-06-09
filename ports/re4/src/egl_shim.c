@@ -135,14 +135,18 @@ EGLBoolean egl_shim_Terminate(EGLDisplay dpy) {
 EGLBoolean egl_shim_ChooseConfig(EGLDisplay dpy, const EGLint *attrib_list,
                                   EGLConfig *configs, EGLint config_size,
                                   EGLint *num_config) {
-  (void)dpy;
-  debugPrintf("egl_shim: eglChooseConfig() attribs:");
-  if (attrib_list) { for (const EGLint *a = attrib_list; a[0] != 0x3038 /*EGL_NONE*/; a += 2) debugPrintf(" 0x%x=%d", a[0], a[1]); }
-  debugPrintf("\n");
-  if (configs && config_size > 0)
-    configs[0] = (EGLConfig)strdup("config");
-  if (num_config)
-    *num_config = 1;
+  (void)dpy; (void)attrib_list;
+  /* Unity 2018 valida o config por MATCH EXATO de cor (R/G/B/A/LUM) contra o pedido (de
+     PlayerSettings, NAO no attrib_list). Em vez de adivinhar, devolvemos VARIOS configs com
+     formatos comuns; o ponteiro codifica o indice (0xC0F00+i) e GetConfigAttrib devolve a cor
+     daquele formato -> Unity acha o que casa. depth/stencil sao ">=" (24/8 cobrem). */
+  int total = 6;
+  if (num_config) *num_config = total;
+  if (configs && config_size > 0) {
+    int n = config_size < total ? config_size : total;
+    for (int i = 0; i < n; i++) configs[i] = (EGLConfig)(uintptr_t)(0xC0F00 + i);
+    if (num_config) *num_config = n;
+  }
   return EGL_TRUE;
 }
 
@@ -290,19 +294,26 @@ EGLBoolean egl_shim_QuerySurface(EGLDisplay dpy, EGLSurface surface,
 
 EGLBoolean egl_shim_GetConfigAttrib(EGLDisplay dpy, EGLConfig config,
                                      EGLint attribute, EGLint *value) {
-  (void)dpy; (void)config;
+  (void)dpy;
   if (!value) return EGL_TRUE;
-  int _logn=0; { static int n=0; _logn=(n++<80); }
+  int _logn=0; { static int n=0; _logn=(n++<120); }
+  /* cor por-config: o ponteiro codifica o indice (0xC0F00+i). r/g/b/a do formato i. */
+  static const int FMT[6][4] = {
+    {8,8,8,8}, {8,8,8,0}, {5,6,5,0}, {4,4,4,4}, {5,5,5,1}, {8,8,8,0},
+  };
+  int idx = ((uintptr_t)config >= 0xC0F00 && (uintptr_t)config < 0xC0F00+6) ? (int)((uintptr_t)config - 0xC0F00) : 0;
   switch (attribute) {
-  case 0x3020: *value = 8; break;          /* EGL_RED_SIZE */
-  case 0x3021: *value = 8; break;          /* EGL_GREEN_SIZE */
-  case 0x3022: *value = 8; break;          /* EGL_BLUE_SIZE */
-  case 0x3023: *value = 8; break;          /* EGL_ALPHA_SIZE (RGBA8888) */
+  case 0x3020: *value = FMT[idx][0]; break; /* EGL_RED_SIZE */
+  case 0x3021: *value = FMT[idx][1]; break; /* EGL_GREEN_SIZE */
+  case 0x3022: *value = FMT[idx][2]; break; /* EGL_BLUE_SIZE */
+  case 0x3023: *value = FMT[idx][3]; break; /* EGL_ALPHA_SIZE */
   case 0x3025: *value = 24; break;         /* EGL_DEPTH_SIZE */
   case 0x3026: *value = 8; break;          /* EGL_STENCIL_SIZE */
-  case 0x3024: *value = 0; break;          /* EGL_LUMINANCE_SIZE */
+  case 0x3024: *value = 8; break;          /* EGL_LUMINANCE_SIZE -- Unity pede match exato
+                                              (LUM,ALPHA,BLUE,GREEN)=(8,8,8,8); idx0=RGBA8888 +
+                                              este LUM=8 fecha o match -> config aceito */
   case 0x3027: *value = 0x3038; break;     /* EGL_CONFIG_CAVEAT = EGL_NONE */
-  case 0x3028: *value = 1; break;          /* EGL_CONFIG_ID */
+  case 0x3028: *value = idx + 1; break;    /* EGL_CONFIG_ID (unico por config) */
   case 0x3031: *value = 0; break;          /* EGL_SAMPLE_BUFFERS */
   case 0x3032: *value = 0; break;          /* EGL_SAMPLES */
   case 0x3033: *value = 0x0004; break;     /* EGL_SURFACE_TYPE = EGL_WINDOW_BIT */
