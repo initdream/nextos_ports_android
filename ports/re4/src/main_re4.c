@@ -59,6 +59,13 @@ static void *my_dlsym(void *h,const char *nm){ void *p=0;
   /* libmono pega pthread_kill/raise/abort via dlsym(RTLD_DEFAULT), furando o GOT override.
      Devolve nossos hooks aqui tb -> caimos no map_caller (acha quem dispara o raise fatal). */
   if(nm){ if(!strcmp(nm,"pthread_kill"))return (void*)my_ptkill; if(!strcmp(nm,"raise")||!strcmp(nm,"gsignal"))return (void*)my_raise; if(!strcmp(nm,"abort"))return (void*)my_abort; }
+  /* CRITICO: Unity dlopen libGLESv2.so/libEGL + dlsym("eglCreateContext"/etc) em runtime.
+     Sem isso, cai no libEGL REAL do Mali (dep do SDL2) com nosso display FALSO -> a validacao
+     de config (eglCreateContext por config) falha -> "Unable to find a configuration matching
+     minimum spec" -> abort. Devolve os egl_shim_* da nossa tabela p/ TODO nome egl*. */
+  if(nm && nm[0]=='e' && nm[1]=='g' && nm[2]=='l'){
+    for(size_t i=0;i<dynlib_numfunctions;i++) if(!strcmp(dynlib_functions[i].symbol,nm) && dynlib_functions[i].func){
+      fprintf(stderr,"[DLSYM-EGL] %s -> egl_shim\n",nm); return (void*)dynlib_functions[i].func; } }
   if(h==&g_dl_self){ p=(void*)so_find_addr_safe(nm);
     if(!p && g_m_mono){ so_module *cur=so_save(); so_use(g_m_mono); p=(void*)so_find_addr_safe(nm); so_use(cur); free(cur); }
     if(!p) p=dlsym(RTLD_DEFAULT,nm); }
@@ -304,6 +311,11 @@ int main(void){
      visivel p/ dlsym(RTLD_DEFAULT) no re4_resolve. */
   { void *z=dlopen("libz.so.1",RTLD_NOW|RTLD_GLOBAL); if(!z)z=dlopen("libz.so",RTLD_NOW|RTLD_GLOBAL);
     fprintf(stderr,"[LIBZ] dlopen -> %p (inflate=%p)\n",z,dlsym(RTLD_DEFAULT,"inflate")); }
+  /* GL: Unity resolve glClear/glDrawArrays/etc via dlsym(RTLD_DEFAULT) -> sem libGLESv2 no
+     namespace global, viram NULL -> crash ao chamar. dlopen RTLD_GLOBAL torna-as visiveis. */
+  { void *g=dlopen("libGLESv2.so.2",RTLD_NOW|RTLD_GLOBAL); if(!g)g=dlopen("libGLESv2.so",RTLD_NOW|RTLD_GLOBAL);
+    void *e=dlopen("libEGL.so.1",RTLD_NOW|RTLD_GLOBAL); if(!e)e=dlopen("libEGL.so",RTLD_NOW|RTLD_GLOBAL);
+    fprintf(stderr,"[LIBGL] GLESv2=%p EGL=%p (glClear=%p)\n",g,e,dlsym(RTLD_DEFAULT,"glClear")); }
   size_t hs=48*1024*1024;
   void *heap=mmap(NULL,hs,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
   if(heap==MAP_FAILED){perror("mmap");return 1;}

@@ -135,8 +135,10 @@ EGLBoolean egl_shim_Terminate(EGLDisplay dpy) {
 EGLBoolean egl_shim_ChooseConfig(EGLDisplay dpy, const EGLint *attrib_list,
                                   EGLConfig *configs, EGLint config_size,
                                   EGLint *num_config) {
-  (void)dpy; (void)attrib_list;
-  debugPrintf("egl_shim: eglChooseConfig()\n");
+  (void)dpy;
+  debugPrintf("egl_shim: eglChooseConfig() attribs:");
+  if (attrib_list) { for (const EGLint *a = attrib_list; a[0] != 0x3038 /*EGL_NONE*/; a += 2) debugPrintf(" 0x%x=%d", a[0], a[1]); }
+  debugPrintf("\n");
   if (configs && config_size > 0)
     configs[0] = (EGLConfig)strdup("config");
   if (num_config)
@@ -290,15 +292,32 @@ EGLBoolean egl_shim_GetConfigAttrib(EGLDisplay dpy, EGLConfig config,
                                      EGLint attribute, EGLint *value) {
   (void)dpy; (void)config;
   if (!value) return EGL_TRUE;
+  int _logn=0; { static int n=0; _logn=(n++<80); }
   switch (attribute) {
-  case 0x3020: *value = 8; break;
-  case 0x3021: *value = 8; break;
-  case 0x3022: *value = 8; break;
-  case 0x3023: *value = 0; break;
-  case 0x3025: *value = 24; break;
-  case 0x3026: *value = 8; break;
+  case 0x3020: *value = 8; break;          /* EGL_RED_SIZE */
+  case 0x3021: *value = 8; break;          /* EGL_GREEN_SIZE */
+  case 0x3022: *value = 8; break;          /* EGL_BLUE_SIZE */
+  case 0x3023: *value = 8; break;          /* EGL_ALPHA_SIZE (RGBA8888) */
+  case 0x3025: *value = 24; break;         /* EGL_DEPTH_SIZE */
+  case 0x3026: *value = 8; break;          /* EGL_STENCIL_SIZE */
+  case 0x3024: *value = 0; break;          /* EGL_LUMINANCE_SIZE */
+  case 0x3027: *value = 0x3038; break;     /* EGL_CONFIG_CAVEAT = EGL_NONE */
+  case 0x3028: *value = 1; break;          /* EGL_CONFIG_ID */
+  case 0x3031: *value = 0; break;          /* EGL_SAMPLE_BUFFERS */
+  case 0x3032: *value = 0; break;          /* EGL_SAMPLES */
+  case 0x3033: *value = 0x0004; break;     /* EGL_SURFACE_TYPE = EGL_WINDOW_BIT */
+  case 0x3040: *value = 0x0044; break;     /* EGL_RENDERABLE_TYPE = ES2|ES3 (Unity 2018 valida ES3
+                                              primeiro; anunciar ambos passa a validacao -- o
+                                              eglCreateContext sempre cria contexto ES2 no Mali) */
+  case 0x3042: *value = 1; break;          /* EGL_BIND_TO_TEXTURE_RGB */
+  case 0x3039: *value = 0x0044; break;     /* EGL_CONFORMANT = ES2|ES3 */
+  case 0x302E: *value = 0; break;          /* EGL_NATIVE_VISUAL_ID */
+  case 0x3034: *value = 0; break;          /* EGL_TRANSPARENT_TYPE = EGL_NONE */
+  case 0x30e2: *value = 0x30e3; break;     /* Unity 2018 config-match: aceita se 0x30e2==0x30e3 */
+  case 0x30e1: *value = 0; break;
   default: *value = 0; break;
   }
+  if(_logn) debugPrintf("egl_shim: GetConfigAttrib(0x%x) = %d\n", attribute, *value);
   return EGL_TRUE;
 }
 

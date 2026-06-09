@@ -265,8 +265,31 @@ void jni_run(void) {
       if (ph == 0) { g_onkey(fake_env, fake_thiz, 108, 1); g_onkey(fake_env, fake_thiz, 96, 1); }
       else if (ph == 4) { g_onkey(fake_env, fake_thiz, 108, 0); g_onkey(fake_env, fake_thiz, 96, 0); }
     }
+    /* SONIC_AUTONEW: auto-navega o menu (aperta A) p/ testar o fluxo de jogo novo
+     * Mania Mode->save->personagem->iniciar, sem precisar do controle do o autor. */
+    if (g_onkey && getenv("SONIC_AUTONEW") && s_folder && memcmp((char*)s_folder,"Menu",5)==0) {
+      static long mf=0; mf++;
+      long ph=mf%150;
+      if (ph==0 && mf<1200) { g_onkey(fake_env,fake_thiz,96,1); fprintf(stderr,"[autonew] A press (mf=%ld)\n",mf); }
+      else if (ph==6) g_onkey(fake_env,fake_thiz,96,0);
+    }
 
     { static uintptr_t sa2=0; if(!sa2) sa2=so_find_addr_safe("_ZN4RSDK5Audio15deviceAvailableE"); if(sa2)*(int*)sa2=1; }
+    /* ---- FIX SAVE (cloud): no build Netflix, salvar usa JniWrapper::CloudSave que
+     * registra um callback (id no contador 0x4a7088) e chama um método Java que NÃO
+     * existe no port -> o callback nunca é entregue -> SaveGame_SaveFile (write) trava
+     * o "novo jogo". Entregamos os callbacks void pendentes via CallCallback(id,...)
+     * (a fila é drenada por ExecuteCallbacks no loop do engine) -> o save "completa"
+     * e o fluxo segue p/ a cutscene+fase. ids de data-callback (CloudLoad) são no-op
+     * no mapa void (seguros). ---- */
+    { uintptr_t tb2=(uintptr_t)g_copyslot-0x17d9bc;
+      long cur=*(long*)(tb2+0x4a7088); static long flushed=0;
+      if (cur>flushed) {
+        static uintptr_t ccb=0; if(!ccb) ccb=so_find_addr_safe("Java_com_netflix_NGP_SonicMania_MainActivity_CallCallback");
+        if (ccb) while (flushed<cur) { ((void(*)(void*,void*,long,long,long,long))ccb)(fake_env,fake_thiz,flushed,0,0,0); flushed++; }
+        else flushed=cur;
+      }
+    }
     /* ---- FIX (ANTES do step): título trava em WaitForConflictState (espera um
      * cloud-save conflict que nunca chega no port offline). Força o estado p/
      * PressButton ANTES do step p/ que PressButton esteja ativo quando o EDGE do
@@ -337,6 +360,16 @@ void jni_run(void) {
           gp?*(int*)(gp+0x100a0):-1, gp?*(int*)(gp+0x414bc):-1);
       }
     }
+    /* ---- REDIRECT da cutscene de abertura: começar jogo novo no menu chama
+     * SetScene("Cutscenes","Angel Island Zone")=#122 que trava (cutscene não roda
+     * no port). Reescreve p/ Green Hill Zone 1 (#14, cat 'Mania Mode'=1) -> cai
+     * direto na fase. (#123=AIZ Encore tb). Mantém o playerID escolhido no menu. ---- */
+    if (getenv("SONIC_SKIPCUT")) { uintptr_t tb=(uintptr_t)g_copyslot-0x17d9bc; uintptr_t si=*(uintptr_t*)(tb+0x4a7098);
+      if (si) { unsigned short lp=*(unsigned short*)(si+36); char *fo=s_folder?(char*)s_folder:"";
+        if (lp==122 || lp==123 || strcmp(fo,"AIZ")==0) {
+          *(unsigned char*)(si+64)=1; *(unsigned short*)(si+36)=14; *(unsigned char*)(si+66)=0; /* state=LOAD */
+          uintptr_t gp=*(uintptr_t*)(tb+0x4a76d8); if(gp){ *(int*)(gp+0)=0; if(*(int*)(gp+4)==0)*(int*)(gp+4)=1; }
+          static int once=0; if(!once){once=1;fprintf(stderr,"[redir] Angel Island cutscene -> Green Hill Zone 1 (reload)\n");} } } }
     /* ---- LOAD DIRETO de uma fase (pula o menu mobile). SONIC_ZONE=14 (GHZ1).
      * globals: gameMode(+0)=0 Mania, playerID(+4)=1 Sonic. sceneInfo: activeCategory(+64),
      * listPos(+36), state(+66)=0 ENGINESTATE_LOAD. ---- */
@@ -368,8 +401,8 @@ void jni_run(void) {
           (unsigned long)si,(unsigned long)ld,catc,*(unsigned char*)(si+64),*(unsigned short*)(si+36));
         /* stride do SceneListEntry: hash16+name32+folder16+id8+filter1 -> tenta 76 e 80 */
         int stride=72; uintptr_t e=ld;
-        for (int i=0;i<80;i++){ char*nm=(char*)(e+16); char*fo=(char*)(e+48); char*id=(char*)(e+64);
-          if(nm[0]<32||nm[0]>126) break;
+        for (int i=0;i<140;i++){ char*nm=(char*)(e+16); char*fo=(char*)(e+48); char*id=(char*)(e+64);
+          if(nm[0]<32||nm[0]>126){e+=stride;continue;}
           fprintf(stderr,"[scn] #%d name='%.20s' folder='%.12s' id='%.6s'\n",i,nm,fo,id); e+=stride; }
         /* categorias */
         uintptr_t lc=*(uintptr_t*)(si+16);
