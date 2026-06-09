@@ -14,12 +14,23 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/syscall.h>
 #include "so_util.h"
 #include "imports.h"
 #include "jni_shim.h"
+/* RAIZ do "invalid CIL": glibc fstatat64 preenche struct stat64 layout GLIBC, mas Unity
+   (bionic) le st_size no offset BIONIC -> tamanho errado (32KB) -> le so 32KB do .dll.
+   Fix: syscall CRU -> o kernel preenche o layout stat64 do kernel (== bionic). */
+static int my_fstatat64(int dfd,const char*p,void*b,int fl){ return (int)syscall(__NR_fstatat64,dfd,p,b,fl); }
+static int my_fstat64(int fd,void*b){ return (int)syscall(__NR_fstat64,fd,b); }
+static int my_stat64(const char*p,void*b){ return (int)syscall(__NR_stat64,p,b); }
+static int my_lstat64(const char*p,void*b){ return (int)syscall(__NR_lstat64,p,b); }
 static uintptr_t g_mono_base=0, g_unity_base=0;
 static void getmem_trace(const char*tag);
-static long my_read(int fd,void*b,unsigned long n){ long r=read(fd,b,n); if(n>50000){ static int rn=0; if(rn++<20)fprintf(stderr,"[READ] fd=%d req=%lu -> %ld\n",fd,n,r); } return r; }
+static long my_read(int fd,void*b,unsigned long n){ long r=read(fd,b,n);
+  if(n==32768||n>50000){ static int rn=0; if(rn++<24){ void*ra=__builtin_return_address(0); uintptr_t a=(uintptr_t)ra; const char*m="?"; uintptr_t o=a;
+    if(g_mono_base&&a>=g_mono_base&&a<g_mono_base+0x600000){m="libmono";o=a-g_mono_base;} else if(g_unity_base&&a>=g_unity_base&&a<g_unity_base+0x2000000){m="libunity";o=a-g_unity_base;}
+    fprintf(stderr,"[READ] fd=%d req=%lu -> %ld caller=%s+0x%lx\n",fd,n,r,m,(unsigned long)o); } } return r; }
 static long my_write(int fd,const void*b,unsigned long n){ if(fd==2&&b&&n>0&&n<200){ static int wn=0; if(wn++<200){ char t[208]; unsigned k=n<200?n:199; memcpy(t,b,k); t[k]=0; for(unsigned i=0;i<k;i++) if(t[i]=='\n')t[i]=' '; fprintf(stderr,"[W] %s\n",t); } } return write(fd,b,n); }
 /* BRIDGE stdio bionic: __sF[3] (stdin/out/err) do bionic tem layout != glibc. Forneco um
    array marcador + intercepto fprintf/fputs/etc pra mapear &__sF[i] -> stream real do glibc.
@@ -232,6 +243,13 @@ int main(void){
   re4_set_import("open",(void*)my_open);
   re4_set_import("write",(void*)my_write);
   re4_set_import("read",(void*)my_read);
+  re4_set_import("fstatat64",(void*)my_fstatat64);
+  re4_set_import("newfstatat",(void*)my_fstatat64);
+  re4_set_import("fstat64",(void*)my_fstat64);
+  re4_set_import("fstat",(void*)my_fstat64);
+  re4_set_import("stat64",(void*)my_stat64);
+  re4_set_import("stat",(void*)my_stat64);
+  re4_set_import("lstat64",(void*)my_lstat64);
   re4_set_import("raise",(void*)my_raise);
   re4_set_import("pthread_kill",(void*)my_ptkill);
   re4_set_import("sigaction",(void*)my_sigaction);
@@ -255,7 +273,7 @@ int main(void){
   so_resolve(dynlib_functions,dynlib_numfunctions,0); so_finalize();
   so_execute_init_array();
   fprintf(stderr,"[A] engine init OK (372 ctors)\n");
-  g_m_unity=so_save();
+  g_unity_base=(uintptr_t)text_virtbase; g_m_unity=so_save();
   { size_t msz=24*1024*1024; void *mh=mmap(NULL,msz,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
     if(mh!=MAP_FAILED && so_load("libmono.so",mh,msz)>=0){ so_relocate(); so_resolve(dynlib_functions,dynlib_numfunctions,0);
       { uintptr_t a; a=so_find_addr_safe("mono_exception_from_name_msg"); if(a)hook_arm64(a,(uintptr_t)hook_exc_msg);
