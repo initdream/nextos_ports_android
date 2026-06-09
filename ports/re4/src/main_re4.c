@@ -53,8 +53,12 @@ static void *my_dlopen(const char *nm,int flag){
     fprintf(stderr,"[DLOPEN] \"%s\" -> SELF\n",nm?nm:"(null)"); return &g_dl_self; }
   void *h=dlopen(nm,flag); fprintf(stderr,"[DLOPEN] \"%s\" -> %p\n",nm,h); return h?h:&g_dl_self; }
 static int noop_ret0(void){ return 0; }
+static int my_raise(int sig); static void my_abort(void); static int my_ptkill(unsigned long t,int sig);
 static void *my_dlsym(void *h,const char *nm){ void *p=0;
   fprintf(stderr,"[DLSYM?] %s\n",nm?nm:"?"); fflush(stderr);
+  /* libmono pega pthread_kill/raise/abort via dlsym(RTLD_DEFAULT), furando o GOT override.
+     Devolve nossos hooks aqui tb -> caimos no map_caller (acha quem dispara o raise fatal). */
+  if(nm){ if(!strcmp(nm,"pthread_kill"))return (void*)my_ptkill; if(!strcmp(nm,"raise")||!strcmp(nm,"gsignal"))return (void*)my_raise; if(!strcmp(nm,"abort"))return (void*)my_abort; }
   if(h==&g_dl_self){ p=(void*)so_find_addr_safe(nm);
     if(!p && g_m_mono){ so_module *cur=so_save(); so_use(g_m_mono); p=(void*)so_find_addr_safe(nm); so_use(cur); free(cur); }
     if(!p) p=dlsym(RTLD_DEFAULT,nm); }
@@ -192,10 +196,22 @@ static int my_sigaction(int sig,const void*act,void*old){
   g.sa_sigaction=(void(*)(int,siginfo_t*,void*))h; sigemptyset(&g.sa_mask); g.sa_flags=SA_SIGINFO|SA_RESTART;
   static int sn=0; if(sn++<12) fprintf(stderr,"[SIGACT] sig=%d handler=%p (struct bionic->glibc)\n",sig,h);
   int rr=sigaction(sig,&g,NULL); return rr<0?0:rr; }
-/* intercepta abort/raise/pthread_kill: loga o caller (engine) + NAO mata -> vejo o pos-fatal */
-static int my_raise(int sig){ fprintf(stderr,"[RAISE] sig=%d caller=unity+0x%lx -> IGNORADO\n",sig,(unsigned long)__builtin_return_address(0)-(unsigned long)text_virtbase); return 0; }
-static void my_abort(void){ fprintf(stderr,"[ABORT] caller=unity+0x%lx -> IGNORADO\n",(unsigned long)__builtin_return_address(0)-(unsigned long)text_virtbase); }
-static int my_ptkill(unsigned long t,int sig){ (void)t; fprintf(stderr,"[PTKILL] sig=%d caller=unity+0x%lx -> IGNORADO\n",sig,(unsigned long)__builtin_return_address(0)-(unsigned long)text_virtbase); return 0; }
+/* mapeia um endereco de retorno -> "libmono+0x.." ou "unity+0x.." pra identificar o caller */
+static void map_caller(const char*tag,unsigned long ra){
+  unsigned long ub=(unsigned long)text_virtbase;
+  if(g_mono_base && ra>=g_mono_base && ra<g_mono_base+0x600000) fprintf(stderr,"%s caller=libmono+0x%lx\n",tag,ra-g_mono_base);
+  else if(ra>=ub && ra<ub+0x2000000) fprintf(stderr,"%s caller=unity+0x%lx\n",tag,ra-ub);
+  else fprintf(stderr,"%s caller=0x%lx (?)\n",tag,ra);
+  fflush(stderr);
+}
+/* intercepta abort/raise/pthread_kill/gsignal: loga o caller + (gated) NAO mata -> vejo o pos-fatal.
+   RE4_SUPPRESS_RAISE=1 -> ignora o sinal (testa se o "fatal" e' obrigatorio ou se da pra seguir). */
+static int my_raise(int sig){ map_caller("[RAISE]",(unsigned long)__builtin_return_address(0)); fprintf(stderr,"[RAISE] sig=%d\n",sig);
+  if(getenv("RE4_SUPPRESS_RAISE")) return 0; return raise(sig); }
+static void my_abort(void){ map_caller("[ABORT]",(unsigned long)__builtin_return_address(0));
+  if(getenv("RE4_SUPPRESS_RAISE")) return; abort(); }
+static int my_ptkill(unsigned long t,int sig){ (void)t; map_caller("[PTKILL]",(unsigned long)__builtin_return_address(0)); fprintf(stderr,"[PTKILL] sig=%d\n",sig);
+  if(getenv("RE4_SUPPRESS_RAISE")) return 0; return pthread_kill((pthread_t)t,sig); }
 extern void *text_virtbase;
 static void on_segv(int sig, siginfo_t *si, void *uc_){
   ucontext_t *uc=(ucontext_t*)uc_;
@@ -301,7 +317,11 @@ int main(void){
             if(t3!=MAP_FAILED){ memcpy(t3,(void*)jv,8); *(uint32_t*)(t3+8)=0xe51ff004u; *(uint32_t*)(t3+12)=(uint32_t)(jv+8);
               __builtin___clear_cache((char*)t3,(char*)t3+16); g_orig_jitinitver=(void*(*)(const char*,const char*))t3;
               hook_arm64(jv,(uintptr_t)my_jit_init_version); fprintf(stderr,"[HOOK] jit_init_version @0xbd5d0\n"); } }
-          hook_arm64(base+0x2bcfdc,(uintptr_t)my_assert_handler); fprintf(stderr,"[HOOK] assert handler @0x2bcfdc (g_log fatal, nao-fatal)\n"); }
+          /* 0x2bcfdc NAO e assert: e o INSTALADOR do print/log handler (instala a func 0x13dec0
+             -> mono_trace). Hookar com no-op DEIXAVA o global do handler NULL -> o runtime
+             chamava o handler NULL = o "NULL-call no init" (pc=0). REMOVIDO: deixa instalar. */
+          if(getenv("RE4_HOOKASSERT")){ hook_arm64(base+0x2bcfdc,(uintptr_t)my_assert_handler); fprintf(stderr,"[HOOK] assert handler @0x2bcfdc (LEGADO/gated)\n"); }
+          else fprintf(stderr,"[NOHOOK] 0x2bcfdc deixado intacto (instalador de print-handler)\n"); }
         so_flush_caches(); }
       so_finalize(); so_execute_init_array(); g_m_mono=so_save(); fprintf(stderr,"[MONO] libmono carregado+init OK\n"); }
     else fprintf(stderr,"[MONO] FALHOU carregar libmono\n"); }
