@@ -19,7 +19,7 @@
 #include "jni_shim.h"
 static uintptr_t g_mono_base=0, g_unity_base=0;
 static void getmem_trace(const char*tag);
-static long my_write(int fd,const void*b,unsigned long n){ if(b&&n>=7&&memmem(b,n,"GET_MEM",7))getmem_trace("write"); return write(fd,b,n); }
+static long my_write(int fd,const void*b,unsigned long n){ if(fd==2&&b&&n>0&&n<200){ static int wn=0; if(wn++<200){ char t[208]; unsigned k=n<200?n:199; memcpy(t,b,k); t[k]=0; for(unsigned i=0;i<k;i++) if(t[i]=='\n')t[i]=' '; fprintf(stderr,"[W] %s\n",t); } } return write(fd,b,n); }
 /* BRIDGE stdio bionic: __sF[3] (stdin/out/err) do bionic tem layout != glibc. Forneco um
    array marcador + intercepto fprintf/fputs/etc pra mapear &__sF[i] -> stream real do glibc.
    Assim o LOG de erro da Unity (que vai pro stderr bionic) aparece. */
@@ -99,9 +99,12 @@ static void* my_jit_tls_getter(void){
    Se GC_page_size==0 -> qualquer bytes aborta. Hook+trampolim: arredonda bytes p/ 4096. */
 static void* (*g_orig_getmem)(unsigned)=0;
 static void* my_getmem(unsigned bytes){
-  static int gn=0; unsigned orig=bytes; bytes=(bytes+4095u)&~4095u;
-  if(gn++<12){ fprintf(stderr,"[GETMEM] bytes=%u->%u (orig&0xfff=%u)\n",orig,bytes,orig&0xfff); fflush(stderr); }
-  return g_orig_getmem?g_orig_getmem(bytes):0;
+  /* BYPASS: se GC_page_size==0, o check do original (bytes&(page-1)) sempre aborta.
+     Aloco eu mesmo (mmap page-aligned, zerado) = o que o GET_MEM do Boehm deve devolver. */
+  static int gn=0; unsigned orig=bytes; bytes=(bytes+4095u)&~4095u; if(!bytes)bytes=4096;
+  void *p=mmap(0,bytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0); if(p==MAP_FAILED)p=0;
+  if(gn++<12){ fprintf(stderr,"[GETMEM] bytes=%u->%u -> %p (bypass mmap)\n",orig,bytes,p); fflush(stderr); }
+  (void)g_orig_getmem; return p;
 }
 /* handler de assert do Mono (libmono+0x2bcf90): r0=arquivo r1=linha. Loga e NAO aborta. */
 static void my_assert_handler(const char* file, int line, const char* a, const char* b){ (void)a;(void)b;
