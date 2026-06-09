@@ -362,7 +362,10 @@ int main(void){
   /* DIAG: a UnityMain trava em WaitForJobGroup (libunity+0x3268e0) no 1o nativeRender -- os jobs
      nunca completam (sem workers / inline-exec callback NULL). Hook p/ retornar imediato e ver
      se a engine progride (jobs nao-criticos) ou crasha (criticos). Gated. */
-  if(getenv("RE4_SKIPJOBWAIT")){ hook_arm64(g_unity_base+0x3268e0,(uintptr_t)jobwait_stub); fprintf(stderr,"[HOOK] WaitForJobGroup @unity+0x3268e0 -> return 0\n"); }
+  if(getenv("RE4_SKIPJOBWAIT")){ uintptr_t ha=g_unity_base+0x3268e0;
+    /* libunity ja foi finalizada (text r-x) -> precisa mprotect RWX antes de escrever o hook */
+    uintptr_t pg=ha&~0xfffUL; mprotect((void*)pg,0x2000,PROT_READ|PROT_WRITE|PROT_EXEC);
+    hook_arm64(ha,(uintptr_t)jobwait_stub); so_flush_caches(); fprintf(stderr,"[HOOK] WaitForJobGroup @unity+0x3268e0 -> return 0\n"); }
   { size_t msz=24*1024*1024; void *mh=mmap(NULL,msz,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
     if(mh!=MAP_FAILED && so_load("libmono.so",mh,msz)>=0){ so_relocate(); so_resolve(dynlib_functions,dynlib_numfunctions,0);
       { uintptr_t a;

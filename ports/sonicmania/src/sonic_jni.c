@@ -258,9 +258,9 @@ void jni_run(void) {
         fprintf(stderr, "[ev] JOYAXIS %d=%d\n", ev.jaxis.axis, ev.jaxis.value);
       } else if (ev.type == SDL_CONTROLLERDEVICEADDED) SDL_GameControllerOpen(ev.cdevice.which);
     }
-    /* auto-aperto START/A SÓ na Title (p/ avançar a tela-título). Na Menu PARA,
-     * senão o A repetido fica disparando transições e o swirl não assenta. */
-    if (g_onkey && !(s_folder && memcmp((char*)s_folder,"Menu",5)==0)) {
+    /* auto-aperto START/A SÓ na Title (p/ avançar a tela-título). Em QUALQUER
+     * outra cena PARA (na Menu disparava transições; na gameplay START=pausa!). */
+    if (g_onkey && s_folder && memcmp((char*)s_folder,"Title",6)==0) {
       long ph = f % 60;
       if (ph == 0) { g_onkey(fake_env, fake_thiz, 108, 1); g_onkey(fake_env, fake_thiz, 96, 1); }
       else if (ph == 4) { g_onkey(fake_env, fake_thiz, 108, 0); g_onkey(fake_env, fake_thiz, 96, 0); }
@@ -354,8 +354,9 @@ void jni_run(void) {
         }
       }
     }
-    /* auto-RIGHT na gameplay (folder GHZ/CPZ/etc) p/ Sonic andar pra frente */
-    if (g_onkey && s_folder) { char *fo=(char*)s_folder;
+    /* auto-RIGHT na gameplay SÓ em modo demo (SONIC_ZONE set). No fluxo normal o
+     * jogador controla tudo. */
+    if (g_onkey && getenv("SONIC_ZONE") && s_folder) { char *fo=(char*)s_folder;
       int gameplay = strcmp(fo,"Logos")&&strcmp(fo,"Title")&&strcmp(fo,"Menu")&&fo[0]>='A'&&fo[0]<='Z';
       if (gameplay) { static int held=0; if(!held){held=1; g_onkey(fake_env,fake_thiz,22,1); fprintf(stderr,"[play] segurando RIGHT (folder=%s)\n",fo);} }
     }

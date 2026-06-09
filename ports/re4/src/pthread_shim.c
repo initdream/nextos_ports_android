@@ -88,11 +88,19 @@ static int sh_cond_destroy(void *c) { (void)c; return 0; }
 
 /* ---- semaforo (job system do Unity: bionic sem_t=4B vs glibc=32B) ---- */
 static int sh_sem_init(void *s, int pshared, unsigned val) {
-  (void)pshared; (void)pmap_get(s, K_SEM, val); return 0;
+  (void)pshared; (void)pmap_get(s, K_SEM, val);
+  if(getenv("RE4_SEMLOG")){static int n=0;if(n++<60)fprintf(stderr,"[SEM] init  b=%p val=%u tid=%p\n",s,val,(void*)pthread_self());}
+  return 0;
 }
-static int sh_sem_wait(void *s) { return sem_wait((sem_t *)pmap_get(s, K_SEM, 0)); }
+static int sh_sem_wait(void *s) {
+  if(getenv("RE4_SEMLOG")){static int n=0;if(n++<400)fprintf(stderr,"[SEM] wait> b=%p tid=%p\n",s,(void*)pthread_self());}
+  int r=sem_wait((sem_t *)pmap_get(s, K_SEM, 0));
+  if(getenv("RE4_SEMLOG")){static int n=0;if(n++<400)fprintf(stderr,"[SEM] <wake b=%p tid=%p\n",s,(void*)pthread_self());}
+  return r; }
 static int sh_sem_trywait(void *s) { return sem_trywait((sem_t *)pmap_get(s, K_SEM, 0)); }
-static int sh_sem_post(void *s) { return sem_post((sem_t *)pmap_get(s, K_SEM, 0)); }
+static int sh_sem_post(void *s) {
+  if(getenv("RE4_SEMLOG")){static int n=0;if(n++<400)fprintf(stderr,"[SEM] post  b=%p tid=%p\n",s,(void*)pthread_self());}
+  return sem_post((sem_t *)pmap_get(s, K_SEM, 0)); }
 static int sh_sem_timedwait(void *s, const void *ts) {
   return sem_timedwait((sem_t *)pmap_get(s, K_SEM, 0), (const struct timespec *)ts);
 }
