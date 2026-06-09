@@ -2,6 +2,7 @@
  * A tabela imports.gen.c aponta glX -> my_glX; my_glX loga + chama o GL real. */
 #include <GLES2/gl2.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 static int nd, nf, np, ns, nc;
 
@@ -42,7 +43,8 @@ void my_glClear(GLbitfield m) {
 
 void my_glGenTextures(GLsizei n, GLuint *t) { fprintf(stderr, "[GL] GenTextures n=%d\n", n); glGenTextures(n, t); }
 void my_glBindTexture(GLenum tg, GLuint tex) { static int c; if (c++ < 10) fprintf(stderr, "[GL] BindTexture %u\n", tex); glBindTexture(tg, tex); }
-void my_glTexImage2D(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h, GLint b, GLenum f, GLenum ty, const void *p) { fprintf(stderr, "[GL] TexImage2D %dx%d ifmt=0x%x f=0x%x\n", w, h, ifmt, f); glTexImage2D(tg, l, ifmt, w, h, b, f, ty, p); }
+static const void *rb_swap_rgba(const void *p, GLsizei w, GLsizei h);
+void my_glTexImage2D(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h, GLint b, GLenum f, GLenum ty, const void *p) { fprintf(stderr, "[GL] TexImage2D %dx%d ifmt=0x%x f=0x%x\n", w, h, ifmt, f); if (f==0x1908 && p) p = rb_swap_rgba(p, w, h); glTexImage2D(tg, l, ifmt, w, h, b, f, ty, p); }
 void my_glGenFramebuffers(GLsizei n, GLuint *fb) { fprintf(stderr, "[GL] GenFramebuffers n=%d\n", n); glGenFramebuffers(n, fb); }
 void my_glGenBuffers(GLsizei n, GLuint *b) { fprintf(stderr, "[GL] GenBuffers n=%d\n", n); glGenBuffers(n, b); }
 
@@ -50,13 +52,23 @@ unsigned my_glCreateShader(GLenum t) { unsigned s = glCreateShader(t); fprintf(s
 void my_glActiveTexture(GLenum t) { static int c; if (c++ < 4) fprintf(stderr, "[GL] ActiveTexture 0x%x\n", t); glActiveTexture(t); }
 void my_glBufferData(GLenum tg, GLsizeiptr sz, const void *d, GLenum u) { fprintf(stderr, "[GL] BufferData sz=%ld\n", (long)sz); glBufferData(tg, sz, d, u); }
 
+/* swap R<->B numa imagem RGBA (corrige logo Netflix/vídeos: o decode entrega BGRA
+ * mas sobe como GL_RGBA -> N vermelho vira azul). Só RGBA (imageTexture/vídeo);
+ * a tela do jogo é RGB (não entra aqui). Gate: SONIC_NORBSWAP desliga. */
+static const void *rb_swap_rgba(const void *p, GLsizei w, GLsizei h) {
+  static int chk=-1; if (chk<0) chk = getenv("SONIC_NORBSWAP")?0:1;
+  if (!chk || !p) return p;
+  long n=(long)w*h; if (n<=0 || n>1024*512) return p;
+  static unsigned char *sw=NULL; if(!sw) sw=(unsigned char*)malloc(1024*512*4);
+  if(!sw) return p;
+  const unsigned char *s=(const unsigned char*)p;
+  for (long i=0;i<n;i++){ sw[i*4]=s[i*4+2]; sw[i*4+1]=s[i*4+1]; sw[i*4+2]=s[i*4]; sw[i*4+3]=s[i*4+3]; }
+  return sw;
+}
 void my_glTexSubImage2D(GLenum tg, GLint l, GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLenum ty, const void *p) {
   static int c=0;
-  if (c++<3 && p) {
-    const unsigned char *b=p; long nz=0,n=(long)w*h*4;
-    for (long i=0;i<n;i++) if (b[i]>10) nz++;
-    fprintf(stderr, "[GL] TexSubImage2D %dx%d fmt=0x%x  NAO-PRETO=%ld/%ld\n", w,h,f, nz, n);
-  }
+  if (c++<3 && p) fprintf(stderr, "[GL] TexSubImage2D %dx%d fmt=0x%x\n", w,h,f);
+  if (f==0x1908) p = rb_swap_rgba(p, w, h); /* GL_RGBA */
   glTexSubImage2D(tg,l,x,y,w,h,f,ty,p);
 }
 

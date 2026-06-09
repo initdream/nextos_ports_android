@@ -53,12 +53,47 @@ static void *my_dlopen(const char *nm,int flag){
     fprintf(stderr,"[DLOPEN] \"%s\" -> SELF\n",nm?nm:"(null)"); return &g_dl_self; }
   void *h=dlopen(nm,flag); fprintf(stderr,"[DLOPEN] \"%s\" -> %p\n",nm,h); return h?h:&g_dl_self; }
 static int noop_ret0(void){ return 0; }
+/* DIAG GL: versao/GLSL + se os shaders sao ES3 (#version 300 es) e compilam (Mali=ES2) */
+static const unsigned char* (*r_glGetString)(unsigned);
+static void (*r_glShaderSource)(unsigned,int,const char*const*,const int*);
+static void (*r_glCompileShader)(unsigned);
+static void (*r_glGetShaderiv)(unsigned,unsigned,int*);
+static void (*r_glGetShaderInfoLog)(unsigned,int,int*,char*);
+/* CACHE de glGetString: o preprocessador de shader do Unity chama glGetString(RENDERER/EXTENSIONS)
+   numa WORKER thread que pode NAO ter contexto GL current -> real retorna NULL -> o parse char-a-char
+   de NULL crasha. Cacheamos os valores (de quando havia contexto) e devolvemos no lugar de NULL. */
+static const unsigned char* g_glstr_cache[5]={0,0,0,0,0}; /* VENDOR,RENDERER,VERSION,EXT,GLSL */
+static int glstr_idx(unsigned n){ switch(n){case 0x1F00:return 0;case 0x1F01:return 1;case 0x1F02:return 2;case 0x1F03:return 3;case 0x8B8C:return 4;} return -1; }
+static const unsigned char* my_glGetString(unsigned n){
+  if(!r_glGetString) r_glGetString=dlsym(RTLD_DEFAULT,"glGetString");
+  const unsigned char* s=r_glGetString?r_glGetString(n):0;
+  int i=glstr_idx(n);
+  if(s){ if(i>=0 && !g_glstr_cache[i]) g_glstr_cache[i]=(const unsigned char*)strdup((const char*)s); }
+  else if(i>=0 && g_glstr_cache[i]){ s=g_glstr_cache[i]; static int w=0; if(w++<8)fprintf(stderr,"[GLSTR] 0x%x NULL->cache %s\n",n,(const char*)s); }
+  else if(i>=0){ /* sem cache ainda: devolve default sano (nunca NULL p/ o parser) */
+    s=(const unsigned char*)(n==0x1F00?"ARM":n==0x1F01?"Mali-450 MP":n==0x1F02?"OpenGL ES 2.0":n==0x8B8C?"OpenGL ES GLSL ES 1.00":""); }
+  if(getenv("RE4_GLDIAG") && (n==0x1F00||n==0x1F01||n==0x1F02||n==0x8B8C)) fprintf(stderr,"[GLSTR] 0x%x = %s\n",n,s?(const char*)s:"(null)");
+  return s; }
+static void my_glShaderSource(unsigned sh,int c,const char*const*str,const int*len){
+  if(!r_glShaderSource) r_glShaderSource=dlsym(RTLD_DEFAULT,"glShaderSource");
+  if(str&&c>0&&str[0]){ char b[90]; int k=0; for(;k<89&&str[0][k]&&str[0][k]!='\n';k++)b[k]=str[0][k]; b[k]=0;
+    static int n=0; if(n++<12)fprintf(stderr,"[SHADER src#%d] %s\n",n,b); }
+  if(r_glShaderSource) r_glShaderSource(sh,c,str,len); }
+static void my_glCompileShader(unsigned sh){
+  if(!r_glCompileShader){ r_glCompileShader=dlsym(RTLD_DEFAULT,"glCompileShader"); r_glGetShaderiv=dlsym(RTLD_DEFAULT,"glGetShaderiv"); r_glGetShaderInfoLog=dlsym(RTLD_DEFAULT,"glGetShaderInfoLog"); }
+  if(r_glCompileShader) r_glCompileShader(sh);
+  if(r_glGetShaderiv){ int ok=0; r_glGetShaderiv(sh,0x8B81,&ok);
+    static int n=0; if(!ok && n++<8){ char lg[300]; lg[0]=0; if(r_glGetShaderInfoLog)r_glGetShaderInfoLog(sh,299,0,lg); fprintf(stderr,"[SHADER FAIL] %s\n",lg); } } }
 static int my_raise(int sig); static void my_abort(void); static int my_ptkill(unsigned long t,int sig);
 static void *my_dlsym(void *h,const char *nm){ void *p=0;
   fprintf(stderr,"[DLSYM?] %s\n",nm?nm:"?"); fflush(stderr);
   /* libmono pega pthread_kill/raise/abort via dlsym(RTLD_DEFAULT), furando o GOT override.
      Devolve nossos hooks aqui tb -> caimos no map_caller (acha quem dispara o raise fatal). */
   if(nm){ if(!strcmp(nm,"pthread_kill"))return (void*)my_ptkill; if(!strcmp(nm,"raise")||!strcmp(nm,"gsignal"))return (void*)my_raise; if(!strcmp(nm,"abort"))return (void*)my_abort; }
+  /* glGetString SEMPRE wrapado: cache/fallback evita NULL na worker sem contexto (crash do preproc) */
+  if(nm && !strcmp(nm,"glGetString")) return (void*)my_glGetString;
+  /* DIAG (gated): shader source/compile */
+  if(nm && getenv("RE4_GLDIAG")){ if(!strcmp(nm,"glShaderSource"))return (void*)my_glShaderSource; if(!strcmp(nm,"glCompileShader"))return (void*)my_glCompileShader; }
   /* CRITICO: Unity dlopen libGLESv2.so/libEGL + dlsym("eglCreateContext"/etc) em runtime.
      Sem isso, cai no libEGL REAL do Mali (dep do SDL2) com nosso display FALSO -> a validacao
      de config (eglCreateContext por config) falha -> "Unable to find a configuration matching
