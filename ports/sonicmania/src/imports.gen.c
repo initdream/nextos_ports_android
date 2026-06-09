@@ -129,7 +129,7 @@ DynLibFunction dynlib_functions[] = {
   {"glUniform1i", (uintptr_t)&glUniform1i},  // gles
   {"glUniform2fv", (uintptr_t)&glUniform2fv},  // gles
   {"glUseProgram", (uintptr_t)&my_glUseProgram},  // gles
-  {"glVertexAttribPointer", (uintptr_t)&glVertexAttribPointer},  // gles
+  {"glVertexAttribPointer", (uintptr_t)&my_glVertexAttribPointer},  // gles
   {"glViewport", (uintptr_t)&my_glViewport},  // gles
   {"__gxx_personality_v0", (uintptr_t)&__gxx_personality_v0},  // cxx
   // TODO {"ldexpf", (uintptr_t)&stub_ldexpf},  // <<< IMPLEMENTAR

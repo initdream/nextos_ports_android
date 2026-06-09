@@ -56,4 +56,5 @@ unsigned my_glCreateShader(); void my_glActiveTexture(); void my_glBufferData();
 void my_glTexSubImage2D();
 void my_glShaderSource();
 void my_glUseProgram();
+void my_glVertexAttribPointer();
 #endif
