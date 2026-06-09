@@ -40,6 +40,7 @@ static void *my_dlopen(const char *nm,int flag){
   if(!nm||!nm[0]||strstr(nm,"libc")||strstr(nm,"libunity")||strstr(nm,"libmain")||strstr(nm,"libmono")){
     fprintf(stderr,"[DLOPEN] \"%s\" -> SELF\n",nm?nm:"(null)"); return &g_dl_self; }
   void *h=dlopen(nm,flag); fprintf(stderr,"[DLOPEN] \"%s\" -> %p\n",nm,h); return h?h:&g_dl_self; }
+static int noop_ret0(void){ return 0; }
 static void *my_dlsym(void *h,const char *nm){ void *p=0;
   fprintf(stderr,"[DLSYM?] %s\n",nm?nm:"?"); fflush(stderr);
   if(h==&g_dl_self){ p=(void*)so_find_addr_safe(nm);
@@ -66,7 +67,15 @@ static void hook_exc_name(void *img,const char *ns,const char *name){ (void)img;
 static void *my_mmap(void *a,size_t l,int prot,int flags,int fd,long off){
   if(l>1024UL*1024*1024){ fprintf(stderr,"[MMAP-BIG] %zu valloc=%p GC-caller=%p\n",l,__builtin_return_address(0),__builtin_return_address(1)); }
   void *p=mmap(a,l,prot,flags,fd,off);
-  if((prot&PROT_EXEC)||p==MAP_FAILED){ static int n=0; if(n++<60) fprintf(stderr,"[MMAP] len=%zu prot=0x%x -> %p\n",l,prot,p==MAP_FAILED?(void*)-1:p); } return p; }
+  /* FS exFAT/FAT do /storage/roms NAO suporta mmap de arquivo -> emula: anon RW + pread.
+     Sem isso o Mono nao mapeia os .dll -> "invalid CIL image". */
+  if(p==MAP_FAILED && fd>=0 && l>0){
+    void *q=mmap(0,l,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    if(q!=MAP_FAILED){ ssize_t r=pread(fd,q,l,off);
+      static int e=0; if(e++<8) fprintf(stderr,"[MMAP-FILE-EMU] len=%zu fd=%d off=%ld read=%zd -> %p\n",l,fd,off,r,q);
+      return q; }
+  }
+  if((prot&PROT_EXEC)||p==MAP_FAILED){ static int n=0; if(n++<60) fprintf(stderr,"[MMAP] len=%zu prot=0x%x fd=%d -> %p\n",l,prot,fd,p==MAP_FAILED?(void*)-1:p); } return p; }
 static int my_mprotect(void *a,size_t l,int prot){ int r=mprotect(a,l,prot);
   if(prot&PROT_EXEC){ static int n=0; if(n++<60) fprintf(stderr,"[MPROT-X] %p len=%zu prot=0x%x -> %d(%s)\n",a,l,prot,r,r?strerror(errno):"ok"); } return r; }
 /* sysconf(_SC_PHYS_PAGES)=0 no so-loader -> Mono faz 0-used=negativo=3.8GB. Damos 512MB. */
@@ -105,6 +114,13 @@ static void* my_getmem(unsigned bytes){
   void *p=mmap(0,bytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0); if(p==MAP_FAILED)p=0;
   if(gn++<12){ fprintf(stderr,"[GETMEM] bytes=%u->%u -> %p (bypass mmap)\n",orig,bytes,p); fflush(stderr); }
   (void)g_orig_getmem; return p;
+}
+/* mono_jit_init_version (0xbd5d0): Unity passa versao que o Mono nao reconhece -> default v1.1
+   -> nao le o mscorlib v2.0 ("invalid CIL image"). Forcamos "v2.0.50727". */
+static void* (*g_orig_jitinitver)(const char*,const char*)=0;
+static void* my_jit_init_version(const char* name, const char* ver){
+  fprintf(stderr,"[JITINIT] name=%s ver=%s -> forco v2.0.50727\n", name?name:"?", ver?ver:"NULL"); fflush(stderr);
+  return g_orig_jitinitver?g_orig_jitinitver(name,"v2.0.50727"):0;
 }
 /* handler de assert do Mono (libmono+0x2bcf90): r0=arquivo r1=linha. Loga e NAO aborta. */
 static void my_assert_handler(const char* file, int line, const char* a, const char* b){ (void)a;(void)b;
@@ -251,6 +267,10 @@ int main(void){
             if(t2!=MAP_FAILED){ memcpy(t2,(void*)gm,8); *(uint32_t*)(t2+8)=0xe51ff004u; *(uint32_t*)(t2+12)=(uint32_t)(gm+8);
               __builtin___clear_cache((char*)t2,(char*)t2+16); g_orig_getmem=(void*(*)(unsigned))t2;
               hook_arm64(gm,(uintptr_t)my_getmem); fprintf(stderr,"[HOOK] GET_MEM @0x2bed14\n"); } }
+          { uintptr_t jv=base+0xbd5d0; unsigned char*t3=(unsigned char*)mmap(0,32,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+            if(t3!=MAP_FAILED){ memcpy(t3,(void*)jv,8); *(uint32_t*)(t3+8)=0xe51ff004u; *(uint32_t*)(t3+12)=(uint32_t)(jv+8);
+              __builtin___clear_cache((char*)t3,(char*)t3+16); g_orig_jitinitver=(void*(*)(const char*,const char*))t3;
+              hook_arm64(jv,(uintptr_t)my_jit_init_version); fprintf(stderr,"[HOOK] jit_init_version @0xbd5d0\n"); } }
           hook_arm64(base+0x2bcfdc,(uintptr_t)my_assert_handler); fprintf(stderr,"[HOOK] assert handler @0x2bcfdc (g_log fatal, nao-fatal)\n"); }
         so_flush_caches(); }
       so_finalize(); so_execute_init_array(); g_m_mono=so_save(); fprintf(stderr,"[MONO] libmono carregado+init OK\n"); }
