@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <stdarg.h>
 #include <dlfcn.h>
+#include <pwd.h>
 #include "so_util.h"
 #include "imports.h"
 #include "jni_shim.h"
@@ -26,6 +27,7 @@ static size_t my_fwrite(const void*p,size_t a,size_t b,FILE*fp){ return fwrite(p
 static int my_fputc(int c,FILE*fp){ return fputc(c,sf_map(fp)); }
 static int my_fflush(FILE*fp){ return fflush(fp?sf_map(fp):NULL); }
 /* loga dlopen/dlsym -> ve se a engine tenta carregar libmono (Mono runtime C#) */
+static so_module *g_m_mono=NULL; static so_module *g_m_unity=NULL;
 static char g_dl_self; /* sentinela do handle global/self */
 static void *my_dlopen(const char *nm,int flag){
   if(!nm||!nm[0]||strstr(nm,"libc")||strstr(nm,"libunity")||strstr(nm,"libmain")||strstr(nm,"libmono")){
@@ -33,9 +35,19 @@ static void *my_dlopen(const char *nm,int flag){
   void *h=dlopen(nm,flag); fprintf(stderr,"[DLOPEN] \"%s\" -> %p\n",nm,h); return h?h:&g_dl_self; }
 static void *my_dlsym(void *h,const char *nm){ void *p=0;
   fprintf(stderr,"[DLSYM?] %s\n",nm?nm:"?"); fflush(stderr);
-  if(h==&g_dl_self){ p=(void*)so_find_addr_safe(nm); if(!p) p=dlsym(RTLD_DEFAULT,nm); }
+  if(h==&g_dl_self){ p=(void*)so_find_addr_safe(nm);
+    if(!p && g_m_mono){ so_module *cur=so_save(); so_use(g_m_mono); p=(void*)so_find_addr_safe(nm); so_use(cur); free(cur); }
+    if(!p) p=dlsym(RTLD_DEFAULT,nm); }
   else p=dlsym(h,nm);
   fprintf(stderr,"[DLSYM=] %s -> %p\n",nm?nm:"?",p); return p; }
+/* getpwuid/getpwnam do glibc fazem dlopen de NSS -> crasha no so-loader. Stub fake. */
+static struct passwd g_pw;
+static struct passwd *my_getpwuid(unsigned u){ (void)u; g_pw.pw_name=(char*)"user"; g_pw.pw_passwd=(char*)"";
+  g_pw.pw_uid=0; g_pw.pw_gid=0; g_pw.pw_gecos=(char*)""; g_pw.pw_dir=(char*)"/storage/roms/re4-recon"; g_pw.pw_shell=(char*)"/bin/sh";
+  fprintf(stderr,"[PWUID] stub\n"); return &g_pw; }
+static const char *my_dlerror(void){ return 0; } /* sem erro -> evita _dl_exception_create */
+static int my_dladdr(const void *a,void *info){ (void)a;(void)info; return 0; }
+static int my_dlclose(void *h){ (void)h; return 0; }
 extern void *text_virtbase;
 extern void re4_fill(void);
 extern void recon_wire_pthread(void (*)(const char *, void *));
@@ -123,6 +135,11 @@ int main(void){
   re4_set_import("sigaction",(void*)my_sigaction);
   re4_set_import("dlopen",(void*)my_dlopen);
   re4_set_import("dlsym",(void*)my_dlsym);
+  re4_set_import("getpwuid",(void*)my_getpwuid);
+  re4_set_import("getpwnam",(void*)my_getpwuid);
+  re4_set_import("dlerror",(void*)my_dlerror);
+  re4_set_import("dladdr",(void*)my_dladdr);
+  re4_set_import("dlclose",(void*)my_dlclose);
   re4_set_import("__sF",(void*)g_sf);
   re4_set_import("fprintf",(void*)my_fprintf);
   re4_set_import("vfprintf",(void*)my_vfprintf);
@@ -133,6 +150,11 @@ int main(void){
   so_resolve(dynlib_functions,dynlib_numfunctions,0); so_finalize();
   so_execute_init_array();
   fprintf(stderr,"[A] engine init OK (372 ctors)\n");
+  g_m_unity=so_save();
+  { size_t msz=48*1024*1024; void *mh=mmap(NULL,msz,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    if(mh!=MAP_FAILED && so_load("libmono.so",mh,msz)>=0){ so_relocate(); so_resolve(dynlib_functions,dynlib_numfunctions,0); so_finalize(); so_execute_init_array(); g_m_mono=so_save(); fprintf(stderr,"[MONO] libmono carregado+init OK\n"); }
+    else fprintf(stderr,"[MONO] FALHOU carregar libmono\n"); }
+  so_use(g_m_unity);
   void *vm=NULL,*env=NULL; jni_shim_init(&vm,&env);
   uintptr_t onload=so_find_addr_safe("JNI_OnLoad");
   jint ver=((JNI_OnLoad_t)onload)(vm,NULL);

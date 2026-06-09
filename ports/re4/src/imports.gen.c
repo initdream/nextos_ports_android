@@ -53,7 +53,7 @@ static int cond_timedwait_rel(pthread_cond_t*c,pthread_mutex_t*m,const struct ti
 }
 static long noop(void){ return 0; }
 /* resolve um simbolo: bionic-shim > alias > dlsym > stub */
-static void *re4_resolve(const char *nm){
+void *re4_resolve(const char *nm){
   ctype_build();
   if(!strcmp(nm,"_ctype_")) return &g_ctype[1];
   if(!strcmp(nm,"_tolower_tab_")) return &g_tolower[1];
@@ -65,7 +65,9 @@ static void *re4_resolve(const char *nm){
   if(!strcmp(nm,"pthread_cond_timedwait_relative_np")) return (void*)&cond_timedwait_rel;
   if(!strncmp(nm,"__google_potentially",20)) return (void*)&noop;
   if(!strcmp(nm,"ptrace")) return (void*)&noop;
-  if(!strcmp(nm,"__sF")) return dlsym(RTLD_DEFAULT,"stdout"); /* best-effort */
+  if(!strcmp(nm,"__sF")) return dlsym(RTLD_DEFAULT,"stdout");
+  if(!strcmp(nm,"bsd_signal")||!strcmp(nm,"sysv_signal")) return dlsym(RTLD_DEFAULT,"signal");
+  if(!strcmp(nm,"sigignore")) return (void*)&noop;
   void *p=dlsym(RTLD_DEFAULT,nm);
   if(p) return p;
   /* Android-specific / nao-achado -> stub */

@@ -377,10 +377,11 @@ int so_resolve(DynLibFunction *funcs, int num_funcs,
               }
             }
             if (!found) {
-              if (taint_missing_imports)
-                *ptr = (uint32_t)rels[j].r_offset;
-              fprintf(stderr, "*** UNRESOLVED import: \"%s\" (off 0x%x) ***\n",
-                      name, (unsigned)rels[j].r_offset);
+              extern void *re4_resolve(const char *);
+              void *fp = re4_resolve(name);
+              if (fp) { *ptr = (uint32_t)(uintptr_t)fp; }
+              else { if (taint_missing_imports) *ptr = (uint32_t)rels[j].r_offset;
+                fprintf(stderr, "*** UNRESOLVED import: \"%s\" ***\n", name); }
             }
           }
           break;

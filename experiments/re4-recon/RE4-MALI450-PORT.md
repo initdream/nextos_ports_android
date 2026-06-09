@@ -87,3 +87,23 @@ instrumentacao melhor p/ achar a razao FATAL engolida. Frente grande e nova.
 ### Diagnostico/infra que ja temos (no main_re4.c)
 segv handler (fault/pc/lr + maps + regs + stack-scan unity), __android_log real, sigaction-block,
 abort/raise/pthread_kill intercept, TLS bridge, init_array index+addr logging, RE4_SKIP.
+
+## FASE 1 -- Unity+Mono RODANDO, agora no JIT do Mono (2026-06-09, sessao 3)
+SEQUENCIA DE BREAKTHROUGHS (cada um destravou o proximo):
+1. sigaction bionic->glibc traduzido (handler @ offset 0) -> passou nativeRecreateGfxState; a engine
+   loga SystemInfo+versao 2018.1.1f1 mono; o crash-handler DA UNITY funciona (via __android_log bridge).
+2. dlopen("")/libc/libunity/libmono -> SELF handle; dlsym -> so_find_addr+RTLD_DEFAULT.
+3. dlerror/dladdr/dlclose stubados -> evita _dl_exception_create NULL-deref (glibc dl-error path).
+4. LIBMONO carregado como 2o modulo (so_load+reloc+resolve+init_array, g_m_mono); dlsym de mono_*
+   resolve nele -> "Could not load symbol mono_*" = 0.
+5. so_resolve cai pro re4_resolve (dlsym+aliases, bsd_signal->signal) p/ os imports do libmono ->
+   UNRESOLVED=0.
+ESTADO: a engine roda Unity+Mono, lifecycle ate nativeRender, e o **JIT do Mono compila C#** ->
+crasha com Assertion em mini.c:2215 + "stack walk not installed" (pc em libmono = o JIT do Mono).
+
+PAREDE ATUAL: o JIT do Mono (mini-arm) -- precisa de setup de unwind/stack-walk OU exec-mem do JIT.
+Frente nova e funda (interna do runtime C#). Muito alem do HK (que nem passou do init da engine).
+
+### Infra (main_re4.c) p/ continuar
+multi-modulo (g_m_unity+g_m_mono), bridges: pthread+TLS+stdio+dl+sigaction(bionic->glibc), __android_log
+real, segv handler gdb-friendly, getpwuid stub. Device: /storage/roms/re4-recon (re4boot+libunity+libmono+assets).
