@@ -36,6 +36,11 @@ static long stub_generic(void){ return 0; }
 /* shims bionic */
 static unsigned char g_ctype[384];
 static short g_tolower[384], g_toupper[384];
+/* bionic _ctype_/_tolower_tab_/_toupper_tab_ sao VARIAVEIS PONTEIRO (const char*), acessadas com
+   2 derefs: *(_ctype_) aponta p/ a tabela; o codigo faz tabela[c+1]. Resolver o SIMBOLO p/ o
+   endereco da tabela (1 deref) crashava (libueva deref a tabela como se fosse o ponteiro). */
+static const unsigned char *g_ctype_p;
+static const short *g_tolower_p, *g_toupper_p;
 static int g_ctype_init=0;
 #include <ctype.h>
 static void ctype_build(void){
@@ -95,9 +100,11 @@ void *re4_resolve(const char *nm){
   if(!strcmp(nm,"pthread_attr_getstack")) return (void*)&ig_attr_getstack;
   if(!strcmp(nm,"pthread_getattr_np")) return (void*)&ig_getattr_np;
   ctype_build();
-  if(!strcmp(nm,"_ctype_")) return &g_ctype[1];
-  if(!strcmp(nm,"_tolower_tab_")) return &g_tolower[1];
-  if(!strcmp(nm,"_toupper_tab_")) return &g_toupper[1];
+  /* devolve o ENDERECO da variavel ponteiro (que aponta p/ a base da tabela; codigo faz +1+c) */
+  g_ctype_p=g_ctype; g_tolower_p=g_tolower; g_toupper_p=g_toupper;
+  if(!strcmp(nm,"_ctype_")) return &g_ctype_p;
+  if(!strcmp(nm,"_tolower_tab_")) return &g_tolower_p;
+  if(!strcmp(nm,"_toupper_tab_")) return &g_toupper_p;
   if(!strcmp(nm,"__errno")) return dlsym(RTLD_DEFAULT,"__errno_location");
   if(!strcmp(nm,"setjmp")) return dlsym(RTLD_DEFAULT,"_setjmp");
   if(!strcmp(nm,"longjmp")) return dlsym(RTLD_DEFAULT,"_longjmp");
