@@ -59,3 +59,13 @@ void my_glTexSubImage2D(GLenum tg, GLint l, GLint x, GLint y, GLsizei w, GLsizei
   }
   glTexSubImage2D(tg,l,x,y,w,h,f,ty,p);
 }
+
+void my_glShaderSource(GLuint sh, GLsizei n, const char *const *str, const GLint *len) {
+  static int c=0;
+  if (c++<8 && n>0 && str) {
+    fprintf(stderr, "[GL] ShaderSource sh=%u parts=%d:", sh, n);
+    for (int i=0;i<n && i<4;i++) if(str[i]) { char buf[40]; int j=0; for(;j<39 && str[i][j] && str[i][j]!='\n';j++) buf[j]=str[i][j]; buf[j]=0; fprintf(stderr, " [%s]", buf); }
+    fprintf(stderr, "\n");
+  }
+  glShaderSource(sh,n,str,len);
+}

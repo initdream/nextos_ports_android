@@ -54,4 +54,5 @@ int AInputEvent_getDeviceId(void *); int AMotionEvent_getButtonState(void *); ex
 void my_glGenTextures(); void my_glBindTexture(); void my_glTexImage2D(); void my_glGenFramebuffers(); void my_glGenBuffers();
 unsigned my_glCreateShader(); void my_glActiveTexture(); void my_glBufferData();
 void my_glTexSubImage2D();
+void my_glShaderSource();
 #endif

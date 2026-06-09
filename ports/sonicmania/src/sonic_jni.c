@@ -120,6 +120,7 @@ void jni_run(void) {
   g_ctx = SDL_GL_CreateContext(g_win);
   if (!g_ctx) fprintf(stderr, "[gl] CreateContext FALHOU: %s\n", SDL_GetError());
   SDL_GL_MakeCurrent(g_win, g_ctx);
+  SDL_GL_SetSwapInterval(0);
   fprintf(stderr, "[gl] contexto GLES2 win=%p ctx=%p\n", (void *)g_win, (void *)g_ctx);
 
   build_env();

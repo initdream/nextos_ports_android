@@ -18,6 +18,7 @@
 
 // === passthrough/pthread/shim: ligados automaticamente ===
 DynLibFunction dynlib_functions[] = {
+  {"glShaderSource", (uintptr_t)&my_glShaderSource},
   {"glBufferData", (uintptr_t)&my_glBufferData},
   {"glCreateShader", (uintptr_t)&my_glCreateShader},
   {"glGenBuffers", (uintptr_t)&my_glGenBuffers},
