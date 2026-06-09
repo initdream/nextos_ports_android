@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 // re4_imports.c -- GERADO. egl->egl_shim_*, resto->dlsym(RTLD_DEFAULT) em runtime + shims bionic.
 #include "imports.h"
 #include "so_util.h"
@@ -62,6 +63,13 @@ static long ig_sysconf(int name){ long r=sysconf(name);
   if((name==_SC_PHYS_PAGES||name==_SC_AVPHYS_PAGES)&&r<=0){ r=(512L*1024*1024)/4096; }
   return r; }
 static int ig_getpagesize(void){ return 4096; }
+/* GC pega bounds da pilha; glibc retorna base=0 p/ a thread Unity -> GC varre de ~0 -> crash.
+   Forcamos bounds VALIDOS (reais via glibc, ou fallback baseado no SP atual). */
+static int ig_attr_getstack(void *attr,void **base,size_t *size){ (void)attr;
+  void *b=0; size_t sz=0; pthread_attr_t ga;
+  if(pthread_getattr_np(pthread_self(),&ga)==0){ pthread_attr_getstack(&ga,&b,&sz); pthread_attr_destroy(&ga); }
+  if(!b||!sz){ uintptr_t sp; __asm__ volatile("mov %0, sp":"=r"(sp)); sz=8UL*1024*1024; b=(void*)(((sp - sz) + 0x10000UL) & ~0xfffUL); }
+  if(base)*base=b; if(size)*size=sz; fprintf(stderr,"[IG-STACK] base=%p size=%zu\n",b,sz); return 0; }
 static int ig_sysinfo(struct sysinfo *info){ if(info){ memset(info,0,sizeof(*info));
   info->totalram=512UL*1024*1024; info->freeram=256UL*1024*1024; info->sharedram=0; info->bufferram=0;
   info->totalswap=256UL*1024*1024; info->freeswap=256UL*1024*1024; info->mem_unit=1; info->procs=4; info->uptime=120;
@@ -70,6 +78,7 @@ void *re4_resolve(const char *nm){
   if(!strcmp(nm,"sysconf")) return (void*)&ig_sysconf;
   if(!strcmp(nm,"getpagesize")) return (void*)&ig_getpagesize;
   if(!strcmp(nm,"sysinfo")) return (void*)&ig_sysinfo;
+  if(!strcmp(nm,"pthread_attr_getstack")) return (void*)&ig_attr_getstack;
   ctype_build();
   if(!strcmp(nm,"_ctype_")) return &g_ctype[1];
   if(!strcmp(nm,"_tolower_tab_")) return &g_tolower[1];

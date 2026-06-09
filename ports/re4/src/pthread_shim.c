@@ -151,10 +151,19 @@ static int sh_getattr_np(void *thread_, void *battr) {
   return r;
 }
 static int sh_attr_getstack(void *battr, void **base, size_t *size) {
-  if (battr) {
-    if (base) *base = *(void **)((char *)battr + 4);  /* bionic 32-bit stack_base@4 */
-    if (size) *size = *(size_t *)((char *)battr + 8);  /* stack_size@8 */
+  /* RAIZ do crash do GC: o attr foi preenchido pelo glibc pthread_getattr_np (layout glibc)
+     mas aqui liamos offsets bionic -> base=0 -> GC aborta "Bad GET_MEM arg".
+     Fix: ignora o attr e pega os bounds REAIS da thread atual via glibc (consistente). */
+  (void)battr;
+  void *b = NULL; size_t s = 0;
+  pthread_attr_t ga;
+  if (pthread_getattr_np(pthread_self(), &ga) == 0) {
+    pthread_attr_getstack(&ga, &b, &s);
+    pthread_attr_destroy(&ga);
   }
+  if (base) *base = b;
+  if (size) *size = s;
+  fprintf(stderr, "[STACK] attr_getstack -> base=%p size=%zu\n", b, s);
   return 0;
 }
 

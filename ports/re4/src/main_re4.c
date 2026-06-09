@@ -17,16 +17,26 @@
 #include "so_util.h"
 #include "imports.h"
 #include "jni_shim.h"
+static uintptr_t g_mono_base=0, g_unity_base=0;
+static void getmem_trace(const char*tag);
+static long my_write(int fd,const void*b,unsigned long n){ if(b&&n>=7&&memmem(b,n,"GET_MEM",7))getmem_trace("write"); return write(fd,b,n); }
 /* BRIDGE stdio bionic: __sF[3] (stdin/out/err) do bionic tem layout != glibc. Forneco um
    array marcador + intercepto fprintf/fputs/etc pra mapear &__sF[i] -> stream real do glibc.
    Assim o LOG de erro da Unity (que vai pro stderr bionic) aparece. */
 static char g_sf[3*84+16];
 static FILE *sf_map(FILE *fp){ uintptr_t p=(uintptr_t)fp,b=(uintptr_t)g_sf;
   if(p>=b && p<b+sizeof(g_sf)){ int i=(int)((p-b)/84); return i<=0?stdin:(i==1?stdout:stderr); } return fp; }
-static int my_fprintf(FILE*fp,const char*fmt,...){ va_list ap; va_start(ap,fmt); int r=vfprintf(sf_map(fp),fmt,ap); va_end(ap); return r; }
-static int my_vfprintf(FILE*fp,const char*fmt,va_list ap){ return vfprintf(sf_map(fp),fmt,ap); }
-static int my_fputs(const char*str,FILE*fp){ return fputs(str,sf_map(fp)); }
-static size_t my_fwrite(const void*p,size_t a,size_t b,FILE*fp){ return fwrite(p,a,b,sf_map(fp)); }
+static int my_fprintf(FILE*fp,const char*fmt,...){ if(fmt&&strstr(fmt,"GET_MEM"))getmem_trace("fprintf"); va_list ap; va_start(ap,fmt); int r=vfprintf(sf_map(fp),fmt,ap); va_end(ap); return r; }
+static int my_vfprintf(FILE*fp,const char*fmt,va_list ap){ if(fmt&&strstr(fmt,"GET_MEM"))getmem_trace("vfprintf"); return vfprintf(sf_map(fp),fmt,ap); }
+static void getmem_trace(const char*tag){
+  volatile void *anchor; uintptr_t sp=(uintptr_t)&anchor;
+  fprintf(stderr,"[GETMEM-TRACE %s] frames libmono na pilha:\n",tag);
+  int found=0;
+  for(int k=0;k<1024 && found<24;k++){ uintptr_t v=*(uintptr_t*)(sp+k*4);
+    if(g_mono_base&&v>=g_mono_base+0x10000&&v<g_mono_base+0x396c84){ fprintf(stderr,"  libmono+0x%lx\n",(unsigned long)(v-g_mono_base)); found++; } }
+  fflush(stderr); }
+static int my_fputs(const char*str,FILE*fp){ if(str&&strstr(str,"GET_MEM"))getmem_trace("fputs"); return fputs(str,sf_map(fp)); }
+static size_t my_fwrite(const void*p,size_t a,size_t b,FILE*fp){ if(p&&a*b>=7&&memmem(p,a*b,"GET_MEM",7))getmem_trace("fwrite"); return fwrite(p,a,b,sf_map(fp)); }
 static int my_fputc(int c,FILE*fp){ return fputc(c,sf_map(fp)); }
 static int my_fflush(FILE*fp){ return fflush(fp?sf_map(fp):NULL); }
 /* loga dlopen/dlsym -> ve se a engine tenta carregar libmono (Mono runtime C#) */
@@ -95,7 +105,6 @@ static void* my_jit_tls_getter(void){
 static void my_assert_handler(const char* file, int line, const char* a, const char* b){ (void)a;(void)b;
   static int n=0; if(n++<60){ fprintf(stderr,"[ASSERT-SKIP] %s:%d\n", file?file:"?", line); fflush(stderr); }
 }
-static uintptr_t g_mono_base=0, g_unity_base=0;
 /* loga open/fopen -> acha a fonte de memoria (/proc/meminfo etc) */
 static FILE* my_fopen(const char*p,const char*m){ if(p&&(strstr(p,"proc")||strstr(p,"mem")||strstr(p,"sys"))) fprintf(stderr,"[FOPEN] %s\n",p);
   if(p&&!strcmp(p,"/proc/meminfo")){ fprintf(stderr,"[FOPEN] meminfo -> fake 512MB\n");
@@ -194,6 +203,7 @@ int main(void){
   re4_set_import("abort",(void*)my_abort);
   re4_set_import("fopen",(void*)my_fopen);
   re4_set_import("open",(void*)my_open);
+  re4_set_import("write",(void*)my_write);
   re4_set_import("raise",(void*)my_raise);
   re4_set_import("pthread_kill",(void*)my_ptkill);
   re4_set_import("sigaction",(void*)my_sigaction);
