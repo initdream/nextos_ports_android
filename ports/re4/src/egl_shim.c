@@ -317,11 +317,12 @@ EGLBoolean egl_shim_GetConfigAttrib(EGLDisplay dpy, EGLConfig config,
   case 0x3031: *value = 0; break;          /* EGL_SAMPLE_BUFFERS */
   case 0x3032: *value = 0; break;          /* EGL_SAMPLES */
   case 0x3033: *value = 0x0004; break;     /* EGL_SURFACE_TYPE = EGL_WINDOW_BIT */
-  case 0x3040: *value = 0x0044; break;     /* EGL_RENDERABLE_TYPE = ES2|ES3 (Unity 2018 valida ES3
-                                              primeiro; anunciar ambos passa a validacao -- o
-                                              eglCreateContext sempre cria contexto ES2 no Mali) */
+  case 0x3040: *value = 0x0004; break;     /* EGL_RENDERABLE_TYPE = ES2 SO (4). Unity tenta
+                                              ES3.2/3.1/3.0/ES2 em sequencia; anunciar so ES2 faz
+                                              ele REJEITAR as ES3 e ACEITAR a ES2 -> usa contexto
+                                              ES2 (Mali-450 e ES2-only; ES3 crashava). */
   case 0x3042: *value = 1; break;          /* EGL_BIND_TO_TEXTURE_RGB */
-  case 0x3039: *value = 0x0044; break;     /* EGL_CONFORMANT = ES2|ES3 */
+  case 0x3039: *value = 0x0004; break;     /* EGL_CONFORMANT = ES2 */
   case 0x302E: *value = 0; break;          /* EGL_NATIVE_VISUAL_ID */
   case 0x3034: *value = 0; break;          /* EGL_TRANSPARENT_TYPE = EGL_NONE */
   case 0x30e2: *value = 0x30e3; break;     /* Unity 2018 config-match: aceita se 0x30e2==0x30e3 */
