@@ -250,6 +250,15 @@ void jni_run(void) {
     so_make_text_executable(); so_flush_caches(); }
   { int nj = SDL_NumJoysticks(); fprintf(stderr, "[input] %d joysticks\n", nj);
     for (int i=0;i<nj;i++){ if (SDL_IsGameController(i)) { SDL_GameControllerOpen(i); fprintf(stderr,"[input] gamecontroller %d aberto\n",i);} else { SDL_JoystickOpen(i); fprintf(stderr,"[input] joystick RAW %d aberto (%s)\n",i,SDL_JoystickNameForIndex(i)); } } }
+  /* ---- ÁUDIO via DIRECT MIX: resolve RSDK::Audio::MixToBuffer e passa pro shim SDL,
+   * que chama o mixer direto (sem a callback do Oboe que crasha em string STL). ---- */
+  if (!getenv("SONIC_NOAUDIO")) {
+    uintptr_t mx = so_find_addr_safe("_ZN4RSDK5Audio11MixToBufferEPfj");
+    extern void opensles_shim_set_mixfn(void *);
+    if (mx) { opensles_shim_set_mixfn((void *)mx);
+      fprintf(stderr, "[sl] DIRECT MIX wired MixToBuffer=%p\n", (void *)mx); }
+    else fprintf(stderr, "[sl] MixToBuffer NAO achado (sem audio)\n");
+  }
   fprintf(stderr, "[drv] entrando no loop step\n");
   for (long f = 0; st; f++) {
     SDL_Event ev;
@@ -451,8 +460,19 @@ void jni_run(void) {
       }
     }
     { extern void opensles_shim_pump_callbacks(void); static int au=-1;
-      if(au<0) au=getenv("SONIC_AUDIO")?1:0; /* áudio OFF por padrão (pump crasha; em debug) */
-      if(au && f>600) opensles_shim_pump_callbacks(); } /* só após init estável */
+      if(au<0) au=getenv("SONIC_AUDIO")?1:0; /* pump Oboe (crasha; debug) */
+      if(au && f>600) opensles_shim_pump_callbacks(); }
+    /* FORÇA VOLUME: os canais tocam (state 2=stream/música, 1=sfx) mas engine volume=0
+     * (opções zeradas) -> MixToBuffer multiplica por 0 = silêncio. Seta streamVolume(+4)
+     * e soundFXVolume(+8) = 1.0 (engine=*(tb+0x490da0); SFX usa +8, stream usa +4). */
+    if (!getenv("SONIC_NOAUDIO")) { uintptr_t tb=(uintptr_t)g_copyslot-0x17d9bc;
+      uintptr_t en=*(uintptr_t*)(tb+0x490da0);
+      if (en) { if(*(float*)(en+4)<0.99f) *(float*)(en+4)=1.0f; if(*(float*)(en+8)<0.99f) *(float*)(en+8)=1.0f; } }
+    if (f%120==60) { uintptr_t tb=(uintptr_t)g_copyslot-0x17d9bc;
+      uintptr_t ch=*(uintptr_t*)(tb+0x49e948); uintptr_t en=*(uintptr_t*)(tb+0x490da0);
+      char st[40]; int act=0; for(int c=0;c<16;c++){ int s=ch?*(unsigned char*)(ch+c*40+39):-1; st[c]='0'+(s&7); if(s)act++; } st[16]=0;
+      float v0=en?*(float*)(en):-1, v4=en?*(float*)(en+4):-1, v8=en?*(float*)(en+8):-1;
+      fprintf(stderr,"[snd2] chStates=%s active=%d vol(+0=%.2f +4=%.2f +8=%.2f)\n", st, act, v0,v4,v8); }
     { extern int g_drawcount; static int last=0;
       if (f%30==0) { fprintf(stderr, "[loop] frame %ld draws=%d (+%d) glErr=0x%x\n", f, g_drawcount, g_drawcount-last, glGetError()); last=g_drawcount; }
       if (f%120==1) fprintf(stderr, "[state] running=%d container=%d info=%d %d %d %d\n",

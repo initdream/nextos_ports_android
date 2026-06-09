@@ -219,9 +219,28 @@ static uint32_t ring_read(AudioPlayer *p, void *data, uint32_t len) {
 #define SDL_OUTPUT_RATE 44100
 #define TMP_BUF_SAMPLES (SDL_AUDIO_SAMPLES * 2)
 
+/* ---- DIRECT MIX: chama RSDK::Audio::MixToBuffer(float*, uint32) direto na thread
+ * de áudio do SDL, em vez de passar pela callback do Oboe (que crasha em string STL).
+ * MixToBuffer é um mixer de samples PURO (sem string) -> sem crash. ---- */
+static void (*g_mixfn)(float *, unsigned) = NULL;
+static void ensure_audio_initialized(void);
+void opensles_shim_set_mixfn(void *fn) { g_mixfn = (void (*)(float *, unsigned))fn; ensure_audio_initialized(); }
+
 static void sdl_audio_callback(void *userdata, Uint8 *stream, int len) {
   (void)userdata;
   memset(stream, 0, len);
+  if (g_mixfn) {
+    int16_t *o = (int16_t *)stream;
+    int n = len / (int)sizeof(int16_t);
+    static float fb[SDL_AUDIO_SAMPLES * 2];
+    if (n > SDL_AUDIO_SAMPLES * 2) n = SDL_AUDIO_SAMPLES * 2;
+    memset(fb, 0, n * sizeof(float));
+    g_mixfn(fb, (unsigned)n);  /* engine mixa 44100 stereo float */
+    float pk = 0.f;
+    for (int s = 0; s < n; s++) { float v = fb[s]; if (v > 1.f) v = 1.f; else if (v < -1.f) v = -1.f; o[s] = (int16_t)(v * 32767.f); float a = v<0?-v:v; if (a>pk) pk=a; }
+    { static int dc=0; if (dc++%40==0) fprintf(stderr,"[snd] direct mix n=%d peak=%.3f\n", n, pk); }
+    return;
+  }
   { static int dbgc=0; if(dbgc++%80==0){ int act=0; for(int k=0;k<MAX_PLAYERS;k++) if(g_players[k].active && g_players[k].play_state==SL_PLAYSTATE_PLAYING) act++; fprintf(stderr,"[sl] sdl_cb len=%d active_players=%d\n", len, act); } }
 
   int16_t *out = (int16_t *)stream;
