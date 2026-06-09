@@ -1,3 +1,4 @@
+#include <stdlib.h>
 /* sonic_jni.c — JNI driver estático do Sonic Mania (RSDKv5).
  * Fabrica um JNIEnv/JavaVM falsos e chama o fluxo nativo:
  *   JNI_OnLoad -> OpenGLNativeCalls_startEngine -> loop OpenGLNativeCalls_step.
@@ -118,6 +119,8 @@ static void audio_cb(void *ud, Uint8 *stream, int len) {
 
 static void (*g_onkey)(void *, void *, int, int) = NULL;
 static void (*g_copyslot)(void *, unsigned) = NULL;
+static uintptr_t g_ctrl_base = 0;
+static int g_ctrl_probe = 0;
 static int sdl_key_to_android(int sc) {
   switch (sc) {
     case SDL_SCANCODE_UP: return 19; case SDL_SCANCODE_DOWN: return 20;
@@ -209,7 +212,14 @@ void jni_run(void) {
     if (ci) { fprintf(stderr, "[input] Controller::Init()\n"); ((void(*)(void))ci)(); } }
   g_onkey = (void (*)(void *, void *, int, int))so_find_addr_safe("Java_com_netflix_NGP_SonicMania_MainActivity_OnKeyEvent");
   g_copyslot = (void (*)(void *, unsigned))so_find_addr_safe("_ZN4RSDK3SKU18AndroidInputDevice10CopyToSlotEh");
+  { uintptr_t kc = so_find_addr_safe("Java_com_google_android_games_paddleboat_GameControllerManager_onKeyboardConnected");
+    if (kc) { fprintf(stderr, "[input] onKeyboardConnected()\n"); ((int(*)(void*,void*,int))kc)(fake_env, fake_thiz, 0); }
+  }
   fprintf(stderr, "[input] CopyToSlot=%p\n", (void *)g_copyslot);
+  if (g_copyslot) { uintptr_t tb = (uintptr_t)g_copyslot - 0x17d9bc;
+    g_ctrl_base = *(uintptr_t *)(tb + 0x490e18);
+    fprintf(stderr, "[input] text_base=0x%lx controller_base=0x%lx\n", (unsigned long)tb, (unsigned long)g_ctrl_base); }
+  g_ctrl_probe = getenv("SONIC_FORCEINPUT") != NULL;
   fprintf(stderr, "[input] OnKeyEvent=%p\n", (void *)g_onkey);
   { int nj = SDL_NumJoysticks(); fprintf(stderr, "[input] %d joysticks\n", nj);
     for (int i=0;i<nj;i++){ if (SDL_IsGameController(i)) { SDL_GameControllerOpen(i); fprintf(stderr,"[input] gamecontroller %d aberto\n",i);} else { SDL_JoystickOpen(i); fprintf(stderr,"[input] joystick RAW %d aberto (%s)\n",i,SDL_JoystickNameForIndex(i)); } } }
@@ -238,10 +248,13 @@ void jni_run(void) {
       } else if (ev.type == SDL_CONTROLLERDEVICEADDED) SDL_GameControllerOpen(ev.cdevice.which);
     }
     /* auto-teste: aperta START no frame 250/255 p/ ver se a cena avança */
-    if (g_onkey && (f==700||f==1000||f==1300)) { fprintf(stderr, "[input] AUTO START f=%ld\n", f); g_onkey(fake_env, fake_thiz, 108, 1); }
-    if (g_onkey && (f==706||f==1006||f==1306)) { g_onkey(fake_env, fake_thiz, 108, 0); }
+    if (g_onkey) {
+      long ph = f % 60;
+      if (ph == 0) { g_onkey(fake_env, fake_thiz, 108, 1); g_onkey(fake_env, fake_thiz, 96, 1); }
+      else if (ph == 4) { g_onkey(fake_env, fake_thiz, 108, 0); g_onkey(fake_env, fake_thiz, 96, 0); }
+    }
+
     { static uintptr_t sa2=0; if(!sa2) sa2=so_find_addr_safe("_ZN4RSDK5Audio15deviceAvailableE"); if(sa2)*(int*)sa2=1; }
-    if (g_copyslot) { g_copyslot(fake_thiz, 0); g_copyslot(fake_thiz, 1); }
     ((void (*)(void *, void *, float))st)(fake_env, fake_thiz, 60.0f);
     /* { extern void opensles_shim_pump_callbacks(void); opensles_shim_pump_callbacks(); } DISABLED p/ isolar crash */
     { extern int g_drawcount; static int last=0;
