@@ -24,6 +24,7 @@ typedef struct {
   SDL_GLContext sdl_context;
   EGLBoolean is_pbuffer;
   int id;
+  unsigned long owner_tid; /* thread dona do SDL context (SDL-mali amarra a thread criadora) */
 } _egl_context;
 
 static SDL_Window *egl_window = NULL;
@@ -106,7 +107,7 @@ int egl_shim_ensure_current(void) {
 
 EGLDisplay egl_shim_GetDisplay(EGLNativeDisplayType display_id) {
   (void)display_id;
-  debugPrintf("egl_shim: eglGetDisplay()\n");
+  debugPrintf("egl_shim: eglGetDisplay() [tid=%lx]\n",(unsigned long)pthread_self());
   return (EGLDisplay)strdup("display");
 }
 
@@ -174,26 +175,13 @@ EGLContext egl_shim_CreateContext(EGLDisplay dpy, EGLConfig config,
   _egl_context *c = (_egl_context *)calloc(1, sizeof(_egl_context));
   if (!c)
     return EGL_NO_CONTEXT;
-
-  pthread_mutex_lock(&egl_context_create_mutex);
-  SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
-  if (egl_share_root)
-    SDL_GL_MakeCurrent(egl_window, egl_share_root);
-  c->sdl_context = SDL_GL_CreateContext(egl_window);
-  SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
-  SDL_GL_MakeCurrent(egl_window, NULL);
-  pthread_mutex_unlock(&egl_context_create_mutex);
-
-  if (!c->sdl_context) {
-    debugPrintf("egl_shim: eglCreateContext(share=%p) FAILED: %s\n",
-                share_context, SDL_GetError());
-    free(c);
-    return EGL_NO_CONTEXT;
-  }
-
+  /* NAO cria o SDL/EGL context aqui: o Unity cria contextos na MAIN thread mas RENDERIZA numa
+     worker thread -> contexto preso a main -> eglMakeCurrent na worker = EGL_BAD_ACCESS. Adiamos
+     a criacao do SDL context p/ o 1o MakeCurrent, na PROPRIA thread de render (sdl_context=NULL). */
+  c->sdl_context = NULL;
   c->id = next_context_id++;
-  debugPrintf("egl_shim: eglCreateContext(share=%p) -> %p [ctx_id=%d]\n",
-              share_context, c, c->id);
+  debugPrintf("egl_shim: eglCreateContext -> ctx_id=%d [tid=%lx] (lazy)\n",
+              c->id, (unsigned long)pthread_self());
   return (EGLContext)c;
 }
 
@@ -222,28 +210,26 @@ EGLBoolean egl_shim_MakeCurrent(EGLDisplay dpy, EGLSurface draw,
   current_context = context;
   last_context = context;
 
-  if (!egl_window || !context->sdl_context)
+  if (!egl_window)
     return EGL_TRUE;
 
-  int ret = SDL_GL_MakeCurrent(egl_window, context->sdl_context);
-  if (ret != 0) {
-    /* falha tipica = contexto EGL preso a outra thread (EGL_BAD_ACCESS). Solta o contexto
-       atual desta thread e tenta de novo; persistindo, recria um contexto compartilhado
-       (share-root) nesta thread -- como todos compartilham, os objetos GL continuam validos. */
+  /* SDL-mali amarra o SDL context a thread que o criou. O Unity cria o contexto na MAIN e
+     RENDERIZA numa thread de gfx -> precisa MIGRAR: se o contexto nao existe OU pertence a outra
+     thread, (re)cria nesta thread. A thread de render sustentado acaba dona dele. */
+  unsigned long me = (unsigned long)pthread_self();
+  if (!context->sdl_context || context->owner_tid != me) {
+    pthread_mutex_lock(&egl_context_create_mutex);
+    if (context->sdl_context) { SDL_GL_DeleteContext(context->sdl_context); context->sdl_context = NULL; }
     SDL_GL_MakeCurrent(egl_window, NULL);
-    ret = SDL_GL_MakeCurrent(egl_window, context->sdl_context);
-    if (ret != 0) {
-      pthread_mutex_lock(&egl_context_create_mutex);
-      SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
-      if (egl_share_root) SDL_GL_MakeCurrent(egl_window, egl_share_root);
-      SDL_GLContext nc = SDL_GL_CreateContext(egl_window);
-      SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
-      pthread_mutex_unlock(&egl_context_create_mutex);
-      if (nc) { context->sdl_context = nc; ret = SDL_GL_MakeCurrent(egl_window, nc);
-        debugPrintf("egl_shim: MakeCurrent recriou contexto p/ tid=%lx ret=%d [ctx_id=%d]\n",
-                    (unsigned long)pthread_self(), ret, context->id); }
-    }
+    context->sdl_context = SDL_GL_CreateContext(egl_window);
+    context->owner_tid = me;
+    pthread_mutex_unlock(&egl_context_create_mutex);
+    debugPrintf("egl_shim: (re)criou SDL context p/ ctx_id=%d [tid=%lx] -> %p\n",
+                context->id, me, context->sdl_context);
+    if (!context->sdl_context) { debugPrintf("egl_shim: SDL_GL_CreateContext FALHOU: %s\n", SDL_GetError()); return EGL_TRUE; }
   }
+
+  int ret = SDL_GL_MakeCurrent(egl_window, context->sdl_context);
   if (ret == 0) {
     has_real_gl = 1;
     static _Thread_local int acq_log = 0;

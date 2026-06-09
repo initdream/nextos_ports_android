@@ -229,9 +229,19 @@ void jni_run(void) {
    * Sem isso ela retorna 1 e BLOQUEIA o PressButton (gate==1 = return antes de
    * checar botao). Original: ldr w0,[x0,#60]; ret  ->  mov w0,#0; ret ---- */
   { uintptr_t gc = so_find_addr_safe("_ZN4RSDK3SKU11UserStorage25GetCloudSaveConflictStateEv");
-    if (gc) { so_make_text_writable(); *(uint32_t*)gc = 0x52800000u; /* movz w0,#0 */
-      so_make_text_executable(); so_flush_caches();
-      fprintf(stderr, "[patch] GetCloudSaveConflictState -> 0 @%p\n", (void*)gc); } }
+    uintptr_t tb0 = g_copyslot ? (uintptr_t)g_copyslot - 0x17d9bc : 0;
+    so_make_text_writable();
+    if (gc) { *(uint32_t*)gc = 0x52800000u; /* movz w0,#0 */
+      fprintf(stderr, "[patch] GetCloudSaveConflictState -> 0 @%p\n", (void*)gc); }
+    /* ---- PATCH MenuSetup_PrerollChecks: completar naturalmente em vez de forçar
+     * initializedAPI (que pulava UIWaitSpinner_Hide e a ativação do menu -> spinner
+     * preso, botões não aparecem). Com os 4 status forçados=OK, NOP nas 2 ramificações
+     * dos gates de API mobile p/ sempre seguir: dispensa o spinner + seta initializedAPI
+     * + retorna done -> MenuSetup_SingleUpdate path B seta selectionDisabled=false e
+     * ativa o menu. 0x20f4c4 cbz w0,20f5e4 -> NOP ; 0x20f518 cbnz w0,20f134 -> NOP ---- */
+    if (tb0) { *(uint32_t*)(tb0+0x20f4c4)=0xd503201fu; *(uint32_t*)(tb0+0x20f518)=0xd503201fu;
+      fprintf(stderr, "[patch] PrerollChecks gates NOP @%p\n", (void*)(tb0+0x20f4c4)); }
+    so_make_text_executable(); so_flush_caches(); }
   { int nj = SDL_NumJoysticks(); fprintf(stderr, "[input] %d joysticks\n", nj);
     for (int i=0;i<nj;i++){ if (SDL_IsGameController(i)) { SDL_GameControllerOpen(i); fprintf(stderr,"[input] gamecontroller %d aberto\n",i);} else { SDL_JoystickOpen(i); fprintf(stderr,"[input] joystick RAW %d aberto (%s)\n",i,SDL_JoystickNameForIndex(i)); } } }
   fprintf(stderr, "[drv] entrando no loop step\n");
@@ -354,7 +364,10 @@ void jni_run(void) {
        * de cara, pulando TODOS os gates de API mobile (NotifyAutosave/Notifs/Dialogs).
        * MenuSetup = *(tb+0x4a7b20). So depois de initializedSaves(+20) setar. */
       { uintptr_t ms=*(uintptr_t*)(tb+0x4a7b20);
-        if (ms && *(int*)(ms+20)!=0 && *(int*)(ms+16)==0) {
+        /* NAO forçar initializedAPI: o patch dos gates do PrerollChecks deixa o menu
+         * completar sozinho (dispensa spinner + ativa botões). Force só como fallback
+         * tardio se travar >5s sem completar. */
+        if (getenv("SONIC_FORCEAPI") && ms && *(int*)(ms+20)!=0 && *(int*)(ms+16)==0) {
           *(int*)(ms+16)=1; fprintf(stderr,"[menu] forcado MenuSetup->initializedAPI=1\n"); }
         if (ms && f%60==15) { uintptr_t fx=*(uintptr_t*)(ms+48);
           fprintf(stderr,"[menu] MS menuRet=%d menu=%d api=%d saves=%d | fxFade=0x%lx timer=%d\n",
