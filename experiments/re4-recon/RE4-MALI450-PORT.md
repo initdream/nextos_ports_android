@@ -153,3 +153,28 @@ fonte ainda nao identificada (nem sysconf/sysinfo/JNI/proc).
 PROXIMO: achar GC_unix_get_mem (xref a 0x3884c0 -- padrao movw/movt ou GOT, nao ldr+add) e
 hookar p/ alinhar/corrigir o size; OU descobrir a fonte do memory=0 que enviesa o GC.
 Infra de debug toda no main_re4 (on_segv multi-sinal + hooks). RE4_NOSIGH=1 chega mais longe.
+
+## FASE 2 -- C# RUNTIME CARREGANDO!! (madrugada 2026-06-09, sessao 5) -- INEDITO
+CADEIA DE BREAKTHROUGHS (cada um destravou o proximo, TODOS confirmados):
+1. **GC Boehm "Bad GET_MEM arg"** (a parede MAIS DURA): GC_unix_get_mem (libmono+0x2bed14) aborta
+   se (bytes & (GC_page_size-1)); GC_page_size==0 -> tudo aborta. FIX: hook+trampolim no GET_MEM
+   -> bypass (mmap page-aligned direto). **GC PASSADO.**
+2. getmem_trace (debug meu) estourava a pilha -> desabilitado.
+3. **mscorlib "invalid CIL image"**: Unity (bionic) lia st_size do **fstatat64** no offset bionic,
+   mas glibc preenchia layout glibc -> size=32KB -> lia so 32KB do .dll (metadata em 1.27MB fora).
+   FIX: **fstatat64/fstat64/stat64/lstat64 via syscall CRU** (kernel preenche layout bionic).
+   Unity le os 2.49MB inteiros -> **mscorlib + assemblies C# CARREGAM.** (achado via strace!)
+4. assemblies copiados em Managed/mono/{1.0,2.0}/ (FS exFAT sem symlink -> cp).
+5. mono_jit_init_version forca "v2.0.50727" (Unity pedia v4.0.30319=unavailable).
+6. **threads.c:928** (SP nos bounds da pilha) + **mini-posix:382** (sigaction!=-1): FIX=
+   pthread_getattr_np preenche attr BIONIC (base@4 size@8) com bounds reais; sigaction nunca -1.
+   **C# RUNTIME INICIALIZA** -> registra metodos nativos (tangoOnImageAvailable etc).
+
+ESTADO: o runtime C# (Mono v2.0/Boehm) CARREGA e INICIALIZA. Passamos GC + carga de assembly +
+bounds de thread. Janela GLES2 ja existe; falta o C# do jogo rodar + 1a cena desenhar.
+PAREDE ATUAL: chamada via ponteiro NULL (pc=0) fundo no init do runtime (libmono+0x13e018-area,
+mono_register_bundled_assemblies / setup de callbacks do GC). Pilha corrompe no crash. vtable JNI
+ja toda preenchida (nao e ela). Provavel callback/ponteiro do runtime nao instalado.
+
+Infra de fix toda em main_re4.c (gated) + imports.gen.c (stat syscalls, ig_attr_getstack/getattr_np).
+strace no device = /usr/bin/strace (autoritativo, achou o fstat). assemblies em mono/1.0+2.0.
