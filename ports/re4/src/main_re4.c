@@ -9,9 +9,33 @@
 #include <ucontext.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <dlfcn.h>
 #include "so_util.h"
 #include "imports.h"
 #include "jni_shim.h"
+/* BRIDGE stdio bionic: __sF[3] (stdin/out/err) do bionic tem layout != glibc. Forneco um
+   array marcador + intercepto fprintf/fputs/etc pra mapear &__sF[i] -> stream real do glibc.
+   Assim o LOG de erro da Unity (que vai pro stderr bionic) aparece. */
+static char g_sf[3*84+16];
+static FILE *sf_map(FILE *fp){ uintptr_t p=(uintptr_t)fp,b=(uintptr_t)g_sf;
+  if(p>=b && p<b+sizeof(g_sf)){ int i=(int)((p-b)/84); return i<=0?stdin:(i==1?stdout:stderr); } return fp; }
+static int my_fprintf(FILE*fp,const char*fmt,...){ va_list ap; va_start(ap,fmt); int r=vfprintf(sf_map(fp),fmt,ap); va_end(ap); return r; }
+static int my_vfprintf(FILE*fp,const char*fmt,va_list ap){ return vfprintf(sf_map(fp),fmt,ap); }
+static int my_fputs(const char*str,FILE*fp){ return fputs(str,sf_map(fp)); }
+static size_t my_fwrite(const void*p,size_t a,size_t b,FILE*fp){ return fwrite(p,a,b,sf_map(fp)); }
+static int my_fputc(int c,FILE*fp){ return fputc(c,sf_map(fp)); }
+static int my_fflush(FILE*fp){ return fflush(fp?sf_map(fp):NULL); }
+/* loga dlopen/dlsym -> ve se a engine tenta carregar libmono (Mono runtime C#) */
+static char g_dl_self; /* sentinela do handle global/self */
+static void *my_dlopen(const char *nm,int flag){
+  if(!nm||!nm[0]||strstr(nm,"libc")||strstr(nm,"libunity")||strstr(nm,"libmain")||strstr(nm,"libmono")){
+    fprintf(stderr,"[DLOPEN] \"%s\" -> SELF\n",nm?nm:"(null)"); return &g_dl_self; }
+  void *h=dlopen(nm,flag); fprintf(stderr,"[DLOPEN] \"%s\" -> %p\n",nm,h); return h?h:&g_dl_self; }
+static void *my_dlsym(void *h,const char *nm){ void *p=0;
+  fprintf(stderr,"[DLSYM?] %s\n",nm?nm:"?"); fflush(stderr);
+  if(h==&g_dl_self){ p=(void*)so_find_addr_safe(nm); if(!p) p=dlsym(RTLD_DEFAULT,nm); }
+  else p=dlsym(h,nm);
+  fprintf(stderr,"[DLSYM=] %s -> %p\n",nm?nm:"?",p); return p; }
 extern void *text_virtbase;
 extern void re4_fill(void);
 extern void recon_wire_pthread(void (*)(const char *, void *));
@@ -46,9 +70,13 @@ static int my_alog_print(int prio,const char*tag,const char*fmt,...){ va_list ap
 static int my_alog_write(int prio,const char*tag,const char*msg){ fprintf(stderr,"[ALOG:%d %s] %s\n",prio,tag?tag:"?",msg?msg:""); return 0; }
 static int my_alog_vprint(int prio,const char*tag,const char*fmt,va_list ap){ fprintf(stderr,"[ALOG:%d %s] ",prio,tag?tag:"?"); vfprintf(stderr,fmt,ap); fprintf(stderr,"\n"); return 0; }
 /* bloqueia o engine de instalar handler de crash p/ SIGSEGV/ABRT/etc -> MEU handler pega o crash REAL */
-static int my_sigaction(int sig,const void*act,void*old){ (void)act;(void)old;
-  if(sig==SIGSEGV||sig==SIGABRT||sig==SIGILL||sig==SIGBUS||sig==SIGFPE){ fprintf(stderr,"[SIGACT] engine quis handler sig %d -> IGNORADO\n",sig); return 0; }
-  return sigaction(sig,(const struct sigaction*)act,(struct sigaction*)old); }
+static int my_sigaction(int sig,const void*act,void*old){ (void)old;
+  if(!act) return sigaction(sig,NULL,NULL);
+  void *h=*(void* const*)act; /* sa_handler/sa_sigaction @ offset 0 (bionic==glibc) */
+  struct sigaction g; memset(&g,0,sizeof g);
+  g.sa_sigaction=(void(*)(int,siginfo_t*,void*))h; sigemptyset(&g.sa_mask); g.sa_flags=SA_SIGINFO|SA_RESTART;
+  static int sn=0; if(sn++<12) fprintf(stderr,"[SIGACT] sig=%d handler=%p (struct bionic->glibc)\n",sig,h);
+  return sigaction(sig,&g,NULL); }
 /* intercepta abort/raise/pthread_kill: loga o caller (engine) + NAO mata -> vejo o pos-fatal */
 static int my_raise(int sig){ fprintf(stderr,"[RAISE] sig=%d caller=unity+0x%lx -> IGNORADO\n",sig,(unsigned long)__builtin_return_address(0)-(unsigned long)text_virtbase); return 0; }
 static void my_abort(void){ fprintf(stderr,"[ABORT] caller=unity+0x%lx -> IGNORADO\n",(unsigned long)__builtin_return_address(0)-(unsigned long)text_virtbase); }
@@ -64,13 +92,13 @@ static void on_segv(int sig, siginfo_t *si, void *uc_){
   FILE *m=fopen("/proc/self/maps","r"); char ln[300];
   while(m && fgets(ln,sizeof ln,m)){ unsigned long a,b; if(sscanf(ln,"%lx-%lx",&a,&b)==2 && pc>=a && pc<b){ fprintf(stderr,"[SEGV-LIB] %s",ln); break; } }
   if(m) fclose(m);
+  static int sc=0; if(sc++) _exit(139);
   fprintf(stderr,"[REGS] r0=0x%lx r1=0x%lx r2=0x%lx r3=0x%lx r4=0x%lx\n",
     uc->uc_mcontext.arm_r0,uc->uc_mcontext.arm_r1,uc->uc_mcontext.arm_r2,uc->uc_mcontext.arm_r3,uc->uc_mcontext.arm_r4);
   unsigned long sp=uc->uc_mcontext.arm_sp;
-  fprintf(stderr,"[STACK->unity] ");
-  for(int k=0;k<128;k++){ unsigned long v=*(unsigned long*)(sp+k*4);
-    if(v>=base && v<base+0x2000000) fprintf(stderr,"unity+0x%lx ",v-base); }
-  fprintf(stderr,"\n");
+  fprintf(stderr,"[BACKTRACE unity frames sp..+8k]\n");
+  for(int k=0;k<2048;k++){ unsigned long v=*(unsigned long*)(sp+k*4);
+    if(v>=base && v<base+0x2000000) fprintf(stderr,"  unity+0x%lx\n",v-base); }
   _exit(139);
 }
 int main(void){
@@ -89,10 +117,19 @@ int main(void){
   re4_set_import("__android_log_print",(void*)my_alog_print);
   re4_set_import("__android_log_write",(void*)my_alog_write);
   re4_set_import("__android_log_vprint",(void*)my_alog_vprint);
-  re4_set_import("sigaction",(void*)my_sigaction);
   re4_set_import("abort",(void*)my_abort);
   re4_set_import("raise",(void*)my_raise);
   re4_set_import("pthread_kill",(void*)my_ptkill);
+  re4_set_import("sigaction",(void*)my_sigaction);
+  re4_set_import("dlopen",(void*)my_dlopen);
+  re4_set_import("dlsym",(void*)my_dlsym);
+  re4_set_import("__sF",(void*)g_sf);
+  re4_set_import("fprintf",(void*)my_fprintf);
+  re4_set_import("vfprintf",(void*)my_vfprintf);
+  re4_set_import("fputs",(void*)my_fputs);
+  re4_set_import("fwrite",(void*)my_fwrite);
+  re4_set_import("fputc",(void*)my_fputc);
+  re4_set_import("fflush",(void*)my_fflush);
   so_resolve(dynlib_functions,dynlib_numfunctions,0); so_finalize();
   so_execute_init_array();
   fprintf(stderr,"[A] engine init OK (372 ctors)\n");
