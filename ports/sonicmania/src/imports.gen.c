@@ -18,6 +18,8 @@
 
 // === passthrough/pthread/shim: ligados automaticamente ===
 DynLibFunction dynlib_functions[] = {
+  {"glBufferData", (uintptr_t)&my_glBufferData},
+  {"glCreateShader", (uintptr_t)&my_glCreateShader},
   {"glGenBuffers", (uintptr_t)&my_glGenBuffers},
   {"glGenFramebuffers", (uintptr_t)&my_glGenFramebuffers},
   {"__errno", (uintptr_t)&__errno},
@@ -110,7 +112,7 @@ DynLibFunction dynlib_functions[] = {
   {"ftell", (uintptr_t)&ftell},  // pass
   {"fwrite", (uintptr_t)&fwrite},  // pass
   // TODO {"getauxval", (uintptr_t)&stub_getauxval},  // <<< IMPLEMENTAR
-  {"glActiveTexture", (uintptr_t)&glActiveTexture},  // gles
+  {"glActiveTexture", (uintptr_t)&my_glActiveTexture},  // gles
   {"glBindTexture", (uintptr_t)&my_glBindTexture},  // gles
   {"glClear", (uintptr_t)&my_glClear},  // gles
   {"glClearColor", (uintptr_t)&glClearColor},  // gles

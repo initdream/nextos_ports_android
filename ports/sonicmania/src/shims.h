@@ -52,4 +52,6 @@ int *__errno(void); size_t __strlen_chk(const char *, size_t); int __read_chk(in
 int __system_property_get(const char *, char *); void android_set_abort_message(const char *);
 int AInputEvent_getDeviceId(void *); int AMotionEvent_getButtonState(void *); extern void *__sF;
 void my_glGenTextures(); void my_glBindTexture(); void my_glTexImage2D(); void my_glGenFramebuffers(); void my_glGenBuffers();
+unsigned my_glCreateShader(); void my_glActiveTexture(); void my_glBufferData();
+void my_glTexSubImage2D();
 #endif

@@ -5,10 +5,8 @@
 
 static int nd, nf, np, ns, nc;
 
-void my_glDrawArrays(GLenum m, GLint f, GLsizei c) {
-  if (nd++ < 12) fprintf(stderr, "[GL] DrawArrays mode=%d count=%d err=0x%x\n", m, c, glGetError());
-  glDrawArrays(m, f, c);
-}
+int g_drawcount = 0;
+void my_glDrawArrays(GLenum m, GLint f, GLsizei c) { g_drawcount++; glDrawArrays(m, f, c); }
 void my_glDrawElements(GLenum m, GLsizei c, GLenum t, const void *i) {
   if (nd++ < 12) fprintf(stderr, "[GL] DrawElements count=%d err=0x%x\n", c, glGetError());
   glDrawElements(m, c, t, i);
@@ -47,3 +45,17 @@ void my_glBindTexture(GLenum tg, GLuint tex) { static int c; if (c++ < 10) fprin
 void my_glTexImage2D(GLenum tg, GLint l, GLint ifmt, GLsizei w, GLsizei h, GLint b, GLenum f, GLenum ty, const void *p) { fprintf(stderr, "[GL] TexImage2D %dx%d ifmt=0x%x f=0x%x\n", w, h, ifmt, f); glTexImage2D(tg, l, ifmt, w, h, b, f, ty, p); }
 void my_glGenFramebuffers(GLsizei n, GLuint *fb) { fprintf(stderr, "[GL] GenFramebuffers n=%d\n", n); glGenFramebuffers(n, fb); }
 void my_glGenBuffers(GLsizei n, GLuint *b) { fprintf(stderr, "[GL] GenBuffers n=%d\n", n); glGenBuffers(n, b); }
+
+unsigned my_glCreateShader(GLenum t) { unsigned s = glCreateShader(t); fprintf(stderr, "[GL] CreateShader type=0x%x -> %u\n", t, s); return s; }
+void my_glActiveTexture(GLenum t) { static int c; if (c++ < 4) fprintf(stderr, "[GL] ActiveTexture 0x%x\n", t); glActiveTexture(t); }
+void my_glBufferData(GLenum tg, GLsizeiptr sz, const void *d, GLenum u) { fprintf(stderr, "[GL] BufferData sz=%ld\n", (long)sz); glBufferData(tg, sz, d, u); }
+
+void my_glTexSubImage2D(GLenum tg, GLint l, GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLenum ty, const void *p) {
+  static int c=0;
+  if (c++<3 && p) {
+    const unsigned char *b=p; long nz=0,n=(long)w*h*4;
+    for (long i=0;i<n;i++) if (b[i]>10) nz++;
+    fprintf(stderr, "[GL] TexSubImage2D %dx%d fmt=0x%x  NAO-PRETO=%ld/%ld\n", w,h,f, nz, n);
+  }
+  glTexSubImage2D(tg,l,x,y,w,h,f,ty,p);
+}

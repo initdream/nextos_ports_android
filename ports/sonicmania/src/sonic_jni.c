@@ -150,15 +150,17 @@ void jni_run(void) {
               int, int, int, int, int, int, int, int))se)(
       fake_env, fake_thiz, 1280, 720, fake_thiz, g_datapath, 0, fake_thiz,
       1280, 720, 424, 240, 60, 1, 0, 0);
-  fprintf(stderr, "[drv] startEngine retornou; entrando no loop step\n");
+  fprintf(stderr, "[drv] startEngine retornou\n");
+  uintptr_t sgr = so_find_addr_safe("Java_com_netflix_NGP_SonicMania_MainActivity_setGameRunning");
+  if (sgr) { fprintf(stderr, "[drv] setGameRunning(1)\n"); ((void(*)(void*,void*,int))sgr)(fake_env, fake_thiz, 1); }
+  fprintf(stderr, "[drv] entrando no loop step\n");
   for (long f = 0; st; f++) {
     SDL_Event ev;
     while (SDL_PollEvent(&ev))
       if (ev.type == SDL_QUIT) return;
-    glClearColor(0.0f, 0.0f, 1.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    ((void (*)(void *, void *, int, int))st)(fake_env, fake_thiz, 1280, 720);
-    if (f < 3) fprintf(stderr, "[loop] frame %ld glErr=0x%x\n", f, glGetError());
+    ((void (*)(void *, void *, float))st)(fake_env, fake_thiz, 60.0f);
+    { extern int g_drawcount; static int last=0;
+      if (f%30==0) { fprintf(stderr, "[loop] frame %ld draws=%d (+%d) glErr=0x%x\n", f, g_drawcount, g_drawcount-last, glGetError()); last=g_drawcount; } }
     SDL_GL_SwapWindow(g_win);
   }
 }
