@@ -76,6 +76,25 @@ static void *my_mono_valloc(void *addr,size_t size,int flags,int type){ (void)ty
   if(size>256UL*1024*1024){ fprintf(stderr,"[VALLOC-CLAMP] %zu -> 256MB\n",size); size=256UL*1024*1024; }
   int prot=0; if(flags&1)prot|=PROT_READ; if(flags&2)prot|=PROT_WRITE; if(flags&4)prot|=PROT_EXEC;
   void *p=mmap(0,size,prot?prot:PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0); return p==MAP_FAILED?0:p; }
+/* getter do jit_tls (libmono+0x1a6a8) asserta se a thread nao foi atachada ao Mono.
+   Hook + trampolim: atacha a thread (1x) e roda o getter original. */
+static void* (*g_orig_jitgetter)(void)=0;
+static void* (*g_grd_fn)(void)=0; static void (*g_jatt_fn)(void*)=0;
+static __thread int g_jit_attached=0;
+static void* my_jit_tls_getter(void){
+  static int ent=0; if(ent++<6){ fprintf(stderr,"[JITTLS] getter chamado #%d attached=%d tid=%p\n",ent,g_jit_attached,(void*)pthread_self()); fflush(stderr); }
+  if(!g_jit_attached){ g_jit_attached=1;
+    void* d = g_grd_fn?g_grd_fn():0;
+    if(d && g_jatt_fn){ g_jatt_fn(d); fprintf(stderr,"[JITTLS] thread atachada d=%p tid=%p\n",d,(void*)pthread_self()); fflush(stderr); }
+    else { fprintf(stderr,"[JITTLS] sem attach (d=%p jatt=%p)\n",d,(void*)g_jatt_fn); fflush(stderr); }
+  }
+  return g_orig_jitgetter?g_orig_jitgetter():0;
+}
+/* handler de assert do Mono (libmono+0x2bcf90): r0=arquivo r1=linha. Loga e NAO aborta. */
+static void my_assert_handler(const char* file, int line, const char* a, const char* b){ (void)a;(void)b;
+  static int n=0; if(n++<60){ fprintf(stderr,"[ASSERT-SKIP] %s:%d\n", file?file:"?", line); fflush(stderr); }
+}
+static uintptr_t g_mono_base=0, g_unity_base=0;
 extern void *text_virtbase;
 extern void re4_fill(void);
 extern void recon_wire_pthread(void (*)(const char *, void *));
@@ -103,7 +122,7 @@ static int sh_key_create(pthread_key_t *k, void(*d)(void*)){ static int kc=0; if
   int n=g_slot_next++; pthread_mutex_unlock(&g_slot_mtx); if(n>=NSLOT) return 11; *k=(pthread_key_t)n; return 0; }
 static int sh_key_delete(pthread_key_t k){ fprintf(stderr,"[TLS] key_delete %d (no-op)\n",(int)k); return 0; }
 static void *sh_getspecific(pthread_key_t k){ if((int)k<=0||(int)k>=NSLOT){ static int g=0; if(g++<30)fprintf(stderr,"[TLS-GET-BADKEY] k=%d tid=%ld\n",(int)k,(long)pthread_self()); return NULL; } void**arr=tls_slots(); void*v=arr[(int)k]; if(!v){static int g2=0; if(g2++<999)fprintf(stderr,"[TLS-GET-NULL] k=%d tid=%p arr=%p\n",(int)k,(void*)pthread_self(),(void*)arr);} return v; }
-static int sh_setspecific(pthread_key_t k, const void *v){ if((int)k<=0||(int)k>=NSLOT) return 22; void**arr=tls_slots(); if(v){static int st=0; if(st++<40)fprintf(stderr,"[TLS-SET] k=%d v=%p tid=%p arr=%p\n",(int)k,v,(void*)pthread_self(),(void*)arr);} arr[(int)k]=(void*)v; return 0; }
+static int sh_setspecific(pthread_key_t k, const void *v){ if((int)k<=0||(int)k>=NSLOT) return 22; void**arr=tls_slots(); if(v){static int st=0; if(st++<2000)fprintf(stderr,"[TLS-SET] k=%d v=%p tid=%p arr=%p\n",(int)k,v,(void*)pthread_self(),(void*)arr);} arr[(int)k]=(void*)v; return 0; }
 /* __android_log REAL -> stderr (sem isso, o erro do engine antes do abort some) */
 static int my_alog_print(int prio,const char*tag,const char*fmt,...){ va_list ap; va_start(ap,fmt);
   fprintf(stderr,"[ALOG:%d %s] ",prio,tag?tag:"?"); vfprintf(stderr,fmt,ap); fprintf(stderr,"\n"); va_end(ap); return 0; }
@@ -189,7 +208,16 @@ int main(void){
         a=so_find_addr_safe("mono_exception_from_name_two_strings"); if(a)hook_arm64(a,(uintptr_t)hook_exc_two);
         a=so_find_addr_safe("mono_exception_from_name"); if(a)hook_arm64(a,(uintptr_t)hook_exc_name);
         a=so_find_addr_safe("mono_valloc"); if(a)hook_arm64(a,(uintptr_t)my_mono_valloc);
-        a=so_find_addr_safe("mono_pagesize"); if(a){hook_arm64(a,(uintptr_t)my_mono_pagesize); fprintf(stderr,"[HOOK] mono_pagesize -> 4096\n");} so_flush_caches(); }
+        a=so_find_addr_safe("mono_pagesize"); if(a){hook_arm64(a,(uintptr_t)my_mono_pagesize); fprintf(stderr,"[HOOK] mono_pagesize -> 4096\n");}
+        { uintptr_t ps=so_find_addr_safe("mono_pagesize"); uintptr_t base=ps-0x29d7e4; uintptr_t gt=base+0x1a6a8;
+          g_mono_base=base;
+          g_grd_fn=(void*)so_find_addr_safe("mono_get_root_domain"); g_jatt_fn=(void*)so_find_addr_safe("mono_jit_thread_attach");
+          unsigned char*tr=(unsigned char*)mmap(0,32,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+          if(tr!=MAP_FAILED){ memcpy(tr,(void*)gt,8); *(uint32_t*)(tr+8)=0xe51ff004u; *(uint32_t*)(tr+12)=(uint32_t)(gt+8);
+            __builtin___clear_cache((char*)tr,(char*)tr+16); g_orig_jitgetter=(void*(*)(void))tr;
+            hook_arm64(gt,(uintptr_t)my_jit_tls_getter); fprintf(stderr,"[HOOK] jit_tls getter @0x1a6a8 base=%p tramp=%p\n",(void*)base,(void*)tr); }
+          hook_arm64(base+0x2bcfdc,(uintptr_t)my_assert_handler); fprintf(stderr,"[HOOK] assert handler @0x2bcfdc (g_log fatal, nao-fatal)\n"); }
+        so_flush_caches(); }
       so_finalize(); so_execute_init_array(); g_m_mono=so_save(); fprintf(stderr,"[MONO] libmono carregado+init OK\n"); }
     else fprintf(stderr,"[MONO] FALHOU carregar libmono\n"); }
   so_use(g_m_unity);
@@ -210,6 +238,17 @@ int main(void){
   if((fn=N("nativeSendSurfaceChangedEvent"))) ((void(*)(void*,void*))fn)(env,&t);
   if((fn=N("nativeFocusChanged"))) ((void(*)(void*,void*,int))fn)(env,&t,1);
   fprintf(stderr,"[E] lifecycle OK -> nativeRender loop\n");
+  /* ATTACH da thread ao Mono -> seta o jit_tls (senao assert mini.c:2215) */
+  { so_module*c=so_save(); so_use(g_m_mono);
+    void*(*grd)(void)=(void*)so_find_addr_safe("mono_get_root_domain");
+    void*(*att)(void*)=(void*)so_find_addr_safe("mono_thread_attach");
+    void*(*jatt)(void*)=(void*)so_find_addr_safe("mono_jit_thread_attach");
+    so_use(c); free(c);
+    void *d = grd?grd():NULL;
+    fprintf(stderr,"[MONO] root_domain=%p att=%p jatt=%p\n",d,(void*)att,(void*)jatt);
+    if(d && jatt){ void*th=jatt(d); fprintf(stderr,"[MONO] jit_thread_attach -> %p\n",th); }
+    else if(d && att){ void*th=att(d); fprintf(stderr,"[MONO] thread_attach -> %p\n",th); }
+  }
   void *render=N("nativeRender");
   for(int f=0; render && f<1200; f++){
     ((unsigned char(*)(void*,void*))render)(env,&t);
