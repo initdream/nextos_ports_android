@@ -35,7 +35,6 @@ static int *bionic_errno(void){return __errno_location();}
 /* liblog (Android) não existe no glibc -> stubs p/ stderr */
 static int __android_log_print(int p,const char*t,const char*f,...){(void)p;(void)t;(void)f;return 0;}
 static int __android_log_write(int p,const char*t,const char*m){(void)p;fprintf(stderr,"[ALOG:%s] %s\n",t?t:"",m?m:"");return 0;}
-static void android_set_abort_message(const char*m){fprintf(stderr,"[abort] %s\n",m?m:"");}
 // imports.gen.c — GERADO por new-port.sh para 'dusklight' (libmain.so)
 // 525 simbolos. Resolva os UNKNOWN no fim do arquivo.
 #include "imports.h"

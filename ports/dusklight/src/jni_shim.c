@@ -462,8 +462,11 @@ void jni_shim_init(void **out_vm, void **out_env) {
               &jni_env_ptr);
 }
 
-/* ---- F0: VM mínima p/ JNI_OnLoad (jni_shim_get_vm). Em fases futuras vira
- * JNIInvokeInterface* real (GetEnv/AttachCurrentThread) p/ o SDL3-Android. ---- */
-static void *g_fake_vm_tbl[8];   /* JNIInvokeInterface: slots de função (zerados) */
-static void *g_fake_vm = g_fake_vm_tbl;
-void *jni_shim_get_vm(void) { return &g_fake_vm; }
+/* jni_shim_get_vm — usa a VM REAL do template (jni_shim_init monta as vtables
+ * com vm_GetEnv/AttachCurrentThread + o JNIEnv completo). JNI_OnLoad chama
+ * vm->GetEnv (idx 6) → vm_GetEnv → fake env. */
+void *jni_shim_get_vm(void) {
+  static void *vm = NULL;
+  if (!vm) jni_shim_init(&vm, NULL);
+  return vm;
+}

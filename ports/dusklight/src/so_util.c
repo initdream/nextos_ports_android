@@ -241,6 +241,20 @@ int so_load(const char *filename, void *base, size_t max_size) {
          (void *)((uintptr_t)so_base + prog_hdr[data_segno].p_offset),
          prog_hdr[data_segno].p_filesz);
 
+  /* Copiar TODOS os outros PT_LOAD (NDK moderno gera >2 segmentos; o
+   * .init_array/RELRO estava num segmento NÃO-copiado -> slots zerados ->
+   * init_array todo = base+0). (proven reVC: "mapear TODOS"). */
+  for (int s = 0; s < elf_hdr->e_phnum; s++) {
+    if (prog_hdr[s].p_type != PT_LOAD) continue;
+    if (s == text_segno || s == data_segno) continue;
+    void *dst = (void *)(prog_hdr[s].p_vaddr + (Elf64_Addr)load_base);
+    memcpy(dst, (void *)((uintptr_t)so_base + prog_hdr[s].p_offset),
+           prog_hdr[s].p_filesz);
+    debugPrintf("so_load: copiado PT_LOAD[%d] vaddr=0x%lx filesz=0x%lx\n", s,
+                (unsigned long)prog_hdr[s].p_vaddr,
+                (unsigned long)prog_hdr[s].p_filesz);
+  }
+
   syms = NULL;
   dynstrtab = NULL;
 
@@ -298,6 +312,26 @@ int so_relocate(void) {
         default:
           fatal_error("Error: unknown relocation type: %x\n", type);
           break;
+        }
+      }
+    }
+    /* RELR (.relr.dyn / ANDROID_RELR): formato compacto de relocations RELATIVE
+     * que clang/NDK moderno usa p/ vtables/ponteiros internos. SEM isso, função-
+     * ptrs ficam = offset cru (não text_base+offset) -> blr p/ endereço errado. */
+    else if (strcmp(sh_name, ".relr.dyn") == 0) {
+      uintptr_t *relr = (uintptr_t *)((uintptr_t)text_base + sec_hdr[i].sh_addr);
+      size_t n = sec_hdr[i].sh_size / sizeof(uintptr_t);
+      uintptr_t base = (uintptr_t)text_virtbase;
+      uintptr_t *where = NULL;
+      for (size_t k = 0; k < n; k++) {
+        uintptr_t e = relr[k];
+        if ((e & 1) == 0) {            /* endereço: aplica 1 reloc + avança */
+          where = (uintptr_t *)(base + e);
+          *where++ += base;
+        } else {                      /* bitmap dos próximos 63 words */
+          for (int b = 0; (e >>= 1) != 0; b++)
+            if (e & 1) where[b] += base;
+          where += 63;
         }
       }
     }
@@ -361,9 +395,17 @@ void so_execute_init_array(void) {
     if (strcmp(sh_name, ".init_array") == 0) {
       int (**init_array)() =
           (void *)((uintptr_t)text_virtbase + sec_hdr[i].sh_addr);
-      for (int j = 0; j < (int)(sec_hdr[i].sh_size / 8); j++) {
-        if (init_array[j] != 0)
-          init_array[j]();
+      int cnt = (int)(sec_hdr[i].sh_size / 8);
+      for (int j = 0; j < cnt; j++) {
+        uintptr_t fn = (uintptr_t)init_array[j];
+        if (j < 6)
+          debugPrintf("init_array[%d/%d] = %p (off 0x%lx)\n", j, cnt, (void *)fn,
+                      (unsigned long)(fn - (uintptr_t)text_virtbase));
+        if (fn == 0 || fn == (uintptr_t)text_virtbase) {
+          debugPrintf("init_array[%d] = base+0/NULL -> PULANDO\n", j);
+          continue;
+        }
+        init_array[j]();
       }
     }
   }

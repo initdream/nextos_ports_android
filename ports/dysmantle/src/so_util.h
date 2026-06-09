@@ -40,4 +40,11 @@ DynLibFunction *so_find_import(DynLibFunction *funcs, int num_funcs,
 void so_finalize(void);
 int so_unload(void);
 
+// Harvest de todos os símbolos DEFINIDOS (GLOBAL/WEAK) do módulo atualmente
+// carregado, num array {nome, addr}. Usado para expor um módulo (ex.
+// libc++_shared.so) como provedor de símbolos para outro carregado depois.
+// O array é malloc'd; os nomes apontam para o .dynstr do módulo (que permanece
+// mapeado). Devolve o array e escreve a contagem em *out_count.
+DynLibFunction *so_snapshot_symbols(int *out_count);
+
 #endif

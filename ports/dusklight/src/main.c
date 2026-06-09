@@ -37,6 +37,7 @@ static volatile int recovery_streak = 0;
 // Try to recover from a sentinel-pointer crash by decoding the ARM64
 // instruction at the crash PC and skipping it.  Returns 1 if recovered.
 static int try_skip_sentinel_crash(ucontext_t *uc, uintptr_t fault_addr) {
+  if (getenv("DUSK_NOSKIP")) return 0;
   uintptr_t pc = uc->uc_mcontext.pc;
   uintptr_t text = (uintptr_t)text_base;
 
@@ -286,6 +287,7 @@ static int padScheme_updateDown_safe(void *self, unsigned int buttonId) {
 }
 
 int main(int argc, char *argv[]) {
+  setvbuf(stdout, NULL, _IONBF, 0); setvbuf(stderr, NULL, _IONBF, 0);
   install_crash_handler();
 
   // Default: BUKA OBB (Russian, has all assets).
