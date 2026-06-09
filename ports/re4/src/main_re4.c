@@ -11,6 +11,8 @@
 #include <stdarg.h>
 #include <dlfcn.h>
 #include <pwd.h>
+#include <errno.h>
+#include <unistd.h>
 #include "so_util.h"
 #include "imports.h"
 #include "jni_shim.h"
@@ -48,6 +50,24 @@ static struct passwd *my_getpwuid(unsigned u){ (void)u; g_pw.pw_name=(char*)"use
 static const char *my_dlerror(void){ return 0; } /* sem erro -> evita _dl_exception_create */
 static int my_dladdr(const void *a,void *info){ (void)a;(void)info; return 0; }
 static int my_dlclose(void *h){ (void)h; return 0; }
+/* hooks pra VER a excecao que o Mono lanca (antes do throw crashar) */
+static void hook_exc_msg(void *img,const char *ns,const char *name,const char *msg){ (void)img;
+  fprintf(stderr,"\n*** [MONO-EXC] %s.%s : %s ***\n",ns?ns:"?",name?name:"?",msg?msg:"(sem msg)"); fflush(stderr); _exit(42); }
+static void hook_exc_two(void *img,const char *ns,const char *name,const char *m1,const char *m2){ (void)img;(void)m2;
+  fprintf(stderr,"\n*** [MONO-EXC2] %s.%s : %s ***\n",ns?ns:"?",name?name:"?",m1?m1:"?"); fflush(stderr); _exit(42); }
+static void hook_exc_name(void *img,const char *ns,const char *name){ (void)img;
+  fprintf(stderr,"\n*** [MONO-EXC-N] %s.%s ***\n",ns?ns:"?",name?name:"?"); fflush(stderr); _exit(42); }
+/* loga mmap/mprotect EXEC + falhas -> ve a alocacao de exec-mem do JIT que da NULL */
+static void *my_mmap(void *a,size_t l,int prot,int flags,int fd,long off){
+  if(l>1024UL*1024*1024){ fprintf(stderr,"[MMAP-BIG] %zu + NORESERVE\n",l); flags|=0x4000; a=0; } /* MAP_NORESERVE: nao reserva, commit sob demanda */
+  void *p=mmap(a,l,prot,flags,fd,off);
+  if((prot&PROT_EXEC)||p==MAP_FAILED){ static int n=0; if(n++<60) fprintf(stderr,"[MMAP] len=%zu prot=0x%x flags=0x%x -> %p\n",l,prot,flags,p==MAP_FAILED?(void*)-1:p); } return p; }
+static int my_mprotect(void *a,size_t l,int prot){ int r=mprotect(a,l,prot);
+  if(prot&PROT_EXEC){ static int n=0; if(n++<60) fprintf(stderr,"[MPROT-X] %p len=%zu prot=0x%x -> %d(%s)\n",a,l,prot,r,r?strerror(errno):"ok"); } return r; }
+/* sysconf(_SC_PHYS_PAGES)=0 no so-loader -> Mono faz 0-used=negativo=3.8GB. Damos 512MB. */
+static long my_sysconf(int name){ long r=sysconf(name);
+  if((name==_SC_PHYS_PAGES||name==_SC_AVPHYS_PAGES) && r<=0){ long ps=sysconf(_SC_PAGESIZE); if(ps<=0)ps=4096;
+    r=(512L*1024*1024)/ps; fprintf(stderr,"[SYSCONF] name=%d 0->%ld (512MB)\n",name,r); } return r; }
 extern void *text_virtbase;
 extern void re4_fill(void);
 extern void recon_wire_pthread(void (*)(const char *, void *));
@@ -116,7 +136,7 @@ static void on_segv(int sig, siginfo_t *si, void *uc_){
 int main(void){
   struct sigaction sa; memset(&sa,0,sizeof sa); sa.sa_sigaction=on_segv; sa.sa_flags=SA_SIGINFO; sigaction(SIGSEGV,&sa,0); sigaction(SIGBUS,&sa,0);
   fprintf(stderr,"=== RE4 Unity 2018 (ARM32 GLES2) ===\n");
-  size_t hs=192*1024*1024;
+  size_t hs=48*1024*1024;
   void *heap=mmap(NULL,hs,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
   if(heap==MAP_FAILED){perror("mmap");return 1;}
   if(so_load(SO_NAME,heap,hs)<0){fprintf(stderr,"load FALHOU\n");return 1;}
@@ -140,6 +160,9 @@ int main(void){
   re4_set_import("dlerror",(void*)my_dlerror);
   re4_set_import("dladdr",(void*)my_dladdr);
   re4_set_import("dlclose",(void*)my_dlclose);
+  re4_set_import("mmap",(void*)my_mmap);
+  re4_set_import("mprotect",(void*)my_mprotect);
+  re4_set_import("sysconf",(void*)my_sysconf);
   re4_set_import("__sF",(void*)g_sf);
   re4_set_import("fprintf",(void*)my_fprintf);
   re4_set_import("vfprintf",(void*)my_vfprintf);
@@ -151,8 +174,12 @@ int main(void){
   so_execute_init_array();
   fprintf(stderr,"[A] engine init OK (372 ctors)\n");
   g_m_unity=so_save();
-  { size_t msz=48*1024*1024; void *mh=mmap(NULL,msz,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-    if(mh!=MAP_FAILED && so_load("libmono.so",mh,msz)>=0){ so_relocate(); so_resolve(dynlib_functions,dynlib_numfunctions,0); so_finalize(); so_execute_init_array(); g_m_mono=so_save(); fprintf(stderr,"[MONO] libmono carregado+init OK\n"); }
+  { size_t msz=24*1024*1024; void *mh=mmap(NULL,msz,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    if(mh!=MAP_FAILED && so_load("libmono.so",mh,msz)>=0){ so_relocate(); so_resolve(dynlib_functions,dynlib_numfunctions,0);
+      { uintptr_t a; a=so_find_addr_safe("mono_exception_from_name_msg"); if(a)hook_arm64(a,(uintptr_t)hook_exc_msg);
+        a=so_find_addr_safe("mono_exception_from_name_two_strings"); if(a)hook_arm64(a,(uintptr_t)hook_exc_two);
+        a=so_find_addr_safe("mono_exception_from_name"); if(a)hook_arm64(a,(uintptr_t)hook_exc_name); so_flush_caches(); }
+      so_finalize(); so_execute_init_array(); g_m_mono=so_save(); fprintf(stderr,"[MONO] libmono carregado+init OK\n"); }
     else fprintf(stderr,"[MONO] FALHOU carregar libmono\n"); }
   so_use(g_m_unity);
   void *vm=NULL,*env=NULL; jni_shim_init(&vm,&env);

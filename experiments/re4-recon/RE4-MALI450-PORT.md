@@ -107,3 +107,25 @@ Frente nova e funda (interna do runtime C#). Muito alem do HK (que nem passou do
 ### Infra (main_re4.c) p/ continuar
 multi-modulo (g_m_unity+g_m_mono), bridges: pthread+TLS+stdio+dl+sigaction(bionic->glibc), __android_log
 real, segv handler gdb-friendly, getpwuid stub. Device: /storage/roms/re4-recon (re4boot+libunity+libmono+assets).
+
+## FASE 1b -- furamos ATE o GC do Mono (2026-06-09, sessao 3 cont.)
+SEQUENCIA (cada fix destravou o proximo, TUDO confirmado rodando):
+6. mmap absurdo: o Mono pede mmap de 3.8GB (0xE3A00000) e 973MB(RWX) -> falham -> buffer NULL
+   -> crash no CODE-GEN do JIT (str instrucao ARM em [r2=NULL] @ mono_arch +0x11e4).
+7. CAUSA: caller = mono_valloc (alocador VM do Mono). O 3.8GB = 0xE3A00000 = 4GB-454MB =
+   o GC do Mono reservando TODO o espaco de endereco restante (normal em 64-bit; IMPOSSIVEL
+   em processo 32-bit que ja tem so-loader+libunity+libmono+SDL+Mali).
+8. cap 256MB (tudo) -> code-gen PASSA (CRASH=0!) mas o GC usa o tamanho PEDIDO (3.8GB) ->
+   acessa alem dos 256MB -> core dump depois. Cap quebra o GC.
+9. Tentado SEM sucesso p/ o reserve do GC: cap (quebra GC), MAP_NORESERVE (espaco 32-bit nao
+   cabe 3.8GB mesmo sem reservar), GC env vars (GC_MAXIMUM_HEAP_SIZE/MONO_GC_PARAMS, sem efeito),
+   sysconf override (ig_sysconf NAO e chamado -> a memoria nao vem de sysconf), footprint reduzido.
+
+ESTADO: Unity+Mono RODAM, JIT inicializa, code-gen FUNCIONA (com cap), e o muro e o MODELO DE
+MEMORIA DO GC DO MONO em 32-bit (reserva ~3.6GB do espaco de endereco). Provavelmente arquitetural.
+
+PROXIMO PASSO PRECISO (frente nova focada): achar a fonte do underflow (memoria=0 -> 0-X=negativo
+-> 3.8GB) -- hookar o CALLER de mono_valloc + desmontar a logica de reserva do GC; OU descobrir a
+query de memoria que da 0 (NAO e sysconf); OU patchar a reserva do GC no libmono p/ pedir um
+tamanho fixo sano (ex: 256MB) E usar esse tamanho consistentemente. Alternativa: investigar se o
+libmono tem build sgen com max-heap configuravel por env que REALMENTE limite a reserva.

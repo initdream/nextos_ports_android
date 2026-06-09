@@ -8,6 +8,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <errno.h>
+#include <unistd.h>
 extern void egl_shim_ChooseConfig(void);
 extern void egl_shim_CreateContext(void);
 extern void egl_shim_CreatePbufferSurface(void);
@@ -53,7 +54,11 @@ static int cond_timedwait_rel(pthread_cond_t*c,pthread_mutex_t*m,const struct ti
 }
 static long noop(void){ return 0; }
 /* resolve um simbolo: bionic-shim > alias > dlsym > stub */
+static long ig_sysconf(int name){ long r=sysconf(name);
+  if((name==_SC_PHYS_PAGES||name==_SC_AVPHYS_PAGES)&&r<=0){ long ps=sysconf(_SC_PAGESIZE); if(ps<=0)ps=4096;
+    r=(512L*1024*1024)/ps; fprintf(stderr,"[SYSCONF] %d 0->%ld\n",name,r);} return r; }
 void *re4_resolve(const char *nm){
+  if(!strcmp(nm,"sysconf")) return (void*)&ig_sysconf;
   ctype_build();
   if(!strcmp(nm,"_ctype_")) return &g_ctype[1];
   if(!strcmp(nm,"_tolower_tab_")) return &g_tolower[1];
