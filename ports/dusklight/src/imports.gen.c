@@ -1,4 +1,10 @@
 #define _GNU_SOURCE
+#include <GLES2/gl2.h>
+#include <EGL/egl.h>
+extern int __cxa_atexit(void(*)(void*),void*,void*);
+extern void __cxa_finalize(void*);
+extern int __cxa_thread_atexit_impl(void(*)(void*),void*,void*);
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -12,6 +18,10 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <iconv.h>
+#include <sys/ioctl.h>
+#include <malloc.h>
+static int *bionic_errno(void){return __errno_location();}
 #include <locale.h>
 #include <signal.h>
 #include <setjmp.h>
@@ -30,9 +40,62 @@ static void android_set_abort_message(const char*m){fprintf(stderr,"[abort] %s\n
 // 525 simbolos. Resolva os UNKNOWN no fim do arquivo.
 #include "imports.h"
 #include "so_util.h"
+#include "opensles_shim.h"
+extern void __stack_chk_fail(void);
+/* SL_IID_*_shim: interface IDs (objetos) do opensles_shim */
+extern const void *SL_IID_ENGINE_shim, *SL_IID_PLAY_shim, *SL_IID_RECORD_shim,
+  *SL_IID_VOLUME_shim, *SL_IID_ANDROIDSIMPLEBUFFERQUEUE_shim;
+
 #include <stdio.h>
 
 // === passthrough/pthread/shim: ligados automaticamente ===
+
+/* extern decls dos _fake (def em pthread_fake.c) */
+extern long pthread_attr_destroy_fake();
+extern long pthread_attr_init_fake();
+extern long pthread_attr_setdetachstate_fake();
+extern long pthread_attr_setstacksize_fake();
+extern long pthread_cond_broadcast_fake();
+extern long pthread_cond_destroy_fake();
+extern long pthread_cond_init_fake();
+extern long pthread_cond_signal_fake();
+extern long pthread_cond_timedwait_fake();
+extern long pthread_cond_wait_fake();
+extern long pthread_create_fake();
+extern long pthread_detach_fake();
+extern long pthread_getschedparam_fake();
+extern long pthread_getspecific_fake();
+extern long pthread_join_fake();
+extern long pthread_key_create_fake();
+extern long pthread_key_delete_fake();
+extern long pthread_mutexattr_destroy_fake();
+extern long pthread_mutexattr_init_fake();
+extern long pthread_mutexattr_settype_fake();
+extern long pthread_mutex_destroy_fake();
+extern long pthread_mutex_init_fake();
+extern long pthread_mutex_lock_fake();
+extern long pthread_mutex_trylock_fake();
+extern long pthread_mutex_unlock_fake();
+extern long pthread_once_fake();
+extern long pthread_rwlock_destroy_fake();
+extern long pthread_rwlock_init_fake();
+extern long pthread_rwlock_rdlock_fake();
+extern long pthread_rwlock_tryrdlock_fake();
+extern long pthread_rwlock_trywrlock_fake();
+extern long pthread_rwlock_unlock_fake();
+extern long pthread_rwlock_wrlock_fake();
+extern long pthread_self_fake();
+extern long pthread_setschedparam_fake();
+extern long pthread_setspecific_fake();
+extern long pthread_sigmask_fake();
+extern long sem_destroy_fake();
+extern long sem_getvalue_fake();
+extern long sem_init_fake();
+extern long sem_post_fake();
+extern long sem_timedwait_fake();
+extern long sem_trywait_fake();
+extern long sem_wait_fake();
+
 DynLibFunction dynlib_functions[] = {
   {"abort", (uintptr_t)&abort},  // pass
   {"access", (uintptr_t)&access},  // pass
@@ -69,22 +132,22 @@ DynLibFunction dynlib_functions[] = {
   {"close", (uintptr_t)&close},  // pass
   {"closedir", (uintptr_t)&closedir},  // pass
   // TODO {"closelog", (uintptr_t)&stub_closelog},  // <<< IMPLEMENTAR
-  {"compress2", (uintptr_t)&compress2},  // pass
+  // [zlib runtime] {"compress2", (uintptr_t)&compress2},  // pass
   // TODO {"connect", (uintptr_t)&stub_connect},  // <<< IMPLEMENTAR
   // TODO {"copy_file_range", (uintptr_t)&stub_copy_file_range},  // <<< IMPLEMENTAR
   {"cos", (uintptr_t)&cos},  // pass
   {"cosf", (uintptr_t)&cosf},  // pass
   // TODO {"cosh", (uintptr_t)&stub_cosh},  // <<< IMPLEMENTAR
   // TODO {"coshf", (uintptr_t)&stub_coshf},  // <<< IMPLEMENTAR
-  {"crc32", (uintptr_t)&crc32},  // pass
+  // [zlib runtime] {"crc32", (uintptr_t)&crc32},  // pass
   // TODO {"__ctype_get_mb_cur_max", (uintptr_t)&stub___ctype_get_mb_cur_max},  // <<< IMPLEMENTAR
   {"__cxa_atexit", (uintptr_t)&__cxa_atexit},  // cxx
   {"__cxa_finalize", (uintptr_t)&__cxa_finalize},  // cxx
   {"__cxa_thread_atexit_impl", (uintptr_t)&__cxa_thread_atexit_impl},  // cxx
-  {"deflate", (uintptr_t)&deflate},  // pass
-  {"deflateEnd", (uintptr_t)&deflateEnd},  // pass
-  {"deflateInit2_", (uintptr_t)&deflateInit2_},  // pass
-  // TODO {"deflateReset", (uintptr_t)&stub_deflateReset},  // <<< IMPLEMENTAR
+  // [zlib runtime] {"deflate", (uintptr_t)&deflate},  // pass
+  // [zlib runtime] {"deflateEnd", (uintptr_t)&deflateEnd},  // pass
+  // [zlib runtime] {"deflateInit2_", (uintptr_t)&deflateInit2_},  // pass
+  // [zlib runtime] // TODO {"deflateReset", (uintptr_t)&stub_deflateReset},  // <<< IMPLEMENTAR
   // TODO {"dirfd", (uintptr_t)&stub_dirfd},  // <<< IMPLEMENTAR
   // TODO {"div", (uintptr_t)&stub_div},  // <<< IMPLEMENTAR
   // TODO {"dladdr", (uintptr_t)&stub_dladdr},  // <<< IMPLEMENTAR
@@ -96,7 +159,7 @@ DynLibFunction dynlib_functions[] = {
   {"dup", (uintptr_t)&dup},  // pass
   {"dup2", (uintptr_t)&dup2},  // pass
   // TODO {"environ", (uintptr_t)&stub_environ},  // <<< IMPLEMENTAR
-  {"__errno", (uintptr_t)&__errno},  // pass
+  {"__errno", (uintptr_t)&bionic_errno},  // pass
   // TODO {"execvp", (uintptr_t)&stub_execvp},  // <<< IMPLEMENTAR
   // TODO {"_exit", (uintptr_t)&stub__exit},  // <<< IMPLEMENTAR
   {"exit", (uintptr_t)&exit},  // pass
@@ -229,11 +292,11 @@ DynLibFunction dynlib_functions[] = {
   {"iconv_close", (uintptr_t)&iconv_close},  // pass
   {"iconv_open", (uintptr_t)&iconv_open},  // pass
   // TODO {"inet_pton", (uintptr_t)&stub_inet_pton},  // <<< IMPLEMENTAR
-  {"inflate", (uintptr_t)&inflate},  // pass
-  {"inflateEnd", (uintptr_t)&inflateEnd},  // pass
-  {"inflateInit2_", (uintptr_t)&inflateInit2_},  // pass
-  // TODO {"inflateReset", (uintptr_t)&stub_inflateReset},  // <<< IMPLEMENTAR
-  // TODO {"inflateReset2", (uintptr_t)&stub_inflateReset2},  // <<< IMPLEMENTAR
+  // [zlib runtime] {"inflate", (uintptr_t)&inflate},  // pass
+  // [zlib runtime] {"inflateEnd", (uintptr_t)&inflateEnd},  // pass
+  // [zlib runtime] {"inflateInit2_", (uintptr_t)&inflateInit2_},  // pass
+  // [zlib runtime] // TODO {"inflateReset", (uintptr_t)&stub_inflateReset},  // <<< IMPLEMENTAR
+  // [zlib runtime] // TODO {"inflateReset2", (uintptr_t)&stub_inflateReset2},  // <<< IMPLEMENTAR
   {"ioctl", (uintptr_t)&ioctl},  // pass
   // TODO {"isatty", (uintptr_t)&stub_isatty},  // <<< IMPLEMENTAR
   // TODO {"iswalpha_l", (uintptr_t)&stub_iswalpha_l},  // <<< IMPLEMENTAR
@@ -485,7 +548,7 @@ DynLibFunction dynlib_functions[] = {
   // TODO {"towlower_l", (uintptr_t)&stub_towlower_l},  // <<< IMPLEMENTAR
   // TODO {"towupper_l", (uintptr_t)&stub_towupper_l},  // <<< IMPLEMENTAR
   // TODO {"truncate", (uintptr_t)&stub_truncate},  // <<< IMPLEMENTAR
-  {"uncompress", (uintptr_t)&uncompress},  // pass
+  // [zlib runtime] {"uncompress", (uintptr_t)&uncompress},  // pass
   // TODO {"ungetc", (uintptr_t)&stub_ungetc},  // <<< IMPLEMENTAR
   // TODO {"ungetwc", (uintptr_t)&stub_ungetwc},  // <<< IMPLEMENTAR
   {"unlink", (uintptr_t)&unlink},  // pass
@@ -531,7 +594,7 @@ DynLibFunction dynlib_functions[] = {
   // TODO {"ZSTD_trace_decompress_begin", (uintptr_t)&stub_ZSTD_trace_decompress_begin},  // <<< IMPLEMENTAR
   // TODO {"ZSTD_trace_decompress_end", (uintptr_t)&stub_ZSTD_trace_decompress_end},  // <<< IMPLEMENTAR
 };
-const int dynlib_functions_count = sizeof(dynlib_functions)/sizeof(dynlib_functions[0]);
+size_t dynlib_numfunctions = sizeof(dynlib_functions)/sizeof(dynlib_functions[0]);
 
 // ===================== SIMBOLOS A IMPLEMENTAR =====================
 //   acosf

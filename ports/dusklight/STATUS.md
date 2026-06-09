@@ -71,3 +71,23 @@ ganhou bloco de includes + stubs android_log. SO_NAME=libmain.so. build.sh compi
 - `__errno` (bionic): stub `int*__errno(void){return __errno_location();}`.
 Depois: build → deploy libmain.so+data1 no device → 1ª run (ver até onde o init SDL3 vai antes
 de precisar dos shims ANativeWindow/AInputQueue da F1/F2).
+
+## F0 ✅ COMPILA + 1ª RUN (sessão 2, 2026-06-09)
+**BUILD OK**: loader `dusklight` (ELF aarch64 169KB) compila. Fixes: resolver fallback dlsym(RTLD_DEFAULT)
+em so_util.c; entry SDL_main; pthread_fake.c (gtavc) + 22 funcs gap (rwlock/once/key/sem-extras);
+includes+stubs em imports.gen.c; dynlib_numfunctions; **NÃO linkar libs do device** (libz/libSDL2 têm
+seção corrompida no toolchain ld → resolver em runtime via dlopen RTLD_GLOBAL + fallback); excluído
+android_shim/egl_shim do build (Dusklight=SDL_main+SDL3 estático, não NativeActivity); sdl_audio_stub.c
+(6 funcs SDL audio no-op + 5 SL_IID dummy, áudio=F4); dlopen libz/libGLESv2 RTLD_GLOBAL no main.
+**1ª RUN**: loader carrega libmain, resolve ~478/525 imports (fallback), **CRASHA no init_array**
+(construtores C++ estáticos) por causa dos **47 shims bionic/Android faltando** (UNRESOLVED-F1.txt).
+**ROADMAP F1 (imediato)** = prover os 47:
+- **bionic _chk** (FORTIFY): __strlen_chk→strlen, __strchr_chk→strchr, __strncpy_chk2→strncpy,
+  __write_chk→write, __sendto_chk→sendto, __FD_SET_chk/__FD_ISSET_chk, __memcpy_chk etc. (mapear p/ glibc unchecked).
+- **__sF** (bionic stdio FILE[3] = stdin/out/err) → array apontando p/ glibc stdin/stdout/stderr.
+- **__system_property_get** → stub (return 0). **android_set_abort_message** → wirar stub no table (já existe).
+- **ZSTD_trace_*** → stub no-op (tracing opcional).
+- **F2** (depois): ANativeWindow_* (4) → janela Mali fbdev. **F3**: AAsset* (10) → fopen(data1).
+  ASensor*/ALooper* (sensores/looper) → stub/ALooper mínimo.
+Device: /storage/roms/dusklight-recon/ (libmain.so+dusklight). Run: SDL_VIDEODRIVER=mali
+LD_LIBRARY_PATH=/usr/lib32:/usr/lib ./dusklight. Assets data1 (1.46GB) ainda NÃO deployados.

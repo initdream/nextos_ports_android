@@ -13,7 +13,6 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <ucontext.h>
-#include <dlfcn.h>
 
 #include "android_shim.h"
 #include "error.h"
@@ -23,7 +22,7 @@
 #include "util.h"
 
 #define MEMORY_MB 256
-#define SO_NAME "libmain.so"
+#define SO_NAME "libsyberia1.so"
 
 // Forward declarations for PadScheme crash recovery
 static sigjmp_buf padscheme_jmpbuf;
@@ -383,8 +382,6 @@ int main(int argc, char *argv[]) {
     fatal_error("Failed to relocate %s", SO_NAME);
 
   // Resolve imports
-  dlopen("libz.so.1", RTLD_GLOBAL|RTLD_NOW);
-  dlopen("libGLESv2.so.2", RTLD_GLOBAL);
   debugPrintf("Resolving %zu imports...\n", dynlib_numfunctions);
   if (so_resolve(dynlib_functions, dynlib_numfunctions, 0) < 0)
     fatal_error("Failed to resolve imports");
@@ -468,37 +465,28 @@ int main(int argc, char *argv[]) {
   debugPrintf("Running init array...\n");
   so_execute_init_array();
 
-  /* ---- Entrada SDL3 (Dusklight = SDL3 estático, backend Android), NÃO android_main.
-   * Modelo: reVC. JNI_OnLoad primeiro (SDL3-Android usa JNI), depois SDL_SetMainReady + SDL_main.
-   * Os shims Android (ANativeWindow/AInputQueue) entram nas próximas fases (F1/F2). ---- */
-  uintptr_t jni_onload = so_find_addr("JNI_OnLoad");
-  if (jni_onload) {
-    debugPrintf("JNI_OnLoad em %p — chamando...\n", (void *)jni_onload);
-    /* F0: VM mínima (jni_shim fornece em fases futuras). g_fake_vm = JNIInvokeInterface* */
-    extern void *jni_shim_get_vm(void); /* fornecido por jni_shim.c (pode ser stub) */
-    void *vm = jni_shim_get_vm();
-    int (*jnf)(void *, void *) = (int (*)(void *, void *))jni_onload;
-    int jrc = jnf(vm, NULL);
-    debugPrintf("JNI_OnLoad retornou 0x%x\n", jrc);
-  } else {
-    debugPrintf("aviso: JNI_OnLoad não encontrado (seguindo)\n");
-  }
+  // Find android_main
+  uintptr_t android_main_addr = so_find_addr("android_main");
+  if (!android_main_addr)
+    fatal_error("Could not find android_main in %s", SO_NAME);
+  debugPrintf("android_main found at %p\n", (void *)android_main_addr);
 
-  void (*sdl_set_main_ready)(void) =
-      (void (*)(void))so_find_addr("SDL_SetMainReady");
-  if (!sdl_set_main_ready)
-    sdl_set_main_ready = (void (*)(void))dlsym(RTLD_DEFAULT, "SDL_SetMainReady");
-  if (sdl_set_main_ready) { sdl_set_main_ready(); debugPrintf("SDL_SetMainReady() ok\n"); }
+  // Initialize fake Android environment (also inits SDL)
+  struct android_app *app = android_shim_init();
+  if (!app)
+    fatal_error("Failed to initialize Android shim");
 
-  uintptr_t sdl_main_addr = so_find_addr("SDL_main");
-  if (!sdl_main_addr)
-    fatal_error("SDL_main não encontrado em %s", SO_NAME);
-  debugPrintf("SDL_main em %p — chamando...\n", (void *)sdl_main_addr);
-  char arg0[] = "dusklight";
-  char *argv_g[] = {arg0, NULL};
-  int (*sdl_main)(int, char **) = (int (*)(int, char **))sdl_main_addr;
-  int rc = sdl_main(1, argv_g);
-  debugPrintf("SDL_main retornou %d\n", rc);
+  // Send initial lifecycle commands
+  android_shim_send_cmd(app, APP_CMD_INIT_WINDOW);
+  android_shim_send_cmd(app, APP_CMD_GAINED_FOCUS);
+
+  // Call android_main
+  debugPrintf("Calling android_main...\n");
+  void (*android_main_func)(struct android_app *) =
+      (void (*)(struct android_app *))android_main_addr;
+  android_main_func(app);
+
+  debugPrintf("android_main returned\n");
 
   // Hard exit — the .so's destructors crash during normal cleanup
   _exit(0);
