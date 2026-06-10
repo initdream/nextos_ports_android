@@ -251,7 +251,34 @@ static void *jni_GetFieldID(void *env, void *clazz, const char *name,
   (void)env;
   (void)clazz;
   debugPrintf("jni_shim: GetFieldID(%s, %s)\n", name, sig);
-  return &g_method_tags[FID_GENERIC];
+  return reg_mid(name, sig);   /* registra por nome (DisplayMetrics fields) */
+}
+
+/* GetIntField (idx 100): DisplayMetrics widthPixels/heightPixels/densityDpi.
+   0 aqui -> engine ve resolucao invalida -> "Unable to initialize Unity Engine". */
+static jint jni_GetIntField(void *env, void *obj, void *fieldID) {
+  (void)env; (void)obj;
+  const char *nm = mid_name(fieldID);
+  if (nm) {
+    if (strcmp(nm, "widthPixels") == 0) return 1280;
+    if (strcmp(nm, "heightPixels") == 0) return 720;
+    if (strcmp(nm, "densityDpi") == 0) return 160;
+  }
+  return 0;
+}
+
+/* CallFloatMethodV (idx 56): Display.getRefreshRate() -> 60Hz (0 quebra o engine) */
+static float jni_CallFloatMethodV(void *env, void *obj, void *methodID, va_list ap) {
+  (void)env; (void)obj; (void)ap;
+  const char *nm = mid_name(methodID);
+  if (nm && strcmp(nm, "getRefreshRate") == 0) return 60.0f;
+  return 0.0f;
+}
+static float jni_CallFloatMethod(void *env, void *obj, void *methodID, ...) {
+  va_list ap; va_start(ap, methodID);
+  float r = jni_CallFloatMethodV(env, obj, methodID, ap);
+  va_end(ap);
+  return r;
 }
 
 static void *jni_GetStaticFieldID(void *env, void *clazz, const char *name,
@@ -366,6 +393,12 @@ static jint jni_CallIntMethodV(void *env, void *obj, void *methodID,
     if (strcmp(nm, "getFlags") == 0) return g_hk_inject.flags;
     if (strcmp(nm, "getUnicodeChar") == 0) return g_hk_inject.unicode;
     if (strcmp(nm, "size") == 0) return 0; /* List/Collection vazia */
+    /* ---- Display: o engine pega a resolucao/rotacao; 0x0 -> "Unable to
+       initialize the Unity Engine". Devolve 1280x720, rotacao 0, displayId 0. ---- */
+    if (strcmp(nm, "getWidth") == 0 || strcmp(nm, "getRawWidth") == 0) return 1280;
+    if (strcmp(nm, "getHeight") == 0 || strcmp(nm, "getRawHeight") == 0) return 720;
+    if (strcmp(nm, "getRotation") == 0) return 0;
+    if (strcmp(nm, "getDisplayId") == 0) return 0;
   }
   struct astream *s = astream_find(obj);
   if (s && nm) {
@@ -719,6 +752,9 @@ void jni_shim_init(void **out_vm, void **out_env) {
   jni_env_vtable[38] = (uintptr_t)jni_CallBooleanMethod;   /* V */
   jni_env_vtable[49] = (uintptr_t)jni_CallIntMethod;
   jni_env_vtable[50] = (uintptr_t)jni_CallIntMethodV;      /* V (va_list) */
+  jni_env_vtable[55] = (uintptr_t)jni_CallFloatMethod;     /* getRefreshRate */
+  jni_env_vtable[56] = (uintptr_t)jni_CallFloatMethodV;    /* V */
+  jni_env_vtable[100] = (uintptr_t)jni_GetIntField;        /* DisplayMetrics fields */
   jni_env_vtable[61] = (uintptr_t)jni_CallVoidMethod;
   jni_env_vtable[62] = (uintptr_t)jni_CallVoidMethod;      /* V */
   jni_env_vtable[94] = (uintptr_t)jni_GetFieldID;
