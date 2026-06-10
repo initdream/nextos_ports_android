@@ -418,10 +418,12 @@ int main(int argc, char *argv[]) {
   patch_func_ret1("SwappyGL_init");
   patch_func_ret0("SwappyGL_isEnabled");
 
-  /* SoundImpOboe::Initialize(float): a init do Oboe crasha em STL/JNI no nosso
-   * ambiente (problema conhecido do Oboe em so-loaders). Retornamos 0 (falha) ->
-   * a engine cai no fallback (sem som) e segue. Áudio via opensles_shim depois. */
-  patch_func_ret0("_ZN12SoundImpOboe10InitializeEf");
+  /* SoundImpOboe::Initialize(float): crashava ANTES do fix do canary TLS (o
+   * "crash STL/JNI" era provavelmente o mesmo falso-positivo). Tentando rodar
+   * o Oboe de verdade agora; fallback p/ patch ret0 se voltar a crashar.
+   * DYSMANTLE_NO_OBOE=1 -> re-aplica o patch (som Null). */
+  if (getenv("DYSMANTLE_NO_OBOE"))
+    patch_func_ret0("_ZN12SoundImpOboe10InitializeEf");
 
   /* Desabilita popups de erro: a textura grunge-scratched.jpg falha e a engine
    * mostra um popup que crasha. nx_run_no_popups=1 + NXD_ShowPopup=no-op ->

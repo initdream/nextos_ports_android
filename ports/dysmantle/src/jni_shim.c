@@ -35,6 +35,7 @@ enum {
   MID_ERROR_DIALOG,
   MID_GET_CLASS_LOADER,
   MID_LOAD_CLASS,
+  MID_AUDIO_STREAM_PARAMS,
   MID_GENERIC,
   FID_OBB_VERSIONCODE,
   FID_GENERIC,
@@ -104,6 +105,8 @@ static void *jni_GetMethodID(void *env, void *clazz, const char *name,
     return &g_method_tags[MID_GET_CLASS_LOADER];
   if (strcmp(name, "loadClass") == 0)
     return &g_method_tags[MID_LOAD_CLASS];
+  if (strcmp(name, "GetDefaultAudioStreamParameters") == 0)
+    return &g_method_tags[MID_AUDIO_STREAM_PARAMS];
   return &g_method_tags[MID_GENERIC];
 }
 
@@ -141,11 +144,20 @@ static void *jni_GetStaticFieldID(void *env, void *clazz, const char *name,
   return &g_method_tags[FID_GENERIC];
 }
 
+/* Array fake de parâmetros de áudio: [sampleRate, framesPerBurst]
+ * (Oboe/engine pedem via GetDefaultAudioStreamParameters()[I]) */
+static jint g_audio_params[2] = {44100, 1024};
+
 /* CallObjectMethod (index 36) - variadic */
 static void *jni_CallObjectMethod(void *env, void *obj, void *methodID, ...) {
   (void)env;
   (void)obj;
   debugPrintf("jni_shim: CallObjectMethod(mid=%p)\n", methodID);
+  if (methodID == &g_method_tags[MID_AUDIO_STREAM_PARAMS]) {
+    debugPrintf("jni_shim:   -> AudioStreamParameters jintArray {%d,%d}\n",
+                g_audio_params[0], g_audio_params[1]);
+    return g_audio_params;
+  }
   static int fake_obj;
   return &fake_obj;
 }
@@ -318,8 +330,20 @@ static void *jni_ExceptionOccurred(void *env) {
 /* Array */
 static jint jni_GetArrayLength(void *env, void *array) {
   (void)env;
-  (void)array;
+  if (array == g_audio_params) return 2;
   return 0;
+}
+static jint *jni_GetIntArrayElements(void *env, void *array, unsigned char *isCopy) {
+  (void)env;
+  if (isCopy) *isCopy = 0;
+  debugPrintf("jni_shim: GetIntArrayElements(%p)\n", array);
+  if (array == g_audio_params) return g_audio_params;
+  static jint zeros[8];
+  return zeros;
+}
+static void jni_ReleaseIntArrayElements(void *env, void *array, jint *elems,
+                                        jint mode) {
+  (void)env; (void)array; (void)elems; (void)mode;
 }
 
 /* ---- JavaVM functions ---- */
@@ -440,6 +464,8 @@ void jni_shim_init(void **out_vm, void **out_env) {
   jni_env_vtable[169] = (uintptr_t)jni_GetStringUTFChars;
   jni_env_vtable[170] = (uintptr_t)jni_ReleaseStringUTFChars;
   jni_env_vtable[171] = (uintptr_t)jni_GetArrayLength;
+  jni_env_vtable[187] = (uintptr_t)jni_GetIntArrayElements;     /* GetIntArrayElements */
+  jni_env_vtable[195] = (uintptr_t)jni_ReleaseIntArrayElements; /* ReleaseIntArrayElements */
   jni_env_vtable[205] = (uintptr_t)jni_ExceptionCheck;
 
   jni_env_ptr = jni_env_vtable;

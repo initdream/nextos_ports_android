@@ -108,6 +108,7 @@ typedef struct {
   SLuint32 num_channels;
   SLuint32 sample_rate;
   SLuint32 bits_per_sample;
+  int is_float; /* PCM_EX float32 (Oboe) -> converte p/ S16 no Enqueue */
 
   void *obj_vtable[8];
   void *obj_ptr;
@@ -714,6 +715,21 @@ static SLresult bq_Enqueue(void *self, const void *pBuffer, SLuint32 size) {
   for (int i = 0; i < MAX_PLAYERS; i++) {
     if (&g_players[i].bq_ptr == itf_ptr) {
       AudioPlayer *p = &g_players[i];
+      /* float32 (Oboe PCM_EX) -> S16 antes do ring (resto do shim é S16) */
+      static int16_t conv_buf[16384];
+      if (p->is_float) {
+        uint32_t n = size / 4;
+        if (n > sizeof(conv_buf) / 2) n = sizeof(conv_buf) / 2;
+        const float *f = (const float *)pBuffer;
+        for (uint32_t k = 0; k < n; k++) {
+          float v = f[k];
+          if (v > 1.0f) v = 1.0f;
+          if (v < -1.0f) v = -1.0f;
+          conv_buf[k] = (int16_t)(v * 32767.0f);
+        }
+        pBuffer = conv_buf;
+        size = n * 2;
+      }
       uint32_t written = ring_write(p, pBuffer, size);
       if (written != size) {
         debugPrintf("opensles_shim: WARNING: truncated enqueue for player %d (%u/%u bytes)\n",
@@ -970,12 +986,16 @@ static SLresult engine_CreateAudioPlayer(void *self, void **pPlayer,
     }
     if (src->pFormat) {
       SLDataFormat_PCM *fmt = (SLDataFormat_PCM *)src->pFormat;
-      if (fmt->formatType == SL_DATAFORMAT_PCM) {
+      /* 4 = SL_ANDROID_DATAFORMAT_PCM_EX (Oboe float): mesmos 1ºs campos do
+       * PCM + representation; bits=32 float -> converter p/ S16 no Enqueue. */
+      if (fmt->formatType == SL_DATAFORMAT_PCM || fmt->formatType == 4) {
         p->num_channels = fmt->numChannels;
         p->sample_rate = fmt->samplesPerSec / 1000;
         p->bits_per_sample = fmt->bitsPerSample;
-        /* debugPrintf("opensles_shim: format: %u ch, %u Hz, %u bit\n",
-                    p->num_channels, p->sample_rate, p->bits_per_sample); */
+        p->is_float = (fmt->formatType == 4 && fmt->bitsPerSample == 32);
+        debugPrintf("opensles_shim: format: %u ch, %u Hz, %u bit float=%d\n",
+                    p->num_channels, p->sample_rate, p->bits_per_sample,
+                    p->is_float);
       }
     }
   }

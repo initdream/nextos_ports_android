@@ -56,7 +56,14 @@ static size_t b_strlen_chk(const char *s, size_t n) { (void)n; return strlen(s);
 static char  *b_strchr_chk(const char *s, int c, size_t n) { (void)n; return strchr(s, c); }
 static mode_t b_umask_chk(mode_t m) { return umask(m); }
 static int    b_sys_prop_get(const char *name, char *value) {
-  (void)name; if (value) value[0] = '\0'; return 0;
+  /* SDK 25 (N-MR1): Oboe/OpenSLES aceita Float (>=21) e NÃO tenta AAudio
+   * (>=27). Sem isso: "ErrorInvalidFormat" no open do stream de som. */
+  if (name && value && strcmp(name, "ro.build.version.sdk") == 0) {
+    strcpy(value, "25");
+    return 2;
+  }
+  if (value) value[0] = '\0';
+  return 0;
 }
 /* __emutls_get_address vem do libgcc (linkado estático no loader). */
 extern void *__emutls_get_address(void *);
@@ -273,15 +280,24 @@ static void al_wake(void *l) { (void)l; }
 static int   aie_getDeviceId(void *e) { (void)e; return 0; }
 static int   ame_getButtonState(void *e) { (void)e; return 0; }
 
-/* ---------------- OpenSL ES interface IDs (dados dummy) ---------------- */
+/* ---------------- OpenSL ES interface IDs ----------------
+ * IDENTIDADES DO SHIM (receita Sonic Mania): o opensles_shim compara iid por
+ * ponteiro com os sl_IID_* DELE. Os SL_IID_* expostos ao jogo (tabela+dlsym)
+ * têm que conter esses valores; ANDROIDSIMPLEBUFFERQUEUE -> BUFFERQUEUE. */
 extern uint32_t slCreateEngine_shim(void **, uint32_t, const void *, uint32_t,
                                     const void *, const void *);
-static const void *SL_IID_ENGINE_v = "ENGINE";
-static const void *SL_IID_PLAY_v = "PLAY";
-static const void *SL_IID_RECORD_v = "RECORD";
-static const void *SL_IID_BUFFERQUEUE_v = "BUFQ";
-static const void *SL_IID_ANDROIDSIMPLEBUFFERQUEUE_v = "ASBQ";
-static const void *SL_IID_ANDROIDCONFIGURATION_v = "ACFG";
+extern const void *sl_IID_ENGINE, *sl_IID_PLAY, *sl_IID_VOLUME,
+    *sl_IID_BUFFERQUEUE;
+static const void *SL_IID_ENGINE_v, *SL_IID_PLAY_v, *SL_IID_RECORD_v,
+    *SL_IID_BUFFERQUEUE_v, *SL_IID_ANDROIDSIMPLEBUFFERQUEUE_v,
+    *SL_IID_ANDROIDCONFIGURATION_v = "ACFG";
+__attribute__((constructor)) static void sl_iid_init(void) {
+  SL_IID_ENGINE_v = sl_IID_ENGINE;
+  SL_IID_PLAY_v = sl_IID_PLAY;
+  SL_IID_RECORD_v = "RECORD"; /* sem suporte no shim */
+  SL_IID_BUFFERQUEUE_v = sl_IID_BUFFERQUEUE;
+  SL_IID_ANDROIDSIMPLEBUFFERQUEUE_v = sl_IID_BUFFERQUEUE;
+}
 
 /* EGL shim funcs já declaradas em egl_shim.h (assinaturas reais) */
 static unsigned egl_releasethread_stub(void) { return 1u; }
@@ -317,13 +333,43 @@ void *dysmantle_gl_proc_override(const char *name) {
 
 /* A engine resolve as funções GL via dlsym DIRETO (libGLESv2 do device),
  * driblando a tabela de imports E o eglGetProcAddress. Interceptamos dlsym
- * p/ devolver NOSSO glGetString (strings curtas) e deixar o resto passar. */
+ * p/ devolver NOSSO glGetString (strings curtas) e deixar o resto passar.
+ * Oboe também faz dlopen("libOpenSLES.so")+dlsym em runtime (linkOpenSLES) ->
+ * roteamos pro opensles_shim (receita do Sonic Mania). */
+#define SL_MAGIC ((void *)0x5151ABCDul)
+extern uint32_t slCreateEngine_shim(void **, uint32_t, const void *, uint32_t,
+                                    const void *, const void *);
+static void *sl_dlsym(const char *name) {
+  if (!name) return NULL;
+  if (strcmp(name, "slCreateEngine") == 0) return (void *)slCreateEngine_shim;
+  if (strcmp(name, "SL_IID_ENGINE") == 0) return (void *)&SL_IID_ENGINE_v;
+  if (strcmp(name, "SL_IID_PLAY") == 0) return (void *)&SL_IID_PLAY_v;
+  if (strcmp(name, "SL_IID_RECORD") == 0) return (void *)&SL_IID_RECORD_v;
+  if (strcmp(name, "SL_IID_BUFFERQUEUE") == 0) return (void *)&SL_IID_BUFFERQUEUE_v;
+  if (strcmp(name, "SL_IID_ANDROIDSIMPLEBUFFERQUEUE") == 0)
+    return (void *)&SL_IID_ANDROIDSIMPLEBUFFERQUEUE_v;
+  if (strcmp(name, "SL_IID_ANDROIDCONFIGURATION") == 0)
+    return (void *)&SL_IID_ANDROIDCONFIGURATION_v;
+  fprintf(stderr, "[sl] dlsym %s -> NULL\n", name);
+  return NULL;
+}
 static void *my_dlsym(void *handle, const char *name) {
   void *ov = dysmantle_gl_proc_override(name);
   if (ov) { fprintf(stderr, "[my_dlsym] override %s\n", name); return ov; }
+  if (handle == SL_MAGIC) {
+    void *r = sl_dlsym(name);
+    fprintf(stderr, "[sl] dlsym %s -> %p\n", name ? name : "?", r);
+    return r;
+  }
   return dlsym(handle, name);
 }
-static void *my_dlopen(const char *name, int flag) { return dlopen(name, flag); }
+static void *my_dlopen(const char *name, int flag) {
+  if (name && strstr(name, "OpenSLES")) {
+    fprintf(stderr, "[sl] dlopen %s -> shim\n", name);
+    return SL_MAGIC;
+  }
+  return dlopen(name, flag);
+}
 static int   my_dlclose(void *h) { return dlclose(h); }
 
 /* ---- GL wrappers com LOG (pinpoint do stack-smash no renderer init) ---- */
