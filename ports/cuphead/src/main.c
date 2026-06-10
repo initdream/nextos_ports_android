@@ -261,6 +261,24 @@ static long my_sysconf(int name) {
     r = (512L*1024*1024)/4096;
   return r;
 }
+/* mmap spy: a arena de 2MB @ 0x7f10000000 (onde os vtables corrompidos apontam)
+ * é um mmap de 0x200000. Logamos alocações desse tamanho + o caller (RA→libunity/
+ * il2cpp offset) p/ identificar QUAL alocador/subsistema cria a arena. CUP_MMAPLOG. */
+static int g_mmaplog;
+extern void *mmap(void *, size_t, int, int, int, long);  /* glibc real */
+static void *my_mmap(void *addr, size_t len, int prot, int flags, int fd, long off) {
+  void *r = mmap(addr, len, prot, flags, fd, off);
+  if (g_mmaplog && (len == 0x200000 || (len >= 0x100000 && len <= 0x400000))) {
+    uintptr_t ra = (uintptr_t)__builtin_return_address(0);
+    const char *lib = "?"; uintptr_t off2 = ra;
+    if (g_unity_base && ra >= g_unity_base && ra < g_unity_base + text_size) { lib = "libunity"; off2 = ra - g_unity_base; }
+    else if (g_il2cpp_base && ra >= g_il2cpp_base && ra < g_il2cpp_base + 0x3000000) { lib = "libil2cpp"; off2 = ra - g_il2cpp_base; }
+    fprintf(stderr, "[MMAP] len=0x%zx prot=%d -> %p  caller=%s+0x%lx\n",
+            len, prot, r, lib, (unsigned long)off2);
+    fsync(2);
+  }
+  return r;
+}
 /* /proc/cpuinfo + /sys/.../cpu: Unity conta cores p/ dimensionar job workers. */
 static int g_dllog;
 static const char *asset_redirect(const char *p, char *buf, size_t bufsz);
@@ -669,9 +687,20 @@ long my_signal(void *sem, long count);
 long my_signal(void *sem, long count) {
   int c = (int)count;
   if (c > g_signal_clamp) {
-    if (g_signal_clamps++ < 40)
-      fprintf(stderr, "[CLAMPSIG] Signal(sem=%p) count=%d (0x%x) -> %d\n",
-              sem, c, (unsigned)c, g_signal_clamp);
+    if (g_signal_clamps++ < 12) {
+      /* caller = quem chamou Signal (job-scheduler?) */
+      uintptr_t ra = (uintptr_t)__builtin_return_address(0);
+      const char *lib = "?"; uintptr_t off = ra;
+      if (g_unity_base && ra >= g_unity_base && ra < g_unity_base + text_size) { lib = "libunity"; off = ra - g_unity_base; }
+      else if (g_il2cpp_base && ra >= g_il2cpp_base && ra < g_il2cpp_base + 0x3000000) { lib = "libil2cpp"; off = ra - g_il2cpp_base; }
+      fprintf(stderr, "[CLAMPSIG] Signal(sem=%p) count=%d (0x%x) -> %d  caller=%s+0x%lx\n",
+              sem, c, (unsigned)c, g_signal_clamp, lib, (unsigned long)off);
+      /* vizinhança do sem (objeto Semaphore/fila de jobs): contador interno + campos */
+      uintptr_t b = ((uintptr_t)sem - 0x20) & ~0x7UL;
+      for (long d = 0; d < 0x40; d += 8)
+        fprintf(stderr, "[CLAMPSIG]   sem%+ld: %016lx\n", d - 0x20, *(unsigned long *)(b + d));
+      fsync(2);
+    }
     count = (long)g_signal_clamp;
   }
   return signal_orig_tramp(sem, count);
@@ -997,6 +1026,9 @@ int main(int argc, char **argv) {
   if (getenv("CUP_EGPLOG") || getenv("CUP_NOVAO"))
     set_import("eglGetProcAddress", (void *)my_eglGetProcAddress);
   set_import("sysconf", (void *)my_sysconf);
+  g_mmaplog = getenv("CUP_MMAPLOG") ? 1 : 0;
+  set_import("mmap", (void *)my_mmap);
+  set_import("mmap64", (void *)my_mmap);
   set_import("fopen", (void *)my_fopen);
   set_import("open", (void *)my_open);
   set_import("stat", (void *)my_stat);
@@ -1194,6 +1226,8 @@ int main(int argc, char **argv) {
     /* il2cpp abre o global-metadata.dat via open() -> intercepta p/ redirecionar.
        patch_got opera no modulo ATIVO (=il2cpp agora). Tb dlopen/dlsym/log. */
     patch_got("open", (void *)my_open);
+    patch_got("mmap", (void *)my_mmap);
+    patch_got("mmap64", (void *)my_mmap);
     patch_got("fopen", (void *)my_fopen);
     patch_got("stat", (void *)my_stat);
     patch_got("lstat", (void *)my_lstat);
