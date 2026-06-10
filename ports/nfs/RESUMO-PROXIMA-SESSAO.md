@@ -6,8 +6,10 @@
 ```
 cd ~/nextos_ports_android/ports/nfs && ./build.sh && scp -q nfs nextos-87:/storage/roms/nfs/
 ssh nextos-87 'cd /storage/roms/nfs && export LD_LIBRARY_PATH="/usr/lib32:/storage/roms/nfs" \
-  SDL_VIDEODRIVER=mali NFS_INIT=1 NFS_SKIPCTOR="186,187,188"; timeout 70 ./nfs 2>&1 | tail -50'
+  SDL_VIDEODRIVER=mali NFS_INIT=1; timeout 70 ./nfs 2>&1 | tail -50'
 ```
+✅ **NFS_SKIPCTOR NÃO é mais necessário** — o shim de sigaction (abaixo) fez os 3 últimos ctors
+(186/187/188 = detecção de CPU) completarem. init_array roda 100%.
 OBB (623MB) já no device: `/storage/roms/nfs/data/Android/obb/com.ea.games.nfs13_row/main.1003128.com.ea.games.nfs13_row.obb`
 Recon local: `~/Downloads/nfs-analysis/lib/armeabi-v7a/` e `~/Downloads/obb_extract/com.ea.games.nfs13_row/`
 objdump: `~/NextOS-Elite-Edition/build.NextOS-...-Amlogic-ng.aarch64-4/toolchain/bin/armv8a-emuelec-linux-gnueabihf-objdump`
@@ -53,7 +55,33 @@ Em `src/imports.c` + `src/main.c`:
 - crash_handler robusto: regiões de TODOS os módulos (maps), hexdump @PC só se mapeado (g_pc_mapped),
   stack scan resolve retornos em qualquer região r-x.
 
-### 🔑 LEAD MAIS FORTE — ctor 186 (CPU feature detection) PULADO (investigado nesta sessão)
+### ✅ RESOLVIDO nesta sessão — sigaction ABI (era a causa dos ctors 186/187/188 crasharem)
+Os 3 últimos ctors são detecção de CPU (probes crypto/`mrrc` CNTVCT que dão SIGILL e são
+capturados). Eles preenchem um `struct sigaction` **BIONIC** (16B: handler@0, mask@4 4B, flags@8,
+restorer@12) e chamam a `sigaction` da **GLIBC** (sa_mask=128B → flags@132, restorer@136) → glibc
+lia flags/restorer LIXO → handler de SIGILL retornava p/ `0xba`. **FIX (src/imports.c):
+my_sigaction + my_sigprocmask** traduzem o struct/sigset bionic↔glibc (dropam SA_RESTORER/
+SA_THIRTYTWO; glibc põe o restorer certo). NFS_NOSIGSHIM=1 desliga. → ctors completam, sem SKIPCTOR.
+**OBS: isso NÃO consertou a corrupção de asset** (mesma cadeia RTTI; lixo mudou HT=1→TDBG).
+
+### 🔑 MURO ATUAL = ponteiro de vtable SELVAGEM no parse (heap-layout-dependent)
+- O objeto passado ao dynamic_cast tem vtable apontando p/ lixo. Os valores ("HT=1", "TDBG") são
+  **ASCII e MUDAM** conforme PAD/ctors (não são tags fixas; NÃO existem em libapp nem no OBB) →
+  o ponteiro do OBJETO/vtable é SELVAGEM, aponta p/ memória arbitrária com dados de asset.
+- **Depende do layout do heap**: NFS_PAD=64 → crash no RTTI do parse (consistente). PAD=256 → chega
+  ao render loop e crasha em addr=0x4 (libc). PAD=128/512 → outros. Ou seja, é **overflow de heap /
+  misparse** que o padding só REALOCA, não elimina. (PAD=0/16 crasha cedo em malloc invalid size.)
+- Hipótese principal: a engine lê um array de PONTEIROS de objeto do índice do OBB e uma entrada
+  aponta p/ DADOS de asset em vez de um objeto construído (misparse de offset/tamanho), OU um
+  overflow de heap esmaga a vtable de um objeto vizinho.
+- **Próximo passo**: instrumentar `0x46b220` (processa cada elemento; chamado no loop de
+  `0x46afe0`, indexa array `[r0+r8<<2]`) e a construção do objeto — logar o ponteiro do elemento +
+  1as palavras p/ achar a 1ª entrada ruim e de qual offset do arquivo veio. Cadeia (pilha):
+  `0x46afe0 ← 0x3de064 ← 0x46b958 ← 0x43c6fc ← 0x5643cc ← 0x466f28 ← 0x3eabdc ← 0x3d4808`.
+- Suspeitar: leitura byte-a-byte do índice (vi 4826 seeks perto do EOF lendo 1 byte/vez) — formato
+  CUSTOM da EU (não ZIP padrão); algum campo lido com tamanho/sinal errado desalinha tudo.
+
+### (histórico) ctor 186 — detalhes da investigação que levou ao fix de sigaction
 init_array tem 189 ctors (0-188); **186/187/188 são os 3 ÚLTIMOS** (init de subsistemas do app).
 - **ctor 186 @ libapp+0x7433c = DETECÇÃO DE CPU** (ARM mode): instala sigaction(SIGILL)+sigsetjmp e/ou
   lê getauxval p/ montar flags de feature (AES/PMULL/SHA/CRC32) num global, e seleciona rotinas
