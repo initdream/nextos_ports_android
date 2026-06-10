@@ -7,6 +7,7 @@
 #define _LARGEFILE64_SOURCE
 #include <ctype.h>
 #include <stdarg.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/mman.h>
@@ -337,6 +338,62 @@ fail:
   return 0;
 }
 
+/* ---- sigaction/sigprocmask: ABI bionic→glibc ----
+ * O struct sigaction do bionic (arm32) tem 16B: handler@0, mask@4 (4B), flags@8,
+ * restorer@12. O da glibc tem sa_mask de 128B → flags@132, restorer@136. O ctor
+ * 186 (detecção de CPU via probes que dão SIGILL) preenche o struct BIONIC e chama
+ * a sigaction da GLIBC → glibc lê flags/restorer LIXO (offset errado) → instala
+ * handler com SA_RESTORER+restorer lixo → no retorno do handler de SIGILL salta p/
+ * 0xba. Traduzimos o struct. NFS_NOSIGSHIM=1 desliga. */
+struct bionic_sigaction { void *handler; unsigned long mask; int flags; void *restorer; };
+static int (*real_sigaction)(int, const struct sigaction *, struct sigaction *);
+static void mask32_to_set(unsigned long m, sigset_t *s) {
+  sigemptyset(s);
+  for (int sg = 1; sg <= 32; sg++) if (m & (1u << (sg - 1))) sigaddset(s, sg);
+}
+static unsigned long set_to_mask32(const sigset_t *s) {
+  unsigned long m = 0;
+  for (int sg = 1; sg <= 32; sg++) if (sigismember(s, sg)) m |= (1u << (sg - 1));
+  return m;
+}
+static int my_sigaction(int sig, const void *actp, void *oldp) {
+  if (getenv("NFS_NOSIGSHIM")) {
+    if (!real_sigaction) real_sigaction = (void *)dlsym(RTLD_DEFAULT, "sigaction");
+    return real_sigaction(sig, actp, oldp);
+  }
+  if (!real_sigaction) real_sigaction = (void *)dlsym(RTLD_DEFAULT, "sigaction");
+  struct sigaction ga, go;
+  const struct bionic_sigaction *ba = actp;
+  if (ba) {
+    memset(&ga, 0, sizeof ga);
+    ga.sa_handler = (void (*)(int))ba->handler;            /* union @0 */
+    /* mantém só flags portáveis; DROPA SA_RESTORER(0x04000000)+SA_THIRTYTWO
+     * (0x02000000) → glibc fornece o próprio restorer correto p/ ARM. */
+    ga.sa_flags = ba->flags & (SA_NOCLDSTOP | SA_NOCLDWAIT | SA_SIGINFO |
+                               SA_ONSTACK | SA_RESTART | SA_NODEFER | SA_RESETHAND);
+    mask32_to_set(ba->mask, &ga.sa_mask);
+  }
+  int r = real_sigaction(sig, ba ? &ga : NULL, oldp ? &go : NULL);
+  if (oldp) {
+    struct bionic_sigaction *bo = oldp;
+    bo->handler = (void *)go.sa_handler;
+    bo->mask = set_to_mask32(&go.sa_mask);
+    bo->flags = go.sa_flags;
+    bo->restorer = 0;
+  }
+  return r;
+}
+static int (*real_sigprocmask)(int, const sigset_t *, sigset_t *);
+static int my_sigprocmask(int how, const void *setp, void *oldp) {
+  if (!real_sigprocmask) real_sigprocmask = (void *)dlsym(RTLD_DEFAULT, "sigprocmask");
+  if (getenv("NFS_NOSIGSHIM")) return real_sigprocmask(how, setp, oldp);
+  sigset_t gs, go;
+  if (setp) mask32_to_set(*(const unsigned long *)setp, &gs);
+  int r = real_sigprocmask(how, setp ? &gs : NULL, oldp ? &go : NULL);
+  if (oldp) *(unsigned long *)oldp = set_to_mask32(&go);
+  return r;
+}
+
 /* ---- getauxval: o ctor 186 (detecção de CPU) usa AT_HWCAP bit 0x1000 como gate
  * "ler features via getauxval" vs "PROBAR instrução (SIGILL)". O probe SIGILL não
  * sobrevive sob o loader → ctor crasha (por isso era pulado). Forçando bit 0x1000
@@ -415,6 +472,8 @@ DynLibFunction nfs_shims[] = {
     {"sigsetjmp", (uintptr_t)__sigsetjmp},
     {"__dynamic_cast", (uintptr_t)my_dynamic_cast},
     {"getauxval", (uintptr_t)my_getauxval},
+    {"sigaction", (uintptr_t)my_sigaction},
+    {"sigprocmask", (uintptr_t)my_sigprocmask},
     {"AndroidBitmap_getInfo", (uintptr_t)abm_getInfo},
     {"AndroidBitmap_lockPixels", (uintptr_t)abm_lock},
     {"AndroidBitmap_unlockPixels", (uintptr_t)abm_unlock},
