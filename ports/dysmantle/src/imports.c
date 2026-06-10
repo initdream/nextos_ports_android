@@ -773,8 +773,8 @@ static void my_glTexImage2D(unsigned tgt, int lvl, int ifmt, int w, int h,
         snprintf(pix, sizeof(pix), "p0=%02x%02x%02x%02x mid=%02x%02x%02x%02x",
                  b[0], b[1], b[2], b[3], b[mid], b[mid+1], b[mid+2], b[mid+3]);
       }
-      fprintf(stderr, "[TEX2D] tex=%u ifmt=0x%x %dx%d fmt=0x%x typ=0x%x -> err=0x%x %s\n",
-              tid, ifmt, w, h, fmt, typ, e, pix); n++;
+      fprintf(stderr, "[TEX2D] tid=%d tex=%u ifmt=0x%x %dx%d fmt=0x%x typ=0x%x -> err=0x%x %s\n",
+              (int)syscall(178), tid, ifmt, w, h, fmt, typ, e, pix); n++;
     }
   }
 }
