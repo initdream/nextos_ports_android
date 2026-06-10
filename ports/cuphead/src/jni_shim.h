@@ -13,6 +13,11 @@ void jni_shim_init(void **out_vm, void **out_env);
 // recon: acha o ponteiro de um metodo nativo registrado via RegisterNatives
 void *jni_find_native(const char *name);
 
+// FMOD AudioTrack: ByteBuffer sentinel + PCM buffer p/ a thread de audio
+void *jni_fmod_bytebuffer(void);
+void *jni_fmod_pcm(void);
+int jni_fmod_pcm_size(void);
+
 // Set package name and OBB version (call before jni_shim_init)
 void jni_shim_set_package(const char *package_name, int obb_version);
 

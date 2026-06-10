@@ -79,10 +79,11 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
 /* ---------- overrides bionic->glibc (do re4) ---------- */
 /* sysconf: Unity lê _SC_* com constantes BIONIC (≠ glibc) → page/nproc/phys errados. */
 static long my_sysconf(int name) {
+  int ncpu = getenv("CUP_1CORE") ? 1 : 4;
   switch (name) {
     case 39: case 40: return 4096;                 /* _SC_PAGE_SIZE/_SC_PAGESIZE bionic */
     case 6: return 100;                            /* _SC_CLK_TCK */
-    case 96: case 97: return 4;                    /* _SC_NPROCESSORS_CONF/_ONLN -> 4 cores */
+    case 96: case 97: return ncpu;                 /* _SC_NPROCESSORS_CONF/_ONLN (1 core => Unity desliga MT rendering) */
     case 98: return (512L*1024*1024)/4096;         /* _SC_PHYS_PAGES -> 512MB */
     case 99: return (256L*1024*1024)/4096;         /* _SC_AVPHYS_PAGES -> 256MB */
   }
@@ -99,7 +100,7 @@ static FILE *my_fopen(const char *p, const char *m) {
     FILE *t = tmpfile(); if (t) { fputs("MemTotal:      524288 kB\nMemFree:       262144 kB\nMemAvailable:  262144 kB\n", t); rewind(t); return t; }
   }
   if (p && (!strcmp(p, "/sys/devices/system/cpu/possible") || !strcmp(p, "/sys/devices/system/cpu/present") || !strcmp(p, "/sys/devices/system/cpu/online"))) {
-    FILE *t = tmpfile(); if (t) { fputs("0-3\n", t); rewind(t); return t; }
+    FILE *t = tmpfile(); if (t) { fputs(getenv("CUP_1CORE") ? "0\n" : "0-3\n", t); rewind(t); return t; }
   }
   char rb[512]; const char *r = asset_redirect(p, rb, sizeof rb);
   if (r) {
@@ -145,12 +146,36 @@ static const char *asset_redirect(const char *p, char *buf, size_t bufsz) {
   }
   return NULL;
 }
+/* command line do Unity: lido de /proc/<pid>/cmdline (args separados por \0).
+   Injeta -force-gfx-st (single-threaded GFX) p/ matar o GfxDeviceWorker e o
+   deadlock main<->worker no boot. CUP_GFXARGS sobrescreve. */
+static int cmdline_fd(void) {
+  const char *extra = getenv("CUP_GFXARGS");
+  char buf[256]; int n = 0;
+  n += sprintf(buf + n, "cuphead") + 1;
+  if (extra && *extra) {
+    /* CUP_GFXARGS="-a -b" -> cada token \0-terminado */
+    char tmp[200]; strncpy(tmp, extra, sizeof tmp - 1); tmp[sizeof tmp - 1] = 0;
+    for (char *t = strtok(tmp, " "); t; t = strtok(NULL, " ")) n += sprintf(buf + n, "%s", t) + 1;
+  } else {
+    n += sprintf(buf + n, "-force-gfx-st") + 1;
+    n += sprintf(buf + n, "-force-gles20") + 1;
+  }
+  FILE *t = tmpfile();
+  if (!t) return -1;
+  fwrite(buf, 1, n, t); fflush(t);
+  int fd = dup(fileno(t)); fclose(t); lseek(fd, 0, SEEK_SET);
+  fprintf(stderr, "[CMDLINE] injetado (%d bytes): force-gfx-st\n", n);
+  return fd;
+}
 static int my_open(const char *p, int fl, ...) {
   if (p && !strcmp(p, "/proc/cpuinfo")) {
+    int nc = getenv("CUP_1CORE") ? 1 : 4;
     FILE *t = tmpfile();
-    if (t) { for (int i = 0; i < 4; i++) fprintf(t, "processor\t: %d\nCPU implementer\t: 0x41\nCPU architecture: 8\n\n", i);
+    if (t) { for (int i = 0; i < nc; i++) fprintf(t, "processor\t: %d\nCPU implementer\t: 0x41\nCPU architecture: 8\n\n", i);
       fflush(t); int fd = dup(fileno(t)); fclose(t); lseek(fd, 0, SEEK_SET); return fd; }
   }
+  if (p && strstr(p, "cmdline") && !getenv("CUP_NOGFXARGS")) return cmdline_fd();
   char rb[512];
   const char *r = asset_redirect(p, rb, sizeof rb);
   if (r) {
@@ -181,8 +206,24 @@ static int my_access(const char *p, int m) {
   if (r && g_dllog) fprintf(stderr, "[access-redir] %s -> %s\n", p, r);
   return access(r ? r : p, m);
 }
-/* __system_property_get: zera value (Unity lê como string null-terminated) */
-static int my_sysprop(const char *name, char *value) { (void)name; if (value) value[0] = 0; return 0; }
+/* exit() do jogo: loga QUEM chamou (lr) + stack antes de morrer — a morte
+   silenciosa pos-FMOD não deixava rastro. */
+static uintptr_t g_unity_base, g_il2cpp_base;
+static void my_exit(int code) {
+  fprintf(stderr, "[EXIT] exit(%d) chamado! lr=%p\n", code, __builtin_return_address(0));
+  uintptr_t tb = (uintptr_t)g_unity_base;
+  uintptr_t lr = (uintptr_t)__builtin_return_address(0);
+  if (tb && lr >= tb) fprintf(stderr, "[EXIT] (libunity+0x%lx)\n", lr - tb);
+  fsync(2);
+  _exit(code);
+}
+/* __system_property_get: FMOD checa ro.build.version.sdk antes de usar OpenSLES
+   (vazio→SDK 0→desiste sem nem dar dlsym; receita Dysmantle: "25"). Resto vazio. */
+static int my_sysprop(const char *name, char *value) {
+  if (!value) return 0;
+  if (name && strstr(name, "version.sdk")) { strcpy(value, "25"); return 2; }
+  value[0] = 0; return 0;
+}
 /* __android_log -> stderr */
 static int my_alog_print(int prio, const char *tag, const char *fmt, ...) {
   va_list ap; va_start(ap, fmt); fprintf(stderr, "[ALOG:%d %s] ", prio, tag ? tag : "?");
@@ -278,6 +319,34 @@ static const unsigned char *my_glGetString(unsigned n){
   return s;
 }
 
+/* ---- wrappers GL de shader (diagnóstico: shader falha/trava no Mali?) ---- */
+static void (*r_glCompileShader)(unsigned);
+static void (*r_glGetShaderiv)(unsigned, unsigned, int *);
+static void (*r_glLinkProgram)(unsigned);
+static void (*r_glGetProgramiv)(unsigned, unsigned, int *);
+static void (*r_glGetShaderInfoLog)(unsigned, int, int *, char *);
+static int g_shN, g_prN;
+static void my_glCompileShader(unsigned sh) {
+  if (!r_glCompileShader) r_glCompileShader = dlsym(RTLD_DEFAULT, "glCompileShader");
+  if (!r_glGetShaderiv) r_glGetShaderiv = dlsym(RTLD_DEFAULT, "glGetShaderiv");
+  if (!r_glGetShaderInfoLog) r_glGetShaderInfoLog = dlsym(RTLD_DEFAULT, "glGetShaderInfoLog");
+  r_glCompileShader(sh);
+  int st = -1; if (r_glGetShaderiv) r_glGetShaderiv(sh, 0x8B81, &st); /* COMPILE_STATUS */
+  if (st != 1 && g_shN < 20) {
+    char log[512] = {0}; if (r_glGetShaderInfoLog) r_glGetShaderInfoLog(sh, sizeof log - 1, NULL, log);
+    fprintf(stderr, "[SHADER] compile sh=%u status=%d LOG=%s\n", sh, st, log); dbg_sync();
+  }
+  g_shN++;
+}
+static void my_glLinkProgram(unsigned pr) {
+  if (!r_glLinkProgram) r_glLinkProgram = dlsym(RTLD_DEFAULT, "glLinkProgram");
+  if (!r_glGetProgramiv) r_glGetProgramiv = dlsym(RTLD_DEFAULT, "glGetProgramiv");
+  r_glLinkProgram(pr);
+  int st = -1; if (r_glGetProgramiv) r_glGetProgramiv(pr, 0x8B82, &st); /* LINK_STATUS */
+  if (st != 1 && g_prN < 20) { fprintf(stderr, "[SHADER] link pr=%u status=%d\n", pr, st); dbg_sync(); }
+  g_prN++;
+}
+
 static char g_dl_self, g_dl_il2cpp;
 static so_module *g_m_unity = NULL, *g_m_il2cpp = NULL;
 
@@ -359,6 +428,10 @@ static void *my_dlsym(void *h, const char *nm) {
   if (!nm) return NULL;
   if (g_dllog) fprintf(stderr, "[dlsym] h=%p \"%s\"\n", h, nm);
   if (!strcmp(nm, "glGetString")) return (void *)my_glGetString;
+  if (getenv("CUP_SHLOG")) {
+    if (!strcmp(nm, "glCompileShader")) return (void *)my_glCompileShader;
+    if (!strcmp(nm, "glLinkProgram")) return (void *)my_glLinkProgram;
+  }
   if (nm[0] == 'e' && nm[1] == 'g' && nm[2] == 'l') { void *p = egl_route(nm); if (p) return p; }
   /* AUDIO: dlsym do handle de libOpenSLES -> opensles_shim (slCreateEngine + SL_IID_*
      com as identidades DO SHIM — ele compara ponteiro, receita re4/Dysmantle) */
@@ -420,7 +493,6 @@ static void *sh_getspecific(unsigned k) { if ((int)k <= 0 || (int)k >= NSLOT) re
 static int sh_setspecific(unsigned k, const void *v) { if ((int)k <= 0 || (int)k >= NSLOT) return 22; tls_slots()[(int)k] = (void *)v; return 0; }
 
 /* ---------- abort/raise/tgkill: loga o CALLER (achar a origem do fatal) ---------- */
-static uintptr_t g_unity_base = 0, g_il2cpp_base = 0;
 static void map_caller(const char *tag, uintptr_t ra) {
   if (g_unity_base && ra >= g_unity_base && ra < g_unity_base + 0x2000000)
     fprintf(stderr, "%s caller=libunity+0x%lx\n", tag, ra - g_unity_base);
@@ -484,6 +556,33 @@ static long ndk_stub0(void) { return 0; }
 
 extern int my_sigaction();  /* bionic_shims.c (ABI sigset bionic/glibc) */
 
+/* thread de áudio do FMOD (output AudioTrack Java): o Cuphead registra
+   org.fmod.FMODAudioDevice.fmodProcess(ByteBuffer) e espera uma thread Java
+   chamá-la em loop p/ o mixer avançar. Sem JVM, replicamos em C: assim que
+   fmodProcess existir, chamamos com nosso ByteBuffer a cada ~10ms. Isso destrava
+   o boot (a main fica presa no nativeRender esperando o áudio progredir). */
+static void *g_fmod_env;
+static volatile int g_fmod_run = 1;
+static void *fmod_audio_thread(void *arg) {
+  (void)arg;
+  void *fp = NULL;
+  while (g_fmod_run && !(fp = jni_find_native("fmodProcess"))) usleep(20000);
+  if (!fp) return NULL;
+  fprintf(stderr, "[AUDIO] fmodProcess=%p; thread alimentando (10ms)\n", fp);
+  static long dev = 0xFAD;            /* this (FMODAudioDevice) fake */
+  void *bb = jni_fmod_bytebuffer();
+  /* dá um tempo p/ o FMOD terminar o init antes de bater no mixer */
+  usleep(300000);
+  unsigned long n = 0;
+  while (g_fmod_run) {
+    int r = ((int (*)(void *, void *, void *))fp)(g_fmod_env, &dev, bb);
+    if (n < 3 || n % 500 == 0) { fprintf(stderr, "[AUDIO] fmodProcess #%lu -> %d\n", n, r); dbg_sync(); }
+    n++;
+    usleep(10000);
+  }
+  return NULL;
+}
+
 int main(int argc, char **argv) {
   (void)argc; (void)argv;
   setvbuf(stdout, NULL, _IONBF, 0); setvbuf(stderr, NULL, _IONBF, 0);
@@ -511,6 +610,7 @@ int main(int argc, char **argv) {
   struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = on_crash; sa.sa_flags = SA_SIGINFO;
   sigaction(SIGSEGV, &sa, 0); sigaction(SIGBUS, &sa, 0); sigaction(SIGABRT, &sa, 0);
   sigaction(SIGILL, &sa, 0); sigaction(SIGFPE, &sa, 0);
+  sigaction(SIGTRAP, &sa, 0); sigaction(SIGSYS, &sa, 0);  /* BRK/seccomp matam calado */
 
   fprintf(stderr, "=== Cuphead Unity 2017.4 IL2CPP (arm64 GLES2) so-loader ===\n");
 
@@ -535,6 +635,8 @@ int main(int argc, char **argv) {
   set_import("abort", (void *)my_abort);
   set_import("raise", (void *)my_raise);
   set_import("tgkill", (void *)my_tgkill);
+  set_import("exit", (void *)my_exit);
+  set_import("_exit", (void *)my_exit);
   /* __stack_chk_fail nao esta na tabela de imports -> patch direto na GOT (apos resolve) */
   set_import("glGetString", (void *)my_glGetString);
   set_import("sysconf", (void *)my_sysconf);
@@ -591,6 +693,8 @@ int main(int argc, char **argv) {
   patch_got("stat", (void *)my_stat);
   patch_got("lstat", (void *)my_lstat);
   patch_got("access", (void *)my_access);
+  patch_got("exit", (void *)my_exit);
+  patch_got("_exit", (void *)my_exit);
   /* sensores/looper/profiler google: stub no-op (nao usados no path do gfx) */
   const char *ndk_noop[] = {
     "ALooper_forThread","ALooper_prepare","ASensorManager_getInstance",
@@ -635,6 +739,19 @@ int main(int argc, char **argv) {
     else fprintf(stderr, "[SCF] __stack_chk_fail nao achado na GOT\n");
   }
 
+  /* DIAGNÓSTICO: a main fica presa num loop (libunity 0x873a90) esperando a
+     função 0x8739c4 (fila do GfxDevice [+224]/[+256]) zerar — deadlock do
+     threaded rendering no Mali. CUP_NOGFXWAIT patcha 0x8739c4 p/ retornar 0
+     (não espera) e ver se o jogo avança. */
+  if (getenv("CUP_NOGFXWAIT")) {
+    extern void so_make_text_writable(void), so_make_text_executable(void);
+    so_make_text_writable();
+    *(uint32_t *)((uintptr_t)text_base + 0x8739c4) = 0x52800000u; /* mov w0,#0 */
+    *(uint32_t *)((uintptr_t)text_base + 0x8739c8) = 0xd65f03c0u; /* ret */
+    so_make_text_executable(); so_flush_caches();
+    fprintf(stderr, "[NOGFXWAIT] 0x8739c4 -> mov w0,#0; ret\n");
+  }
+
   fprintf(stderr, "[F0] init_array...\n");
   so_execute_init_array();
   fprintf(stderr, "[F0] libunity init OK\n");
@@ -672,6 +789,8 @@ int main(int argc, char **argv) {
     patch_got("access", (void *)my_access);
     patch_got("dlopen", (void *)my_dlopen);
     patch_got("dlsym", (void *)my_dlsym);
+    patch_got("exit", (void *)my_exit);
+    patch_got("_exit", (void *)my_exit);
     patch_got("__android_log_print", (void *)my_alog_print);
     patch_got("__android_log_write", (void *)my_alog_write);
     patch_got("__android_log_vprint", (void *)my_alog_vprint);
@@ -751,13 +870,27 @@ int main(int argc, char **argv) {
   if ((fn = jni_find_native("nativeResume"))) ((void (*)(void *, void *))fn)(env, &thiz);
   if ((fn = jni_find_native("nativeFocusChanged"))) ((void (*)(void *, void *, int))fn)(env, &thiz, 1);
 
+  /* dispara a thread de áudio do FMOD (alimenta fmodProcess em paralelo ao
+     render — destrava o boot que espera o mixer). CUP_NOAUDIOTHREAD=1 desliga. */
+  if (!getenv("CUP_NOAUDIOTHREAD")) {
+    g_fmod_env = env;
+    pthread_t at; pthread_create(&at, NULL, fmod_audio_thread, NULL);
+    pthread_detach(at);
+    fprintf(stderr, "[AUDIO] thread de áudio FMOD criada\n");
+  }
+
   void *render = jni_find_native("nativeRender");
   fprintf(stderr, "[F2] nativeRender=%p -> loop\n", render);
   int max_f = getenv("CUP_FRAMES") ? atoi(getenv("CUP_FRAMES")) : 600;
+  void *fpump = jni_find_native("nativePause");  /* só p/ existência */ (void)fpump;
   for (int f = 0; render && (max_f <= 0 || f < max_f); f++) {
+    if (f < 200) { fprintf(stderr, "[r%d>\n", f); dbg_sync(); }  /* ENTRA no render */
     ((unsigned char (*)(void *, void *))render)(env, &thiz);
+    if (f < 200) { fprintf(stderr, "<r%d]\n", f); dbg_sync(); }  /* SAIU do render */
     opensles_shim_pump_callbacks();
-    if (f < 5 || f % 60 == 0) { fprintf(stderr, "[render %d]\n", f); dbg_sync(); }
+    /* bombeia eventos SDL (foco/janela) p/ o input do Unity não esfomear */
+    SDL_Event ev; while (SDL_PollEvent(&ev)) {}
+    if (f % 60 == 0) { fprintf(stderr, "[render %d]\n", f); dbg_sync(); }
   }
   fprintf(stderr, "[F2] === render loop terminou ===\n");
   fflush(stderr); dbg_sync();

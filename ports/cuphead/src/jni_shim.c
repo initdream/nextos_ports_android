@@ -128,6 +128,16 @@ static struct barr *barr_find(void *h) {
     return (struct barr *)h;
   return NULL;
 }
+/* int[] real (p/ InputDevice.getDeviceIds): len = nº de ELEMENTOS, buf = 4*len bytes */
+static void *iarr_new(const int *vals, int n) {
+  int i = g_barr_n++ % MAX_BARR;
+  if (g_barr[i].buf) free(g_barr[i].buf);
+  g_barr[i].buf = (unsigned char *)malloc(n > 0 ? n * 4 : 4);
+  g_barr[i].len = n;
+  if (vals && n > 0) memcpy(g_barr[i].buf, vals, n * 4);
+  else if (n > 0) memset(g_barr[i].buf, 0, n * 4);
+  return &g_barr[i];
+}
 
 /* --- InputStream (FILE*) tracking --- */
 #define MAX_ASTREAMS 32
@@ -288,7 +298,9 @@ static void *jni_GetStaticFieldID(void *env, void *clazz, const char *name,
   debugPrintf("jni_shim: GetStaticFieldID(%s, %s)\n", name, sig);
   if (strcmp(name, "OBB_VERSIONCODE") == 0)
     return &g_method_tags[FID_OBB_VERSIONCODE];
-  return &g_method_tags[FID_GENERIC];
+  /* registra o nome p/ GetStaticObjectField devolver a chave certa
+     (AudioManager.PROPERTY_OUTPUT_*  -> getProperty distingue) */
+  return reg_mid(name, sig);
 }
 
 /* CallObjectMethod — Unity (C++) usa a variante V (va_list); dispatch nela. */
@@ -314,6 +326,16 @@ static void *jni_CallObjectMethodV(void *env, void *obj, void *methodID,
       if (ln && strstr(ln, "unity"))
         return make_jstring(ASSET_BASE "libunity.so");
       return make_jstring("");
+    }
+    /* AudioManager.getProperty(key) -> valores válidos p/ o FMOD não configurar
+       buffer/samplerate=0 (parseInt do nosso stub dava 0 -> mixer travava no boot) */
+    if (strcmp(nm, "getProperty") == 0) {
+      void *keyo = va_arg(ap, void *);
+      const char *key = resolve_jstring(keyo);
+      const char *val = "44100";
+      if (key && strstr(key, "FRAMES_PER_BUFFER")) val = "256";
+      debugPrintf("jni_shim: getProperty(%s) -> %s\n", key ? key : "?", val);
+      return make_jstring(val);
     }
     /* AssetManager bridge */
     if (strcmp(nm, "getAssets") == 0) return &g_assetmgr;
@@ -445,6 +467,16 @@ static void *jni_CallStaticObjectMethod(void *env, void *clazz,
   (void)clazz;
 
   const char *nm = mid_name(methodID);
+  /* InputDevice.getDeviceIds() -> int[] REAL. Retornar fake quebrava o input
+     system do Cuphead (GetIntArrayElements no fake -> lixo -> spin infinito no
+     boot). CUP_NDEV=N controla quantos devices (default 0 = só touch). */
+  if (nm && !strcmp(nm, "getDeviceIds")) {
+    int ndev = getenv("CUP_NDEV") ? atoi(getenv("CUP_NDEV")) : 0;
+    int ids[8]; for (int i = 0; i < ndev && i < 8; i++) ids[i] = 100 + i;
+    static int once = 0; if (!once) { once = 1;
+      debugPrintf("jni_shim: getDeviceIds() -> int[%d]\n", ndev); }
+    return iarr_new(ids, ndev);
+  }
   debugPrintf("jni_shim: CallStaticObjectMethod(%s)\n", nm ? nm : "?");
   static int fake_result;
   return &fake_result;  /* fake Class/objeto nao-nulo (forName etc.) */
@@ -462,12 +494,26 @@ static unsigned char jni_CallStaticBooleanMethod(void *env, void *clazz,
 }
 
 /* CallStaticIntMethod (index 136) */
-static jint jni_CallStaticIntMethod(void *env, void *clazz, void *methodID,
-                                    ...) {
-  (void)env;
-  (void)clazz;
-  (void)methodID;
+static jint cint_dispatch(void *methodID, void *arg0) {
+  const char *nm = mid_name(methodID);
+  if (nm && (strcmp(nm, "parseInt") == 0 || strcmp(nm, "valueOf") == 0 ||
+             strcmp(nm, "intValue") == 0)) {
+    const char *str = resolve_jstring(arg0);
+    int v = str ? atoi(str) : 0;
+    debugPrintf("jni_shim: %s(%s) -> %d\n", nm, str ? str : "?", v);
+    return v;
+  }
   return 0;
+}
+static jint jni_CallStaticIntMethod(void *env, void *clazz, void *methodID, ...) {
+  (void)env; (void)clazz;
+  va_list ap; va_start(ap, methodID); void *a = va_arg(ap, void *); va_end(ap);
+  return cint_dispatch(methodID, a);
+}
+static jint jni_CallStaticIntMethodV(void *env, void *clazz, void *methodID, va_list ap) {
+  (void)env; (void)clazz;
+  void *a = va_arg(ap, void *);
+  return cint_dispatch(methodID, a);
 }
 
 /* CallStaticVoidMethod (index 145) */
@@ -496,7 +542,13 @@ static jint jni_GetStaticIntField(void *env, void *clazz, void *fieldID) {
 static void *jni_GetStaticObjectField(void *env, void *clazz, void *fieldID) {
   (void)env;
   (void)clazz;
-  (void)fieldID;
+  const char *nm = mid_name(fieldID);
+  /* constantes String do AudioManager: devolver o NOME como valor p/ getProperty
+     distinguir SAMPLE_RATE x FRAMES_PER_BUFFER */
+  if (nm && (strstr(nm, "PROPERTY_") || strstr(nm, "SERVICE"))) {
+    debugPrintf("jni_shim: GetStaticObjectField(%s) -> chave\n", nm);
+    return make_jstring(nm);
+  }
   debugPrintf("jni_shim: GetStaticObjectField -> NULL\n");
   static int fake;
   return &fake;
@@ -596,9 +648,23 @@ static void *jni_ExceptionOccurred(void *env) {
 /* Array */
 static jint jni_GetArrayLength(void *env, void *array) {
   (void)env;
-  (void)array;
-  return 0;
+  struct barr *b = barr_find(array);
+  return b ? b->len : 0;
 }
+/* int[] accessors (InputDevice IDs etc.) */
+static void *jni_GetIntArrayElements(void *env, void *arr, void *isCopy) {
+  (void)env; if (isCopy) *(unsigned char *)isCopy = 0;
+  struct barr *b = barr_find(arr); return b ? b->buf : NULL;
+}
+static void jni_ReleaseIntArrayElements(void *env, void *arr, void *el, int m) {
+  (void)env; (void)arr; (void)el; (void)m;
+}
+static void jni_GetIntArrayRegion(void *env, void *arr, int start, int len, void *buf) {
+  (void)env; struct barr *b = barr_find(arr);
+  if (b && buf && start >= 0 && (start + len) * 4 <= (b->len * 4 > 0 ? b->len * 4 : 0) + 4)
+    memcpy(buf, b->buf + start * 4, len * 4);
+}
+static void *jni_NewIntArray(void *env, int len) { (void)env; return iarr_new(NULL, len); }
 
 /* ---- JavaVM functions ---- */
 
@@ -666,6 +732,21 @@ static int jni_RegisterNatives(void *env, void *clazz, const void *methods, int 
     }
   }
   return 0;
+}
+
+/* ---- DirectByteBuffer p/ a thread de áudio do FMOD (AudioTrack Java) ----
+   fmodProcess(env, thiz, ByteBuffer) faz GetDirectBufferAddress/Capacity no buffer
+   p/ saber onde escrever o PCM. Damos um buffer real nosso. */
+static unsigned char g_fmod_pcm[32768];
+static int g_fmod_bb_sentinel;
+void *jni_fmod_bytebuffer(void) { return &g_fmod_bb_sentinel; }
+void *jni_fmod_pcm(void) { return g_fmod_pcm; }
+int jni_fmod_pcm_size(void) { return (int)sizeof(g_fmod_pcm); }
+static void *jni_GetDirectBufferAddress(void *env, void *buf) {
+  (void)env; if (buf == &g_fmod_bb_sentinel) return g_fmod_pcm; return NULL;
+}
+static long jni_GetDirectBufferCapacity(void *env, void *buf) {
+  (void)env; if (buf == &g_fmod_bb_sentinel) return (long)sizeof(g_fmod_pcm); return -1;
 }
 
 /* GetJavaVM (index 219) — initJni chama isso */
@@ -764,7 +845,7 @@ void jni_shim_init(void **out_vm, void **out_env) {
   jni_env_vtable[117] = (uintptr_t)jni_CallStaticBooleanMethod;
   jni_env_vtable[118] = (uintptr_t)jni_CallStaticBooleanMethod; /* V */
   jni_env_vtable[129] = (uintptr_t)jni_CallStaticIntMethod;
-  jni_env_vtable[130] = (uintptr_t)jni_CallStaticIntMethod; /* V */
+  jni_env_vtable[130] = (uintptr_t)jni_CallStaticIntMethodV; /* V (va_list) */
   jni_env_vtable[141] = (uintptr_t)jni_CallStaticVoidMethod;
   jni_env_vtable[142] = (uintptr_t)jni_CallStaticVoidMethod; /* V */
   jni_env_vtable[144] = (uintptr_t)jni_GetStaticFieldID;
@@ -775,7 +856,13 @@ void jni_shim_init(void **out_vm, void **out_env) {
   jni_env_vtable[169] = (uintptr_t)jni_GetStringUTFChars;
   jni_env_vtable[170] = (uintptr_t)jni_ReleaseStringUTFChars;
   jni_env_vtable[171] = (uintptr_t)jni_GetArrayLength;
+  jni_env_vtable[179] = (uintptr_t)jni_NewIntArray;          /* NewIntArray */
+  jni_env_vtable[187] = (uintptr_t)jni_GetIntArrayElements;  /* int[] elements */
+  jni_env_vtable[195] = (uintptr_t)jni_ReleaseIntArrayElements;
+  jni_env_vtable[203] = (uintptr_t)jni_GetIntArrayRegion;
   jni_env_vtable[205] = (uintptr_t)jni_ExceptionCheck;
+  jni_env_vtable[230] = (uintptr_t)jni_GetDirectBufferAddress;
+  jni_env_vtable[231] = (uintptr_t)jni_GetDirectBufferCapacity;
 
   jni_env_ptr = jni_env_vtable;
 
