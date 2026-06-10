@@ -133,15 +133,15 @@ static void push_joystick_event(float lx, float ly, float rx, float ry) {
 static int sdl_button_to_keycode(int sdl_button) {
   switch (sdl_button) {
   case SDL_CONTROLLER_BUTTON_A:
-    return AKEYCODE_BUTTON_B; // Trimui: A/B swapped (Nintendo layout)
-  case SDL_CONTROLLER_BUTTON_B:
     return AKEYCODE_BUTTON_A;
+  case SDL_CONTROLLER_BUTTON_B:
+    return AKEYCODE_BUTTON_B;
   case SDL_CONTROLLER_BUTTON_X:
     return AKEYCODE_BUTTON_X;
   case SDL_CONTROLLER_BUTTON_Y:
     return AKEYCODE_BUTTON_Y;
   case SDL_CONTROLLER_BUTTON_BACK:
-    return AKEYCODE_BACK;
+    return AKEYCODE_BUTTON_SELECT; /* BACK(4)=Paddleboat trata especial */
   case SDL_CONTROLLER_BUTTON_START:
     return AKEYCODE_BUTTON_START;
   case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:
@@ -184,14 +184,152 @@ static void init_gamecontroller(void) {
   }
 }
 
+/* ---- Ponte Paddleboat (input nativo do DYSMANTLE) ----
+ * O Paddleboat está ESTÁTICO no libNativeGame com os entry-points exportados.
+ * Alimentamos ele direto (sem Java): registra o controle via
+ * Java_..._onControllerConnected e injeta eventos via
+ * Paddleboat_processGameActivity{Key,Motion}InputEvent.
+ * Layouts extraídos do binário:
+ *  key:    {devId@0,src@4,action@8,keyCode@48} size 56
+ *  motion: {devId@0,src@4,action@8,ptrCount@56,ptrs@64
+ *           (8×{id;float axes[48];rawX;rawY}=204), precision@1696} size 1704
+ *  onControllerConnected(env,thiz,jintArray[7],jfloatArray mins/maxs/flats/
+ *  fuzzes[48]); deviceInfo={devId,vendor,product,axisBitsLow,axisBitsHigh,
+ *  controllerNumber,flags}. Eventos têm que casar o deviceId. */
+#define PB_DEVICE_ID 7777
+#define PB_SRC_JOYSTICK 0x01000010
+#define PB_SRC_GAMEPAD 0x00000401
+
+typedef struct {
+  int32_t deviceId, source, action, pad_;
+  int64_t eventTime, downTime;
+  int32_t flags, metaState, modifiers, repeatCount, keyCode, unicodeChar;
+} PbKeyEvent; /* 56 bytes */
+
+typedef struct {
+  int32_t id;
+  float axisValues[48];
+  float rawX, rawY;
+} PbPointer; /* 204 bytes */
+
+typedef struct {
+  int32_t deviceId, source, action, pad_;
+  int64_t eventTime, downTime;
+  int32_t flags, metaState, actionButton, buttonState, classification,
+      edgeFlags;
+  uint32_t pointerCount;
+  int32_t pad2_;
+  PbPointer pointers[8];
+  float precisionX, precisionY;
+} PbMotionEvent; /* 1704 bytes */
+
+_Static_assert(sizeof(PbKeyEvent) == 56, "PbKeyEvent layout");
+_Static_assert(sizeof(PbMotionEvent) == 1704, "PbMotionEvent layout");
+
+static int g_pb_connected = 0;
+static int (*pb_isInitialized)(void);
+static int32_t (*pb_processKey)(const void *, size_t);
+static int32_t (*pb_processMotion)(const void *, size_t);
+static void (*pb_onConnected)(void *, void *, void *, void *, void *, void *,
+                              void *);
+
+static void pb_try_connect(void) {
+  if (g_pb_connected) return;
+  if (!pb_isInitialized) {
+    pb_isInitialized =
+        (int (*)(void))so_find_addr_safe("Paddleboat_isInitialized");
+    pb_processKey = (int32_t(*)(const void *, size_t))so_find_addr_safe(
+        "Paddleboat_processGameActivityKeyInputEvent");
+    pb_processMotion = (int32_t(*)(const void *, size_t))so_find_addr_safe(
+        "Paddleboat_processGameActivityMotionInputEvent");
+    pb_onConnected =
+        (void (*)(void *, void *, void *, void *, void *, void *, void *))
+            so_find_addr_safe("Java_com_google_android_games_paddleboat_"
+                              "GameControllerManager_onControllerConnected");
+    if (!pb_isInitialized || !pb_processKey || !pb_processMotion ||
+        !pb_onConnected) {
+      debugPrintf("android_shim: Paddleboat exports não achados\n");
+      pb_isInitialized = NULL;
+      return;
+    }
+  }
+  if (!pb_isInitialized()) return; /* engine ainda não rodou Paddleboat_init */
+
+  /* axisBits: X,Y(sticks L) Z,RZ(stick R) HAT_X/Y(dpad) L/RTRIGGER */
+  static const int32_t info[7] = {
+      PB_DEVICE_ID, 0x0810, 0x0001,
+      (1 << 0) | (1 << 1) | (1 << 11) | (1 << 14) | (1 << 15) | (1 << 16) |
+          (1 << 17) | (1 << 18),
+      0, 1, 0};
+  static float mins[48], maxs[48], flats[48], fuzzes[48];
+  for (int i = 0; i < 48; i++) {
+    mins[i] = -1.0f; maxs[i] = 1.0f; flats[i] = 0.05f; fuzzes[i] = 0.01f;
+  }
+  pb_onConnected(g_activity.env, NULL, jni_shim_make_array(info, 7),
+                 jni_shim_make_array(mins, 48), jni_shim_make_array(maxs, 48),
+                 jni_shim_make_array(flats, 48),
+                 jni_shim_make_array(fuzzes, 48));
+  g_pb_connected = 1;
+  debugPrintf("android_shim: Paddleboat controle conectado (devId=%d)\n",
+              PB_DEVICE_ID);
+}
+
+static void pb_send_key(int action, int keycode) {
+  if (!g_pb_connected) return;
+  PbKeyEvent ev;
+  memset(&ev, 0, sizeof(ev));
+  ev.deviceId = PB_DEVICE_ID;
+  ev.source = PB_SRC_GAMEPAD;
+  ev.action = action; /* 0=down 1=up */
+  ev.keyCode = keycode;
+  int32_t r = pb_processKey(&ev, sizeof(ev));
+  debugPrintf("android_shim: pb_key action=%d kc=%d -> %d\n", action, keycode,
+              (int)r);
+}
+
+static void pb_send_motion(float lx, float ly, float rx, float ry, float hx,
+                           float hy, float lt, float rt) {
+  if (!g_pb_connected) return;
+  static PbMotionEvent ev; /* 1.7KB, fora da stack */
+  memset(&ev, 0, sizeof(ev));
+  ev.deviceId = PB_DEVICE_ID;
+  ev.source = PB_SRC_JOYSTICK;
+  ev.action = 2; /* AMOTION_EVENT_ACTION_MOVE */
+  ev.pointerCount = 1;
+  ev.pointers[0].id = 0;
+  ev.pointers[0].axisValues[0] = lx;   /* AXIS_X */
+  ev.pointers[0].axisValues[1] = ly;   /* AXIS_Y */
+  ev.pointers[0].axisValues[11] = rx;  /* AXIS_Z */
+  ev.pointers[0].axisValues[14] = ry;  /* AXIS_RZ */
+  ev.pointers[0].axisValues[15] = hx;  /* AXIS_HAT_X */
+  ev.pointers[0].axisValues[16] = hy;  /* AXIS_HAT_Y */
+  ev.pointers[0].axisValues[17] = lt;  /* AXIS_LTRIGGER */
+  ev.pointers[0].axisValues[18] = rt;  /* AXIS_RTRIGGER */
+  pb_processMotion(&ev, sizeof(ev));
+}
+
 /* ---- Process SDL events into input queue ---- */
 
 #define STICK_DEADZONE 8000
 #define CURSOR_SPEED 12.0f
 
+static float g_hat_x = 0, g_hat_y = 0;
+static float g_last_lt = 0, g_last_rt = 0;
+static int g_motion_dirty = 0;
+
+static void update_hat_from_dpad(int button, int down) {
+  float v = down ? 1.0f : 0.0f;
+  if (button == SDL_CONTROLLER_BUTTON_DPAD_LEFT)  g_hat_x = down ? -v : 0;
+  if (button == SDL_CONTROLLER_BUTTON_DPAD_RIGHT) g_hat_x = v;
+  if (button == SDL_CONTROLLER_BUTTON_DPAD_UP)    g_hat_y = down ? -v : 0;
+  if (button == SDL_CONTROLLER_BUTTON_DPAD_DOWN)  g_hat_y = v;
+  g_motion_dirty = 1;
+}
+
 static void process_sdl_events(void) {
   // Try to open a gamepad if we don't have one yet
   init_gamecontroller();
+  pb_try_connect();
 
   SDL_Event e;
   while (SDL_PollEvent(&e)) {
@@ -204,26 +342,13 @@ static void process_sdl_events(void) {
       int kc = sdl_button_to_keycode(e.cbutton.button);
       if (kc >= 0) {
         push_key_event(AKEY_EVENT_ACTION_DOWN, kc);
+        pb_send_key(AKEY_EVENT_ACTION_DOWN, kc);
         debugPrintf("android_shim: button DOWN keycode=%d\n", kc);
       }
-      // D-pad also sends HAT axis joystick events
+      // D-pad also feeds HAT axes (Paddleboat dpad via motion)
       if (e.cbutton.button >= SDL_CONTROLLER_BUTTON_DPAD_UP &&
-          e.cbutton.button <= SDL_CONTROLLER_BUTTON_DPAD_RIGHT) {
-        float hat_x = 0, hat_y = 0;
-        if (e.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_LEFT)  hat_x = -1.0f;
-        if (e.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_RIGHT) hat_x = 1.0f;
-        if (e.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_UP)    hat_y = -1.0f;
-        if (e.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_DOWN)  hat_y = 1.0f;
-        FakeInputEvent ev;
-        memset(&ev, 0, sizeof(ev));
-        ev.type = AINPUT_EVENT_TYPE_MOTION;
-        ev.action = AMOTION_EVENT_ACTION_MOVE;
-        ev.source = AINPUT_SOURCE_JOYSTICK;
-        ev.pointer_count = 1;
-        ev.axes[AMOTION_EVENT_AXIS_HAT_X] = hat_x;
-        ev.axes[AMOTION_EVENT_AXIS_HAT_Y] = hat_y;
-        input_queue_push(&ev);
-      }
+          e.cbutton.button <= SDL_CONTROLLER_BUTTON_DPAD_RIGHT)
+        update_hat_from_dpad(e.cbutton.button, 1);
       break;
     }
 
@@ -231,18 +356,11 @@ static void process_sdl_events(void) {
       int kc = sdl_button_to_keycode(e.cbutton.button);
       if (kc >= 0) {
         push_key_event(AKEY_EVENT_ACTION_UP, kc);
+        pb_send_key(AKEY_EVENT_ACTION_UP, kc);
       }
-      // D-pad release: reset HAT axes to 0
       if (e.cbutton.button >= SDL_CONTROLLER_BUTTON_DPAD_UP &&
-          e.cbutton.button <= SDL_CONTROLLER_BUTTON_DPAD_RIGHT) {
-        FakeInputEvent ev;
-        memset(&ev, 0, sizeof(ev));
-        ev.type = AINPUT_EVENT_TYPE_MOTION;
-        ev.action = AMOTION_EVENT_ACTION_MOVE;
-        ev.source = AINPUT_SOURCE_JOYSTICK;
-        ev.pointer_count = 1;
-        input_queue_push(&ev);
-      }
+          e.cbutton.button <= SDL_CONTROLLER_BUTTON_DPAD_RIGHT)
+        update_hat_from_dpad(e.cbutton.button, 0);
       break;
     }
 
@@ -286,14 +404,27 @@ static void process_sdl_events(void) {
     if (raw_ry > STICK_DEADZONE || raw_ry < -STICK_DEADZONE)
       ry = (float)raw_ry / 32767.0f;
 
+    // Triggers analógicos
+    float lt = (float)SDL_GameControllerGetAxis(
+                   g_gamecontroller, SDL_CONTROLLER_AXIS_TRIGGERLEFT) /
+               32767.0f;
+    float rt = (float)SDL_GameControllerGetAxis(
+                   g_gamecontroller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) /
+               32767.0f;
+
     // Send joystick event only when values change
     if (lx != g_last_lx || ly != g_last_ly ||
-        rx != g_last_rx || ry != g_last_ry) {
+        rx != g_last_rx || ry != g_last_ry ||
+        lt != g_last_lt || rt != g_last_rt || g_motion_dirty) {
       push_joystick_event(lx, ly, rx, ry);
+      pb_send_motion(lx, ly, rx, ry, g_hat_x, g_hat_y, lt, rt);
       g_last_lx = lx;
       g_last_ly = ly;
       g_last_rx = rx;
       g_last_ry = ry;
+      g_last_lt = lt;
+      g_last_rt = rt;
+      g_motion_dirty = 0;
     }
 
     // Also update virtual cursor for touch simulation

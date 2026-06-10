@@ -389,8 +389,17 @@ static void sdl_audio_callback(void *userdata, Uint8 *stream, int len) {
     }
   }
 
-  /* Soft-clip using tanh-style limiter - smooth, no discontinuities */
-  const float master_gain = 0.30f;
+  /* Soft-clip using tanh-style limiter - smooth, no discontinuities.
+   * Ganho master: 0.30 era tuning do Bully (muitos SFX somando). DYSMANTLE
+   * manda UM stream Oboe pré-mixado -> default 1.0; ajustável sem rebuild
+   * via env SLSHIM_GAIN (ex: SLSHIM_GAIN=1.5). */
+  static float master_gain = -1.0f;
+  if (master_gain < 0.0f) {
+    const char *g = getenv("SLSHIM_GAIN");
+    master_gain = g ? (float)atof(g) : 1.0f;
+    if (master_gain <= 0.0f || master_gain > 8.0f) master_gain = 1.0f;
+    debugPrintf("opensles_shim: master_gain=%f\n", master_gain);
+  }
   const float threshold = 28000.0f;
   const float knee = 4000.0f;  /* transition zone */
   static int16_t prev_left = 0, prev_right = 0;

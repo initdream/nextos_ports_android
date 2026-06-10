@@ -162,6 +162,38 @@ static void *jni_CallObjectMethod(void *env, void *obj, void *methodID, ...) {
   return &fake_obj;
 }
 
+/* NewObject (index 28/29/30) - Paddleboat constrói GameControllerManager Java;
+ * NULL aqui = init -2002. Devolvemos objeto fake não-nulo. */
+static void *jni_NewObject(void *env, void *clazz, void *methodID, ...) {
+  (void)env; (void)clazz;
+  debugPrintf("jni_shim: NewObject(mid=%p) -> fake\n", methodID);
+  static int fake_new_obj;
+  return &fake_new_obj;
+}
+
+/* ---- Arrays fake genéricos (int/float) p/ JNI Region/Elements ---- */
+#define MAX_FAKE_ARRAYS 16
+static struct {
+  void *handle;
+  const void *data; /* int32 ou float */
+  int len;
+} g_fake_arrays[MAX_FAKE_ARRAYS];
+static int g_fake_array_count = 0;
+void *jni_shim_make_array(const void *data, int len) {
+  static char handles[MAX_FAKE_ARRAYS];
+  if (g_fake_array_count >= MAX_FAKE_ARRAYS) g_fake_array_count = 0;
+  int i = g_fake_array_count++;
+  g_fake_arrays[i].handle = &handles[i];
+  g_fake_arrays[i].data = data;
+  g_fake_arrays[i].len = len;
+  return g_fake_arrays[i].handle;
+}
+static int find_fake_array(void *h) {
+  for (int i = 0; i < g_fake_array_count; i++)
+    if (g_fake_arrays[i].handle == h) return i;
+  return -1;
+}
+
 /* CallBooleanMethod (index 49) */
 static unsigned char jni_CallBooleanMethod(void *env, void *obj,
                                            void *methodID, ...) {
@@ -331,7 +363,29 @@ static void *jni_ExceptionOccurred(void *env) {
 static jint jni_GetArrayLength(void *env, void *array) {
   (void)env;
   if (array == g_audio_params) return 2;
+  int i = find_fake_array(array);
+  if (i >= 0) return g_fake_arrays[i].len;
   return 0;
+}
+static void jni_GetIntArrayRegion(void *env, void *array, jint start, jint len,
+                                  jint *buf) {
+  (void)env;
+  int i = find_fake_array(array);
+  debugPrintf("jni_shim: GetIntArrayRegion(%p, %d, %d) idx=%d\n", array,
+              (int)start, (int)len, i);
+  if (i < 0 || !buf) return;
+  const jint *d = (const jint *)g_fake_arrays[i].data;
+  for (jint k = 0; k < len && (start + k) < g_fake_arrays[i].len; k++)
+    buf[k] = d[start + k];
+}
+static void jni_GetFloatArrayRegion(void *env, void *array, jint start,
+                                    jint len, float *buf) {
+  (void)env;
+  int i = find_fake_array(array);
+  if (i < 0 || !buf) return;
+  const float *d = (const float *)g_fake_arrays[i].data;
+  for (jint k = 0; k < len && (start + k) < g_fake_arrays[i].len; k++)
+    buf[k] = d[start + k];
 }
 static jint *jni_GetIntArrayElements(void *env, void *array, unsigned char *isCopy) {
   (void)env;
@@ -436,6 +490,9 @@ void jni_shim_init(void **out_vm, void **out_env) {
   jni_env_vtable[22] = (uintptr_t)jni_DeleteGlobalRef;
   jni_env_vtable[23] = (uintptr_t)jni_DeleteLocalRef;
   jni_env_vtable[25] = (uintptr_t)jni_NewLocalRef;
+  jni_env_vtable[28] = (uintptr_t)jni_NewObject;
+  jni_env_vtable[29] = (uintptr_t)jni_NewObject;           /* V variant */
+  jni_env_vtable[30] = (uintptr_t)jni_NewObject;           /* A variant */
   jni_env_vtable[31] = (uintptr_t)jni_GetObjectClass;
   jni_env_vtable[33] = (uintptr_t)jni_GetMethodID;
   jni_env_vtable[34] = (uintptr_t)jni_CallObjectMethod;
@@ -466,7 +523,9 @@ void jni_shim_init(void **out_vm, void **out_env) {
   jni_env_vtable[171] = (uintptr_t)jni_GetArrayLength;
   jni_env_vtable[187] = (uintptr_t)jni_GetIntArrayElements;     /* GetIntArrayElements */
   jni_env_vtable[195] = (uintptr_t)jni_ReleaseIntArrayElements; /* ReleaseIntArrayElements */
-  jni_env_vtable[205] = (uintptr_t)jni_ExceptionCheck;
+  jni_env_vtable[203] = (uintptr_t)jni_GetIntArrayRegion;       /* GetIntArrayRegion */
+  jni_env_vtable[205] = (uintptr_t)jni_GetFloatArrayRegion;     /* GetFloatArrayRegion */
+  jni_env_vtable[228] = (uintptr_t)jni_ExceptionCheck;          /* ExceptionCheck (228 na spec) */
 
   jni_env_ptr = jni_env_vtable;
 
