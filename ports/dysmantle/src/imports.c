@@ -764,6 +764,29 @@ static void my_glTexImage2D(unsigned tgt, int lvl, int ifmt, int w, int h,
       default: break;
     }
   }
+  /* 🧠 TEORIA MEMÓRIA UTGARD (Bully): muitas/grandes texturas estouram a memória
+   * de textura da GPU → uploads tardios (terreno) falham/somem. DYSMANTLE_TEX_HALF
+   * reduz texturas grandes pela metade (box 2x2) p/ liberar memória. */
+  if (getenv("DYSMANTLE_TEX_HALF") && px && lvl == 0 && fmt == 0x1908 &&
+      typ == 0x1401 && w >= 256 && h >= 256 && (w & 1) == 0 && (h & 1) == 0) {
+    int hw = w / 2, hh = h / 2;
+    static unsigned char *half = NULL; static long hcap = 0;
+    long need = (long)hw * hh * 4;
+    if (hcap < need) { free(half); half = malloc(need); hcap = need; }
+    if (half) {
+      const unsigned char *src = (const unsigned char *)px;
+      for (int y = 0; y < hh; y++)
+        for (int x = 0; x < hw; x++) {
+          long s0 = ((long)(y*2)*w + x*2)*4, s1 = s0+4, s2 = s0+(long)w*4, s3 = s2+4;
+          unsigned char *d = half + ((long)y*hw + x)*4;
+          for (int c = 0; c < 4; c++) d[c] = (src[s0+c]+src[s1+c]+src[s2+c]+src[s3+c])/4;
+        }
+      if (gerr) while (gerr()) {}
+      if (real) real(tgt, lvl, ifmt, hw, hh, border, fmt, typ, half);
+      static int hn = 0; if (hn < 4) { fprintf(stderr, "[TEXHALF] %dx%d -> %dx%d\n", w, h, hw, hh); hn++; }
+      return;
+    }
+  }
   if (gerr) while (gerr()) {}
   if (real) real(tgt, lvl, ifmt, w, h, border, fmt, typ, px);
   unsigned e = gerr ? gerr() : 0;

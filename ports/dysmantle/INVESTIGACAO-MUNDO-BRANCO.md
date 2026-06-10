@@ -217,3 +217,16 @@ chão washed-white. Infra de diag toda env-gated; TINT_GREEN/STRIDEFIX off por d
 e fazer createvb/GenerateStreamData extrair os dados certos quando format-0/objeto. OU achar onde
 o entry+0 (formato) deveria ser escrito (é 0; deveria ser e[4]=0x7F) ANTES de AllocateVertexStreams,
 p/ os streams alocarem e a geometria preencher. Comparável a Hollow Knight em dificuldade.
+
+## SESSÃO 3 — fix arriscado + teoria textura: ambos negativos
+| Teste | Método | Resultado |
+|---|---|---|
+| Fix genstreams | DYSMANTLE_GENSTREAMS (chama GenerateVertexStreamsFromInterleaved p/ fmt0) | rodou 6x mas streams continuam NULOS (fmt=0) — a função lê o formato de this+232 que é a CONTAGEM (=2), não o formato; ambiguidade de layout. Não populou |
+| Teoria memória textura (Felipe) | DYSMANTLE_TEX_HALF (reduz texturas ≥256 pela metade, box2x2) | TEXHALF rodou (4+ texturas) MAS branco 0.58 inalterado → NÃO é limite de memória de textura do Utgard. Geometria não desenha (≠ Bully) |
+
+**CONFIRMADO:** o terreno/objetos complexos NÃO desenham por GEOMETRIA (format-0/vertex-stream
+em objeto interleaved), não por textura nem memória. O fix via GenerateVertexStreamsFromInterleaved
+trava porque o campo de formato (this+232) é a contagem de entries (=2), não os bits de formato —
+o formato real (0x7F) está em entry@4 mas a função não o usa. Layout da ModelSurface ambíguo p/
+RE estática. PRÓXIMO REAL: gdb no device p/ rastrear a vtable que decide stream-path × interleaved-path,
+ou RE do construtor da ModelSurface p/ achar onde o formato deveria ser setado (é 0). Nível HK.

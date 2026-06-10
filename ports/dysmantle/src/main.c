@@ -389,10 +389,28 @@ static uint64_t my_createvb(uint32_t fmt, const void *v, uint32_t cnt, int fl) {
 }
 /* detour GenerateVerticesByFormat: loga estado da ModelSurface (count + 5
  * stream ptrs em this+64..96) p/ saber se streams existem mas format=0 */
+static uint32_t surface_format(uint8_t *s);
 static void (*real_genverts)(void *, uint32_t);
+static void (*gen_streams_from_interleaved)(void *) = NULL; /* 0xa06cd4 */
 static void my_genverts(void *self, uint32_t fmt) {
   uint8_t *s = (uint8_t *)self;
   uint64_t *p64 = (uint64_t *)(s + 64);
+  /* 🌍 FIX RISCO: terreno/props chegam fmt=0 c/ streams NULOS mas têm dados
+   * INTERLEAVED (this+224). Chama GenerateVertexStreamsFromInterleaved p/
+   * popular os streams (this+64..96), depois recomputa o formato real e segue.
+   * (DYSMANTLE_GENSTREAMS=1 liga; arriscado, pode crashar.) */
+  if (fmt == 0 && getenv("DYSMANTLE_GENSTREAMS") && !p64[0] && gen_streams_from_interleaved) {
+    uint8_t *arr = *(uint8_t **)(s + 224);
+    int32_t nent = *(int32_t *)(s + 232);
+    if (arr && nent > 0) {
+      gen_streams_from_interleaved(self);  /* popula streams dos interleaved */
+      uint32_t nf = surface_format(s);
+      static int z = 0;
+      if (z < 6) { fprintf(stderr, "[GENSTREAMS] fmt0 -> streams populados, novo fmt=0x%x (p0=%p)\n",
+                           nf, (void *)p64[0]); z++; }
+      if (nf) { real_genverts(self, nf); return; }
+    }
+  }
   /* 🌍 FIX MUNDO BRANCO: surfaces do chão chegam com fmt=0 mas TÊM streams
    * (pos/cor/uv/normal). Computa o formato real dos 5 ponteiros (mesma lógica
    * de GetVertexComponentFlagsAkaVertexFormat): bit0=pos bit3=cor bit1=uv
@@ -507,9 +525,12 @@ static void hook_genverts(void) {
   *(uint64_t *)&tr[3] = addr + 4;
   __builtin___clear_cache((char *)tr, (char *)tr + 32);
   real_genverts = (void (*)(void *, uint32_t))tr;
+  gen_streams_from_interleaved = (void (*)(void *))so_find_addr_safe(
+      "_ZN12ModelSurface52GenerateVertexStreamsFromInterleavedVerticesByFormatEv");
   so_make_text_writable(); hook_arm64(addr, (uintptr_t)my_genverts);
   so_make_text_executable(); so_flush_caches();
-  fprintf(stderr, "hook_genverts: detour @ %p\n", (void *)addr);
+  fprintf(stderr, "hook_genverts: detour @ %p gen_streams=%p\n", (void *)addr,
+          (void *)gen_streams_from_interleaved);
 }
 static void hook_createvb(void) {
   uintptr_t lb = so_find_addr("android_main") - 0x4651a4;
