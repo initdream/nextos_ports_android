@@ -37,3 +37,17 @@
 - ⚠️ armhf: runtime /usr/lib32 (glibc 2.43 32-bit + libMali.m450 + SDL2), launcher PORT_32BIT=Y. Kernel 3.14 sem time64 → shim nextclock.so (time32) como no GTA CTW.
 - ⚠️ Buildar sempre da pasta do port. ES mascarado p/ testes.
 - so_util armhf: `~/gtavc-build/loader/so_util.c` (REL relocs).
+
+## F2 (boot JNI) — EM ANDAMENTO + bug de heap latente
+- Adicionado ao main.c: so_execute_init_array() por módulo, setup jni_shim, chamada JNI_OnLoad
+  + nativeOnCreate(env, fake_this, 0...). MEMORY_MB libapp 320→64 (suficiente, loada 11.6MB).
+- ⚠️ **BUG: heap corruption `malloc(): invalid size (unsorted)`** no load do libapp (durante
+  so_resolve→dlsym, que mallocaa). DIAGNÓSTICO: F1 commitado funciona (0 corrupção); minhas
+  adições F2 EXPÕEM um overflow LATENTE de heap (não-trigger no layout do F1). Descartado por
+  bissecção: NÃO é init_array (NFS_SKIPINIT segue quebrando), NÃO é a sonda de heap (removida,
+  segue). Suspeito = setvbuf(stdout/stderr,_IONBF) pré-load deslocando o layout e expondo o
+  overflow. Removido o setvbuf (não testado — device caiu). PRÓXIMO: testar sem setvbuf; se
+  funcionar, AINDA achar o overflow real (em so_snapshot_symbols? comb_append? so_util load?)
+  pra não voltar no F2+ (nativeOnCreate alocará muito). debugPrintf alternativo p/ logs sem setvbuf.
+- ⚠️ device nextos-87 caiu após ~15 runs (sem rota) — rebootar/power-cycle (lição
+  [[reference]] DYSMANTLE: device degrada em sessões longas de teste).

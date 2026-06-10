@@ -83,31 +83,140 @@ static void patch_sem_shim(void) {
 }
 
 /* ---------- crash handler (arm64) ---------- */
+static uintptr_t g_unity_base, g_il2cpp_base, g_unity_data;
+static uintptr_t g_i2heap_base, g_i2heap_size;
+extern size_t text_size;
+/* /proc/self/maps lido UMA vez (sem malloc — open/read/parse manual; fopen não é
+ * async-signal-safe e re-faulta no handler). Buffer estático grande o bastante. */
+static char g_maps_buf[64 * 1024];
+static int g_maps_len;
+static void maps_snapshot(void) {
+  int fd = open("/proc/self/maps", O_RDONLY);
+  g_maps_len = 0;
+  if (fd < 0) return;
+  int n; char *p = g_maps_buf;
+  while (g_maps_len < (int)sizeof(g_maps_buf) - 1 &&
+         (n = read(fd, p + g_maps_len, sizeof(g_maps_buf) - 1 - g_maps_len)) > 0)
+    g_maps_len += n;
+  g_maps_buf[g_maps_len] = 0;
+  close(fd);
+}
+/* acha a linha de maps que contém 'a'; preenche lo/hi/perm; retorna ptr p/ a linha
+ * (NUL-terminada temporariamente) ou NULL. Parse manual sobre o snapshot. */
+static const char *maps_find(uintptr_t a, uintptr_t *lo_o, uintptr_t *hi_o, char perm_o[5]) {
+  const char *s = g_maps_buf;
+  while (s < g_maps_buf + g_maps_len) {
+    const char *eol = s; while (*eol && *eol != '\n') eol++;
+    uintptr_t lo = 0, hi = 0; const char *q = s;
+    while (*q && *q != '-') { lo = lo * 16 + (*q <= '9' ? *q - '0' : (*q | 32) - 'a' + 10); q++; }
+    if (*q == '-') q++;
+    while (*q && *q != ' ') { hi = hi * 16 + (*q <= '9' ? *q - '0' : (*q | 32) - 'a' + 10); q++; }
+    if (a >= lo && a < hi) {
+      if (lo_o) *lo_o = lo; if (hi_o) *hi_o = hi;
+      if (perm_o) { const char *pp = q + 1; for (int i = 0; i < 4; i++) perm_o[i] = pp[i]; perm_o[4] = 0; }
+      static char line[256]; int len = (int)(eol - s); if (len > 255) len = 255;
+      for (int i = 0; i < len; i++) line[i] = s[i]; line[len] = 0;
+      return line;
+    }
+    s = (*eol == '\n') ? eol + 1 : eol;
+  }
+  return NULL;
+}
+static int addr_readable(uintptr_t a) {
+  char perm[5]; uintptr_t lo, hi;
+  return maps_find(a, &lo, &hi, perm) && perm[0] == 'r';
+}
+/* imprime a linha de maps que contém 'a' + classifica vs nossas bases */
+static void crash_classify(const char *tag, uintptr_t a) {
+  fprintf(stderr, "[CR] %s=0x%lx", tag, (unsigned long)a);
+  if (g_unity_base && a >= g_unity_base && a < g_unity_base + text_size)
+    fprintf(stderr, " (libunity+0x%lx)", a - g_unity_base);
+  else if (g_il2cpp_base && a >= g_il2cpp_base && a < g_il2cpp_base + 0x3000000)
+    fprintf(stderr, " (libil2cpp+0x%lx)", a - g_il2cpp_base);
+  else if (g_i2heap_base && a >= g_i2heap_base && a < g_i2heap_base + g_i2heap_size)
+    fprintf(stderr, " (i2heap+0x%lx)", a - g_i2heap_base);
+  char perm[5]; uintptr_t lo, hi;
+  const char *line = maps_find(a, &lo, &hi, perm);
+  if (line) fprintf(stderr, "  | %s", line);
+  fprintf(stderr, "\n"); dbg_sync();
+}
+static void crash_dump_qwords(const char *tag, uintptr_t base, int n) {
+  if (!addr_readable(base)) { fprintf(stderr, "[CR] %s @0x%lx ILEGÍVEL\n", tag, (unsigned long)base); dbg_sync(); return; }
+  for (int k = 0; k < n; k += 2)
+    fprintf(stderr, "[CR] %s +%02x: %016lx %016lx\n", tag, k * 8,
+            (unsigned long)((uintptr_t *)base)[k], (unsigned long)((uintptr_t *)base)[k + 1]);
+  dbg_sync();
+}
+
+static volatile int g_crashing = 0;
 static void on_crash(int sig, siginfo_t *si, void *uc_) {
+  /* reentrância: se outra thread já está dumpando (vtable corrompido faz várias
+     threads crasharem juntas), esta espera p/ não interleavar/re-faultar o dump. */
+  if (__sync_lock_test_and_set(&g_crashing, 1)) {
+    fprintf(stderr, "[CR] (2ª thread crashou sig=%d tid=%d — aguardando)\n",
+            sig, (int)syscall(SYS_gettid));
+    dbg_sync();
+    for (;;) pause();
+  }
   ucontext_t *uc = (ucontext_t *)uc_;
   uintptr_t pc = uc->uc_mcontext.pc, lr = uc->uc_mcontext.regs[30];
   uintptr_t tb = (uintptr_t)text_base;
+  maps_snapshot();   /* sem malloc — antes de qualquer parse */
   fprintf(stderr, "\n=== CRASH sig=%d fault=%p pc=0x%lx", sig, si->si_addr,
           (unsigned long)pc);
   if (pc >= tb && pc < tb + text_size) fprintf(stderr, " (libunity+0x%lx)", pc - tb);
   fprintf(stderr, " lr=0x%lx", (unsigned long)lr);
   if (lr >= tb && lr < tb + text_size) fprintf(stderr, " (lr unity+0x%lx)", lr - tb);
-  fprintf(stderr, " ===\n");
+  fprintf(stderr, " ===\n"); dbg_sync();
   for (int i = 0; i < 31; i++) {
     fprintf(stderr, " x%-2d=0x%016lx", i, (unsigned long)uc->uc_mcontext.regs[i]);
     if (i % 3 == 2) fprintf(stderr, "\n");
   }
-  /* qual lib contém o pc? */
-  FILE *mp = fopen("/proc/self/maps", "r"); char ml[400];
-  while (mp && fgets(ml, sizeof ml, mp)) { unsigned long a, b;
-    if (sscanf(ml, "%lx-%lx", &a, &b) == 2 && pc >= a && pc < b) { fprintf(stderr, "[PC-LIB] %s", ml); break; } }
-  if (mp) fclose(mp);
+  dbg_sync();
+  /* stack scan limitado à região mapeada da pilha desta thread (evita ler além
+     do fim do mapping e re-faultar dentro do handler). */
   fprintf(stderr, "[stack scan]\n");
   uintptr_t sp = uc->uc_mcontext.sp;
-  for (int k = 0, hits = 0; k < 400 && hits < 24; k++) {
-    uintptr_t v = *(uintptr_t *)(sp + k * 8);
-    if (v >= tb && v < tb + text_size) { fprintf(stderr, "  libunity+0x%lx\n", v - tb); hits++; }
+  uintptr_t slo = 0, shi = 0; char sperm[5];
+  maps_find(sp, &slo, &shi, sperm);
+  uintptr_t send = shi ? shi : sp + 400 * 8;
+  for (uintptr_t a = sp, hits = 0; a + 8 <= send && hits < 32; a += 8) {
+    uintptr_t v = *(uintptr_t *)a;
+    if (v >= tb && v < tb + text_size) { fprintf(stderr, "  [sp+0x%lx] libunity+0x%lx\n", a - sp, v - tb); hits++; }
+    else if (g_il2cpp_base && v >= g_il2cpp_base && v < g_il2cpp_base + 0x3000000)
+      { fprintf(stderr, "  [sp+0x%lx] libil2cpp+0x%lx\n", a - sp, v - g_il2cpp_base); hits++; }
   }
+  dbg_sync();
+
+  /* ---- dump rico do crash 0x7f10000004 (vtable/delegate corrompido) ---- */
+  uintptr_t fault = (uintptr_t)si->si_addr;
+  fprintf(stderr, "[CR] ==== diagnóstico de corrupção ====\n");
+  crash_classify("pc", pc);
+  crash_classify("fault", fault);
+  /* região do ponteiro-lixo (pc=0x7f10000004): o que é 0x7f10000000? */
+  crash_classify("pc_region", pc & ~0xFFFUL);
+  crash_dump_qwords("pc_target", pc & ~0xFUL, 8);
+  /* singleton: *(libunity_data + 0xd18) → método[0] foi p/ o lixo */
+  if (g_unity_data) {
+    uintptr_t pslot = g_unity_data + 0xd18;
+    crash_classify("singleton_slot(d18)", pslot);
+    if (addr_readable(pslot)) {
+      uintptr_t sgl = *(uintptr_t *)pslot;
+      crash_classify("singleton_obj", sgl);
+      crash_dump_qwords("singleton", sgl, 16);
+    }
+  }
+  /* dispatcher std::function/delegate: x19 é o objeto; lê [x19+248/256/264] */
+  uintptr_t x19 = uc->uc_mcontext.regs[19];
+  crash_classify("x19(dispatch_obj)", x19);
+  crash_dump_qwords("x19", x19, 40);   /* cobre +0..+312 (inclui 248/256/264) */
+  /* x8 = ponteiro de função chamado (= pc no blr x8); x21 = this provável */
+  crash_classify("x8", uc->uc_mcontext.regs[8]);
+  crash_classify("x21", uc->uc_mcontext.regs[21]);
+  /* x20/x22/x23/x24: candidatos a 'this'/objeto pai */
+  crash_classify("x20", uc->uc_mcontext.regs[20]);
+  crash_classify("x22", uc->uc_mcontext.regs[22]);
+  fprintf(stderr, "[CR] ==== fim ====\n");
   dbg_sync();
   _exit(128 + sig);
 }
@@ -244,7 +353,6 @@ static int my_access(const char *p, int m) {
 }
 /* exit() do jogo: loga QUEM chamou (lr) + stack antes de morrer — a morte
    silenciosa pos-FMOD não deixava rastro. */
-static uintptr_t g_unity_base, g_il2cpp_base;
 static void my_exit(int code) {
   fprintf(stderr, "[EXIT] exit(%d) chamado! lr=%p\n", code, __builtin_return_address(0));
   uintptr_t tb = (uintptr_t)g_unity_base;
@@ -406,7 +514,6 @@ static so_module *g_m_unity = NULL, *g_m_il2cpp = NULL;
 /* ---- probe MemoryManager do libunity (RE: GetMemoryManager=0x3cbe2c) ----
  * gMemoryManager (bss)  vaddr 0x1292B48; cursor da arena estatica vaddr 0x11EF4D0;
  * data segment vaddr 0x11e6000. Detecta corrupcao do singleton entre fases. */
-static uintptr_t g_unity_data = 0;
 static void mm_probe(const char *tag) {
   if (!g_unity_data) return;
   void *mm  = *(void **)(g_unity_data + (0x1292B48 - 0x11e6000));
@@ -510,6 +617,40 @@ long my_waitall(void *thiz, long a1) {
   long r = waitall_orig_tramp(thiz, a1);
   g_in_waitall--;
   return r;
+}
+
+/* ===== CUP_CLAMPSIG: clampa o count do Semaphore::Signal (0x65850c) =====
+ * Signal(x0=sem, w1=count) posta sem(x0+4) `count` vezes (loop do-while w19=w1).
+ * O count deriva p/ um valor enorme (storm/livelock ~frame 110). Hookamos a entrada
+ * e clampamos w1 a um máximo são (>nº real de threads ~20) → mata o storm.
+ * Prólogo clobberado (4 stp em 0x65850c..0x658518); o tramp re-executa e segue +16. */
+uintptr_t g_signal_cont = 0;   /* 0x65850c + 16 */
+static int g_signal_clamp = 48;
+static volatile unsigned g_signal_clamps = 0;
+__asm__(
+  ".text\n"
+  ".global signal_orig_tramp\n"
+  "signal_orig_tramp:\n"
+  "  stp x26, x25, [sp, #-80]!\n"   /* 0x65850c */
+  "  stp x24, x23, [sp, #16]\n"     /* 0x658510 */
+  "  stp x22, x21, [sp, #32]\n"     /* 0x658514 */
+  "  stp x20, x19, [sp, #48]\n"     /* 0x658518 */
+  "  adrp x17, g_signal_cont\n"
+  "  add x17, x17, :lo12:g_signal_cont\n"
+  "  ldr x17, [x17]\n"
+  "  br x17\n"
+);
+extern long signal_orig_tramp(void *sem, long count);
+long my_signal(void *sem, long count);
+long my_signal(void *sem, long count) {
+  int c = (int)count;
+  if (c > g_signal_clamp) {
+    if (g_signal_clamps++ < 40)
+      fprintf(stderr, "[CLAMPSIG] Signal(sem=%p) count=%d (0x%x) -> %d\n",
+              sem, c, (unsigned)c, g_signal_clamp);
+    count = (long)g_signal_clamp;
+  }
+  return signal_orig_tramp(sem, count);
 }
 
 static char g_dl_sl; /* sentinela do handle de libOpenSLES (FMOD → opensles_shim) */
@@ -652,6 +793,8 @@ static int patch_got(const char *name, void *fn) {
   return n;
 }
 
+static void *volatile g_preload_mgr;  /* PreloadManager capturado pelo spy (CUP_PSPY) */
+
 /* stubs NDK no-op (sensores/looper/profiler google) — devolvem 0/NULL */
 static long ndk_stub0(void) { return 0; }
 
@@ -682,7 +825,6 @@ static volatile int g_fmod_run = 1;
 #define UN_HASPEND   0x8739c4
 #define UN_MTX_LOCK  0x8f5d0c
 #define UN_MTX_UNLK  0x8f5d14
-static void *volatile g_preload_mgr;
 static int my_haspending(void *mgr) {
   g_preload_mgr = mgr;
   void (*lk)(void *) = (void (*)(void *))(g_unity_base + UN_MTX_LOCK);
@@ -983,6 +1125,18 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[WAITGATE] hook WaitForAll(0x873a90)+gate(0x871844); cont=0x%lx\n",
             (unsigned long)g_waitall_cont);
   }
+  /* CUP_CLAMPSIG: clampa o count de Semaphore::Signal (0x65850c) p/ matar o storm
+     (count deriva p/ enorme ~frame 110 → posta bilhões de vezes = livelock). */
+  if (getenv("CUP_CLAMPSIG")) {
+    extern void so_make_text_writable(void), so_make_text_executable(void);
+    if (getenv("CUP_SIGCLAMP")) g_signal_clamp = atoi(getenv("CUP_SIGCLAMP"));
+    g_signal_cont = (uintptr_t)text_base + 0x65850c + 16;
+    so_make_text_writable();
+    hook_arm64((uintptr_t)text_base + 0x65850c, (uintptr_t)my_signal);
+    so_make_text_executable(); so_flush_caches();
+    fprintf(stderr, "[CLAMPSIG] hook Signal(0x65850c) clamp=%d; cont=0x%lx\n",
+            g_signal_clamp, (unsigned long)g_signal_cont);
+  }
 
   fprintf(stderr, "[F0] init_array...\n");
   so_execute_init_array();
@@ -1006,6 +1160,7 @@ int main(int argc, char **argv) {
   g_m_unity = so_save();
   size_t i2s = 96UL * 1024 * 1024;
   void *i2heap = mmap(NULL, i2s, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  g_i2heap_base = (uintptr_t)i2heap; g_i2heap_size = i2s;
   if (i2heap != MAP_FAILED && so_load("libil2cpp.so", i2heap, i2s) >= 0) {
     g_il2cpp_base = (uintptr_t)text_base;
     g_alloc_ib = g_il2cpp_base;
@@ -1123,7 +1278,6 @@ int main(int argc, char **argv) {
     pthread_t st; pthread_create(&st, NULL, preload_spy_thread, NULL);
     pthread_detach(st);
   }
-
   void *render = jni_find_native("nativeRender");
   fprintf(stderr, "[F2] nativeRender=%p -> loop\n", render);
   int max_f = getenv("CUP_FRAMES") ? atoi(getenv("CUP_FRAMES")) : 600;

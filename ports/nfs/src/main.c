@@ -22,7 +22,7 @@
 #include "so_util.h"
 #include "util.h"
 
-#define MEMORY_MB 320
+#define MEMORY_MB 64
 #define SO_NAME "libapp.so"
 
 /* ---- crash handler ARMHF (campos arm_pc/arm_r0/arm_lr do sigcontext 32-bit) ---- */
@@ -112,6 +112,16 @@ static int load_module(const char *name, int heap_mb, int snapshot) {
     DynLibFunction *t = so_snapshot_symbols(&n);
     if (t && n > 0) { comb_append(t, n); debugPrintf("%s: +%d símbolos exportados\n", name, n); }
   }
+  /* roda os construtores C++ estáticos (.init_array) deste módulo — necessário
+   * antes de usar a engine (inicializa globais/singletons). Ordem = ordem de
+   * carga (libc++ 1º). NFS_SKIPINIT="lib..." pula p/ bissecção de corrupção. */
+  const char *skip = getenv("NFS_SKIPINIT");
+  if (skip && strstr(skip, name)) {
+    debugPrintf("%s: init_array PULADO (NFS_SKIPINIT)\n", name);
+  } else {
+    so_execute_init_array();
+    debugPrintf("%s: init_array OK\n", name);
+  }
   return 0;
 }
 
@@ -143,6 +153,29 @@ int main(int argc, char *argv[]) {
   debugPrintf("JNI_OnLoad=%p nativeOnCreate=%p (combinada=%d símbolos)\n",
               (void *)jni_onload, (void *)native_oncreate, g_comb_n);
 
-  debugPrintf("=== F1 OK: multi-módulo carregado+resolvido. (F2: boot JNI) ===\n");
+  /* ---- F2: boot JNI ---- */
+  jni_shim_set_package("com.ea.games.nfs13_row", 0);
+  void *vm = 0, *env = 0;
+  jni_shim_init(&vm, &env);
+  debugPrintf("jni_shim: vm=%p env=%p\n", vm, env);
+
+  if (jni_onload) {
+    int (*JNI_OnLoad)(void *, void *) = (int (*)(void *, void *))jni_onload;
+    int v = JNI_OnLoad(vm, 0);
+    debugPrintf("JNI_OnLoad -> 0x%x\n", v);
+  }
+
+  if (!getenv("NFS_NO_ONCREATE") && native_oncreate) {
+    /* Java_..._nativeOnCreate(JNIEnv*, jobject thiz, ...). Chamamos com env +
+     * um 'this' fake; args extras = 0 (ajustar conforme a engine pedir). */
+    debugPrintf("chamando nativeOnCreate...\n");
+    void (*onCreate)(void *, void *, void *, void *, void *, void *) =
+        (void (*)(void *, void *, void *, void *, void *, void *))native_oncreate;
+    static char fake_this[64];
+    onCreate(env, fake_this, 0, 0, 0, 0);
+    debugPrintf("nativeOnCreate retornou\n");
+  }
+
+  debugPrintf("=== F2: boot JNI executado ===\n");
   return 0;
 }
