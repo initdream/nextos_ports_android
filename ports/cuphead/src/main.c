@@ -383,6 +383,23 @@ static void my_glLinkProgram(unsigned pr) {
   g_prN++;
 }
 
+/* my_eglGetProcAddress: o Unity resolve as funções GL/extensões via
+ * eglGetProcAddress (PLT→Mali real). Se uma extensão é ANUNCIADA (glGetString
+ * EXTENSIONS) mas a função NÃO resolve (NULL), o Unity guarda um ponteiro
+ * inválido e CRASHA ao chamá-lo (fault 0x7f10000004). Loga TODAS as resoluções
+ * (com NULL destacado) p/ achar a culpada. CUP_NOVAO força NULL p/ as funções de
+ * VAO (testa a hipótese de que GL_OES_vertex_array_object é a culpada). */
+static void *(*r_eglGetProcAddress)(const char *);
+static unsigned g_egp_n = 0;
+static void *my_eglGetProcAddress(const char *nm) {
+  if (!r_eglGetProcAddress) r_eglGetProcAddress = dlsym(RTLD_DEFAULT, "eglGetProcAddress");
+  void *p = r_eglGetProcAddress ? r_eglGetProcAddress(nm) : NULL;
+  if (nm && getenv("CUP_NOVAO") && strstr(nm, "VertexArray")) p = NULL;  /* (vira no-op no Unity) */
+  if (g_egp_n++ < 400)
+    fprintf(stderr, "[EGP] %s -> %p%s\n", nm ? nm : "(null)", p, p ? "" : "  <== NULL!");
+  return p;
+}
+
 static char g_dl_self, g_dl_il2cpp;
 static so_module *g_m_unity = NULL, *g_m_il2cpp = NULL;
 
@@ -447,6 +464,54 @@ __asm__(
   "  br x17\n"
 );
 extern void onew_spy_tramp(void);
+
+/* ===== CUP_WAITGATE: FORCEINTEG cirúrgico (só durante WaitForAll) =====
+ * O FORCEINTEG global (NOP em 0x872774) integra ops cedo demais até FORA do
+ * WaitForAll → corrompe um delegate → crash 0x7f10000004 ~60 frames depois.
+ * Aqui só ignoramos o gate de budget QUANDO a main está dentro de
+ * WaitForAllAsyncOperationsToComplete (0x873a90, force-complete legítimo).
+ *
+ * (1) hook 0x873a90 → my_waitall (C): liga g_in_waitall, chama o original
+ *     (waitall_orig_tramp re-executa o prólogo clobberado e segue em +16),
+ *     desliga o flag. (2) hook do gate 0x871844 → my_gate: se in_waitall=1
+ *     retorna 1; senão replica a lógica original (budget 0x871884 AND
+ *     (jobmgr==null OR NOT pending 0x6cdad0)). */
+volatile int g_in_waitall = 0;
+uintptr_t g_waitall_cont = 0;   /* 0x873a90 + 16 (usado pelo asm) */
+/* gate replica — usa as bases já capturadas (g_unity_base/g_unity_data) */
+int my_gate(void *op);
+int my_gate(void *op) {
+  if (g_in_waitall) return 1;
+  int budget = ((int (*)(void *))(g_unity_base + 0x871884))((char *)op + 0x98);
+  if (!budget) return 0;
+  void *mgr = *(void **)(g_unity_data + 0xd3380);  /* job-scheduler 0x12b9380 */
+  if (!mgr) return 1;
+  int pending = ((int (*)(void *))(g_unity_base + 0x6cdad0))(mgr);
+  return pending ? 0 : 1;
+}
+/* trampolim que re-executa o prólogo clobberado de 0x873a90 e segue em +16 */
+__asm__(
+  ".text\n"
+  ".global waitall_orig_tramp\n"
+  "waitall_orig_tramp:\n"
+  "  stp x22, x21, [sp, #-48]!\n"   /* 0x873a90 */
+  "  stp x20, x19, [sp, #16]\n"     /* 0x873a94 */
+  "  stp x29, x30, [sp, #32]\n"     /* 0x873a98 */
+  "  add x29, sp, #0x20\n"          /* 0x873a9c */
+  "  adrp x17, g_waitall_cont\n"
+  "  add x17, x17, :lo12:g_waitall_cont\n"
+  "  ldr x17, [x17]\n"
+  "  br x17\n"
+);
+extern long waitall_orig_tramp(void *thiz, long a1);
+long my_waitall(void *thiz, long a1);
+long my_waitall(void *thiz, long a1) {
+  g_in_waitall++;
+  long r = waitall_orig_tramp(thiz, a1);
+  g_in_waitall--;
+  return r;
+}
+
 static char g_dl_sl; /* sentinela do handle de libOpenSLES (FMOD → opensles_shim) */
 static void *my_dlopen(const char *nm, int flag) {
   if (g_dllog) fprintf(stderr, "[dlopen] \"%s\"\n", nm ? nm : "(null)");
@@ -763,6 +828,8 @@ int main(int argc, char **argv) {
   set_import("_exit", (void *)my_exit);
   /* __stack_chk_fail nao esta na tabela de imports -> patch direto na GOT (apos resolve) */
   set_import("glGetString", (void *)my_glGetString);
+  if (getenv("CUP_EGPLOG") || getenv("CUP_NOVAO"))
+    set_import("eglGetProcAddress", (void *)my_eglGetProcAddress);
   set_import("sysconf", (void *)my_sysconf);
   set_import("fopen", (void *)my_fopen);
   set_import("open", (void *)my_open);
@@ -806,6 +873,8 @@ int main(int argc, char **argv) {
   patch_got("__android_log_print", (void *)my_alog_print);
   patch_got("__android_log_write", (void *)my_alog_write);
   patch_got("__android_log_vprint", (void *)my_alog_vprint);
+  if (getenv("CUP_EGPLOG") || getenv("CUP_NOVAO"))
+    patch_got("eglGetProcAddress", (void *)my_eglGetProcAddress);
   /* dl* estavam COMENTADOS em imports.gen.c -> set_import foi no-op e o dlopen@plt
      caiu no glibc REAL (falha ao carregar .so Android). Sem isso o il2cpp nao carrega. */
   patch_got("dlopen", (void *)my_dlopen);
@@ -900,6 +969,19 @@ int main(int argc, char **argv) {
     *(uint32_t *)((uintptr_t)text_base + 0x872774) = 0xd503201fu; /* NOP */
     so_make_text_executable(); so_flush_caches();
     fprintf(stderr, "[FORCEINTEG] 0x872774 (gate-fail branch) -> NOP\n");
+  }
+  /* CUP_WAITGATE: FORCEINTEG cirúrgico — ignora o gate de budget SÓ dentro do
+     WaitForAll (0x873a90). Hook do WaitForAll (flag in_waitall) + hook do gate
+     (0x871844 → my_gate). NÃO combinar com CUP_FORCEINTEG. */
+  if (getenv("CUP_WAITGATE")) {
+    extern void so_make_text_writable(void), so_make_text_executable(void);
+    g_waitall_cont = (uintptr_t)text_base + 0x873a90 + 16;
+    so_make_text_writable();
+    hook_arm64((uintptr_t)text_base + 0x873a90, (uintptr_t)my_waitall);
+    hook_arm64((uintptr_t)text_base + 0x871844, (uintptr_t)my_gate);
+    so_make_text_executable(); so_flush_caches();
+    fprintf(stderr, "[WAITGATE] hook WaitForAll(0x873a90)+gate(0x871844); cont=0x%lx\n",
+            (unsigned long)g_waitall_cont);
   }
 
   fprintf(stderr, "[F0] init_array...\n");
