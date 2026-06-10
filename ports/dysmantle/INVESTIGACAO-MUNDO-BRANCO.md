@@ -134,3 +134,30 @@ e sim **fazer a variante 0x7 existir** OU corrigir o stride do atributo no draw.
 do stride por buffer (heurística UV frágil pq terreno tem UV de tiling). PRÓXIMO: detecção robusta
 (testar stride por validade de POSIÇÃO contígua, não UV) OU criar a variante 0x7 de verdade
 (re-interleave dos dados 0x7F→0x7 no createvb quando format-0).
+
+## ⚠️ SESSÃO 2 — STRIDE FOI RED HERRING; chão = textura cinza + vértice branco
+| Teste | Método | Resultado |
+|---|---|---|
+| Stride dos buffers GRANDES no attr | STRIDE_DBG filtro >50KB | **buffers grandes (chão) usam attr_stride=40 CORRETO (size%40=0)!** Os de 24 eram sprites (9216B). SEM mismatch no chão |
+| → stride-fix | gateado OFF (DYSMANTLE_STRIDEFIX) | os "triângulos" eram SPRITES de 24B quebrados pelo meu fix, NÃO chão. Stride = red herring |
+| Grid de luminância das texturas | TEXGRID | tex23/24 (chão 256x256) = CINZA (a9a9a9, R=G=B). Outras têm cor (azul 1e78bf etc). tex23 é grayscale |
+| Cor de vértice do terreno | VERTDUMP col@12 | **255,255,255,255 (BRANCO) em TODOS os vértices do chão** |
+| Shader do chão (prog 34 e 35) | DUMP_PROG | ambos BÁSICOS: gl_FragColor = _vary_color * texture2D(_tex_diffuse,uv) |
+
+**🔑 CONCLUSÃO SESSÃO 2:** o chão renderiza com geometria/stride/UV CORRETOS, mas fica
+cinza-claro (~branco) porque: **(a) a textura do chão (tex23) é GRAYSCALE (a9a9a9)** e
+**(b) a cor de vértice do terreno é BRANCA (255,255,255)**. gl_FragColor = branco × cinza =
+cinza-claro. A COR (verde do gramado) deveria vir do _vary_color de vértice (tint+luz assada do
+terreno) OU da textura — **nenhum dos dois fornece cor**. As bordas pretas = fog of war (correto).
+
+**DUAS HIPÓTESES p/ a cor faltando (próxima sessão):**
+1. **Cor de vértice do terreno** deveria codificar tint/luz (verde) mas é branca → a geração da
+   mesh do terreno (GenerateStreamData / stream de cor) não preenche a cor, fica default 255.
+   → investigar o stream de cor (this+72) e como a luz/tint do tile é assada no vértice.
+2. **Textura tex23 deveria ser colorida** (grama) mas decodificou grayscale → bug no nosso
+   pipeline de textura (fix_empty_textures.py ETC2→JPEG) p/ as texturas de terreno.
+   → comparar tex23 com o asset original; ver se R=G=B é decode ou design.
+
+Quick test p/ desambiguar: forçar gl_FragColor = vec4(0,1,0,1)*diffuse no shader do chão — se
+virar grama verde, tex23 é detalhe-luminância e falta o tint (hip 1); se cinza-esverdeado, tex23
+é o problema (hip 2).

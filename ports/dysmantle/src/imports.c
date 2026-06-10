@@ -392,6 +392,7 @@ static void my_glTexStorage2D(unsigned tgt, int lvls, unsigned ifmt, int w,
  * (os offsets pos@0/cor@12/uv@16 valem nos dois formatos). */
 static unsigned g_cur_array_buf = 0;
 static int g_buf_stride[4096];        /* id -> stride real do buffer */
+static long g_buf_size[4096];         /* id -> tamanho do buffer (p/ divisibilidade) */
 /* tabela (tamanho do buffer de vértice -> stride), preenchida pelo createvb
  * (sabe formato→stride e count). O upload glBufferData casa por tamanho. */
 static struct { long size; int stride; } g_szstride[512];
@@ -472,17 +473,34 @@ static void my_glVertexAttribPointer(unsigned idx, int sz, unsigned typ,
     fprintf(stderr, "[ATTR] idx=%u size=%d type=0x%x norm=%d stride=%d off=%ld\n",
             idx, sz, typ, norm, stride, (long)(uintptr_t)ptr); n++;
   }
-  /* AUTO-FIX: se o buffer ligado tem stride REAL maior que o stride do
-   * atributo (mismatch variante 0x7F×0x7), usa o do buffer. Offsets pos@0/
-   * cor@12/uv@16 são iguais nos dois → ler com stride do buffer = correto. */
-  if (g_stridefix < 0) g_stridefix = getenv("DYSMANTLE_STRIDEFIX_OFF") ? 0 : 1;
+  /* AUTO-FIX por DIVISIBILIDADE: o stride real SEMPRE divide o tamanho do
+   * buffer. Se o stride do atributo (ex 24) NÃO divide o tamanho mas existe um
+   * stride de vértice conhecido MAIOR que divide (ex 40), usa esse. Os offsets
+   * pos@0/cor@12/uv@16 batem (24 primeiros bytes do 0x7F == 0x7). */
+  /* OFF por default: o chão usa stride 40 CORRETO (red herring); o fix só
+   * arriscava quebrar sprites. DYSMANTLE_STRIDEFIX=1 p/ reativar/experimentar. */
+  if (g_stridefix < 0) g_stridefix = getenv("DYSMANTLE_STRIDEFIX") ? 1 : 0;
+  if (getenv("DYSMANTLE_STRIDE_DBG")) {
+    static int d = 0;
+    if (d < 30 && stride >= 12 && g_cur_array_buf < 4096 && g_buf_size[g_cur_array_buf] > 50000) {
+      long sb = g_cur_array_buf < 4096 ? g_buf_size[g_cur_array_buf] : -1;
+      fprintf(stderr, "[STRIDEDBG] buf=%u size=%ld attr_stride=%d size%%stride=%ld\n",
+              g_cur_array_buf, sb, stride, sb > 0 ? sb % stride : -1); d++;
+    }
+  }
   if (g_stridefix && stride > 0 && g_cur_array_buf < 4096) {
-    int bs = g_buf_stride[g_cur_array_buf];
-    if (bs > stride && (long)(uintptr_t)ptr + sz * 4 <= bs) {
-      static int fl = 0;
-      if (fl < 8) { fprintf(stderr, "[STRIDEFIX] buf=%u attr_stride=%d -> %d (idx=%u off=%ld)\n",
-                            g_cur_array_buf, stride, bs, idx, (long)(uintptr_t)ptr); fl++; }
-      stride = bs;
+    long sz_buf = g_buf_size[g_cur_array_buf];
+    if (sz_buf > 0 && (sz_buf % stride) != 0) {
+      const int cands[] = {28,32,36,40,44,48,52,56,60};
+      for (unsigned c = 0; c < sizeof(cands)/sizeof(cands[0]); c++) {
+        int S = cands[c];
+        if (S > stride && (sz_buf % S) == 0 && (long)(uintptr_t)ptr + sz*4 <= S) {
+          static int fl = 0;
+          if (fl < 10) { fprintf(stderr, "[STRIDEFIX] buf=%u size=%ld attr=%d -> %d (idx=%u off=%ld)\n",
+                                 g_cur_array_buf, sz_buf, stride, S, idx, (long)(uintptr_t)ptr); fl++; }
+          stride = S; break;
+        }
+      }
     }
   }
   if (real) real(idx, sz, typ, norm, stride, ptr);
@@ -596,28 +614,8 @@ static void my_glBufferData(unsigned tgt, long size, const void *data, unsigned 
   /* DETECTA o stride real do buffer de vértice pela estrutura: o stride certo
    * deixa as UVs (offset 16, 2 floats) consistentemente em ~[0,1] p/ vários
    * vértices. Escolhe o MENOR stride com >85% de UVs válidas. */
-  /* MIRA o chão (variante 0x7F/40B desenhada com atributos 0x7/24B): só corrige
-   * se stride 40 dá UVs válidas E stride 24 NÃO (confirma que é 40, não 24).
-   * Não toca skinned (offsets diferentes). */
-  if (tgt == 0x8892 && data && size >= 40 * 16 && g_cur_array_buf < 4096) {
-    const unsigned char *b = (const unsigned char *)data;
-    int n40 = (int)(size / 40); if (n40 > 24) n40 = 24;
-    int n24 = (int)(size / 24); if (n24 > 24) n24 = 24;
-    int ok40 = 0, ok24 = 0;
-    for (int v = 0; v < n40; v++) {
-      const float *uv = (const float *)(b + (size_t)v * 40 + 16);
-      const float *p = (const float *)(b + (size_t)v * 40);
-      if (uv[0]==uv[0] && uv[1]==uv[1] && uv[0]>-0.05f && uv[0]<1.5f &&
-          uv[1]>-0.05f && uv[1]<1.5f && p[0]==p[0] && p[1]==p[1]) ok40++;
-    }
-    for (int v = 0; v < n24; v++) {
-      const float *uv = (const float *)(b + (size_t)v * 24 + 16);
-      if (uv[0]==uv[0] && uv[1]==uv[1] && uv[0]>-0.05f && uv[0]<1.5f &&
-          uv[1]>-0.05f && uv[1]<1.5f) ok24++;
-    }
-    if (ok40 * 100 >= n40 * 90 && ok24 * 100 < n24 * 70)
-      g_buf_stride[g_cur_array_buf] = 40;
-  }
+  /* registra o TAMANHO do buffer (p/ deduzir stride por divisibilidade no draw) */
+  if (tgt == 0x8892 && g_cur_array_buf < 4096) g_buf_size[g_cur_array_buf] = size;
   static int n = 0;
   if (getenv("DYSMANTLE_BUF_LOG") && (n < 60 || e)) {
     fprintf(stderr, "[BUFDATA] tid=%d tgt=0x%x size=%ld data=%s usage=0x%x -> err=0x%x\n",
@@ -731,6 +729,19 @@ static void my_glTexImage2D(unsigned tgt, int lvl, int ifmt, int w, int h,
       fprintf(stderr, "[TEXFMT] fmt=0x%x(%s) typ=0x%x\n", fmt, fn, typ);
     }
     static int n = 0;
+    unsigned tid = g_bound_tex[g_active_unit < 8 ? g_active_unit : 0];
+    if (px && lvl == 0 && w >= 64 && h >= 64 && fmt == 0x1908) {
+      const unsigned char *b = (const unsigned char *)px;
+      char grid[96]; int gi = 0;
+      for (int gy = 0; gy < 4; gy++)
+        for (int gx = 0; gx < 4; gx++) {
+          long o = ((long)(gy*h/4 + h/8) * w + (gx*w/4 + w/8)) * 4;
+          int lum = (b[o] + b[o+1] + b[o+2]) / 3;
+          gi += snprintf(grid+gi, sizeof(grid)-gi, "%02x ", lum);
+        }
+      static int gn = 0;
+      if (gn < 30) { fprintf(stderr, "[TEXGRID] tex=%u %dx%d lum: %s\n", tid, w, h, grid); gn++; }
+    }
     if (n < 80 || e) {
       char pix[80] = "(null)";
       if (px && lvl == 0 && w >= 4 && h >= 4) {
@@ -740,7 +751,7 @@ static void my_glTexImage2D(unsigned tgt, int lvl, int ifmt, int w, int h,
                  b[0], b[1], b[2], b[3], b[mid], b[mid+1], b[mid+2], b[mid+3]);
       }
       fprintf(stderr, "[TEX2D] tex=%u ifmt=0x%x %dx%d fmt=0x%x typ=0x%x -> err=0x%x %s\n",
-              g_bound_tex[g_active_unit < 8 ? g_active_unit : 0], ifmt, w, h, fmt, typ, e, pix); n++;
+              tid, ifmt, w, h, fmt, typ, e, pix); n++;
     }
   }
 }
