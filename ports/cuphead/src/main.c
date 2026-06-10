@@ -184,6 +184,68 @@ static const unsigned char *my_glGetString(unsigned n){
 
 static char g_dl_self, g_dl_il2cpp;
 static so_module *g_m_unity = NULL, *g_m_il2cpp = NULL;
+
+/* ---- probe MemoryManager do libunity (RE: GetMemoryManager=0x3cbe2c) ----
+ * gMemoryManager (bss)  vaddr 0x1292B48; cursor da arena estatica vaddr 0x11EF4D0;
+ * data segment vaddr 0x11e6000. Detecta corrupcao do singleton entre fases. */
+static uintptr_t g_unity_data = 0;
+static void mm_probe(const char *tag) {
+  if (!g_unity_data) return;
+  void *mm  = *(void **)(g_unity_data + (0x1292B48 - 0x11e6000));
+  void *cur = *(void **)(g_unity_data + (0x11EF4D0 - 0x11e6000));
+  fprintf(stderr, "[MM:%s] gMemoryManager=%p cursor-arena=%p\n", tag, mm, cur);
+}
+
+/* ---- spy na entrada do operator-new tagueado (vaddr 0x3cbf2c) ----
+ * Na entrada: x0=mgr x1=size x2=align(0x10) x3=kind x4=flag x5=tag-string.
+ * O canario estoura nesta funcao durante RecreateGfxState -> capturar a chamada
+ * culpada (size/kind gigante). Loga so' qdo g_in_gfx setado (evita flood).
+ * O hook clobbera 4 insns; o tramp re-executa e segue em entry+16. */
+uintptr_t g_gfx_cont = 0;            /* entry+16 (usado pelo asm) */
+uintptr_t g_alloc_ub = 0, g_alloc_ib = 0;
+volatile int g_in_gfx = 0;
+static unsigned g_ospy_n = 0;
+void onew_spy_log(uintptr_t mgr, uintptr_t size, uintptr_t kind, uintptr_t tag);
+void onew_spy_log(uintptr_t mgr, uintptr_t size, uintptr_t kind, uintptr_t tag) {
+  if (!g_in_gfx) return;
+  const char *t = "?";
+  if (g_alloc_ub && tag >= g_alloc_ub && tag < g_alloc_ub + 0x11e6000)
+    t = (const char *)tag;
+  fprintf(stderr, "[ONEW] #%u mgr=%lx size=%lu kind=%lu tag=%s\n",
+          ++g_ospy_n, mgr, size, kind, t);
+  fflush(stderr);
+}
+__asm__(
+  ".text\n"
+  ".global onew_spy_tramp\n"
+  "onew_spy_tramp:\n"
+  "  stp x29, x30, [sp, #-112]!\n"
+  "  stp x0, x1, [sp, #16]\n"
+  "  stp x2, x3, [sp, #32]\n"
+  "  stp x4, x5, [sp, #48]\n"
+  "  stp x6, x7, [sp, #64]\n"
+  "  str x8, [sp, #80]\n"
+  "  mov x0, x0\n"               /* mgr */
+  "  mov x2, x3\n"               /* kind */
+  "  mov x3, x5\n"               /* tag */
+  "  bl onew_spy_log\n"          /* (mgr,size,kind,tag) */
+  "  ldr x8, [sp, #80]\n"
+  "  ldp x6, x7, [sp, #64]\n"
+  "  ldp x4, x5, [sp, #48]\n"
+  "  ldp x2, x3, [sp, #32]\n"
+  "  ldp x0, x1, [sp, #16]\n"
+  "  ldp x29, x30, [sp], #112\n"
+  /* prologo original clobberado (0x3cbf2c..0x3cbf38) */
+  "  stp x28, x27, [sp, #-96]!\n"
+  "  stp x26, x25, [sp, #16]\n"
+  "  stp x24, x23, [sp, #32]\n"
+  "  stp x22, x21, [sp, #48]\n"
+  "  adrp x17, g_gfx_cont\n"
+  "  add x17, x17, :lo12:g_gfx_cont\n"
+  "  ldr x17, [x17]\n"
+  "  br x17\n"
+);
+extern void onew_spy_tramp(void);
 static void *my_dlopen(const char *nm, int flag) {
   if (nm && strstr(nm, "libil2cpp")) { fprintf(stderr, "[DLOPEN] %s -> il2cpp module\n", nm); return &g_dl_il2cpp; }
   if (!nm || !nm[0] || strstr(nm, "libc") || strstr(nm, "libunity") || strstr(nm, "libmain"))
@@ -197,7 +259,9 @@ static void *my_dlsym(void *h, const char *nm) {
   if (h == &g_dl_il2cpp && g_m_il2cpp) {
     so_module *c = so_save(); so_use(g_m_il2cpp);
     void *p = (void *)so_find_addr_safe(nm);
-    so_use(c); free(c); return p;
+    so_use(c); free(c);
+    fprintf(stderr, "[DLSYM:il2cpp] %s -> %p\n", nm, p);
+    return p;
   }
   if (h == &g_dl_self) {
     void *p = (void *)so_find_addr_safe(nm);
@@ -245,6 +309,34 @@ static void my_abort(void) { map_caller("[ABORT]", (uintptr_t)__builtin_return_a
 static int my_tgkill(int tgid, int tid, int sig) { map_caller("[TGKILL]", (uintptr_t)__builtin_return_address(0));
   fprintf(stderr, "[TGKILL] sig=%d\n", sig); if (getenv("CUP_NORAISE")) return 0; return syscall(__NR_tgkill, tgid, tid, sig); }
 
+/* __stack_chk_fail: o operator-new tagueado (0x3cbf2c) tem canario; numa chamada
+ * do RecreateGfxState ele falha -> abort. Neutraliza p/ diagnosticar (loga caller). */
+static int g_scf_n = 0;
+static void my_stack_chk_fail(void) {
+  uintptr_t ra = (uintptr_t)__builtin_return_address(0);
+  if (g_scf_n++ == 0) {
+    fprintf(stderr, "\n[SCF] __stack_chk_fail caller=%lx", ra);
+    if (g_alloc_ub && ra >= g_alloc_ub && ra < g_alloc_ub + 0x11e6000)
+      fprintf(stderr, " (libunity+0x%lx)", ra - g_alloc_ub);
+    fprintf(stderr, "\n[SCF] stack scan (callers unity FORA do operator-new):\n");
+    uintptr_t sp = (uintptr_t)__builtin_frame_address(0);
+    for (int k = 0, hits = 0; k < 800 && hits < 30; k++) {
+      uintptr_t v = *(uintptr_t *)(sp + k * 8);
+      if (g_alloc_ub && v >= g_alloc_ub && v < g_alloc_ub + 0x11e6000) {
+        uintptr_t off = v - g_alloc_ub;
+        const char *tag = (off >= 0x3cbe90 && off <= 0x3cc1a0) ? " [op-new]" : " <==";
+        fprintf(stderr, "  sp+0x%04x libunity+0x%lx%s\n", k * 8, off, tag);
+        hits++;
+      } else if (g_alloc_ib && v >= g_alloc_ib && v < g_alloc_ib + 0x2325000) {
+        fprintf(stderr, "  sp+0x%04x libil2cpp+0x%lx\n", k * 8, v - g_alloc_ib);
+        hits++;
+      }
+    }
+    fflush(stderr);
+  }
+  /* retorna em vez de abort */
+}
+
 /* ---------- helper: override import na tabela ---------- */
 static void set_import(const char *name, void *fn) {
   for (size_t i = 0; i < dynlib_numfunctions; i++)
@@ -275,6 +367,7 @@ int main(int argc, char **argv) {
   fprintf(stderr, "[F0] heap %dMB @ %p, carregando libunity.so...\n", HEAP_MB, heap);
   if (so_load("libunity.so", heap, hs) < 0) { fprintf(stderr, "so_load libunity FALHOU\n"); return 1; }
   fprintf(stderr, "[F0] libunity: text=%p+%zu data=%p+%zu\n", text_base, text_size, data_base, data_size);
+  g_unity_data = (uintptr_t)data_base;
   if (so_relocate() < 0) { fprintf(stderr, "relocate FALHOU\n"); return 1; }
 
   /* overrides */
@@ -282,6 +375,7 @@ int main(int argc, char **argv) {
   set_import("abort", (void *)my_abort);
   set_import("raise", (void *)my_raise);
   set_import("tgkill", (void *)my_tgkill);
+  /* __stack_chk_fail nao esta na tabela de imports -> patch direto na GOT (apos resolve) */
   set_import("glGetString", (void *)my_glGetString);
   set_import("sysconf", (void *)my_sysconf);
   set_import("fopen", (void *)my_fopen);
@@ -310,9 +404,21 @@ int main(int argc, char **argv) {
   fprintf(stderr, "[F0] resolvendo %zu imports...\n", dynlib_numfunctions);
   if (so_resolve(dynlib_functions, dynlib_numfunctions, 0) < 0) { fprintf(stderr, "resolve FALHOU\n"); return 1; }
   so_finalize(); so_flush_caches();
+  g_alloc_ub = (uintptr_t)text_base;
+
+  /* __stack_chk_fail nao esta na tabela -> patch direto no slot da GOT */
+  if (getenv("CUP_NOSCF")) {
+    extern uintptr_t so_find_rel_addr_safe(const char *);
+    uintptr_t got = so_find_rel_addr_safe("__stack_chk_fail");
+    if (got) { *(uintptr_t *)got = (uintptr_t)my_stack_chk_fail;
+      fprintf(stderr, "[SCF] GOT __stack_chk_fail @ 0x%lx patcheado\n", got); }
+    else fprintf(stderr, "[SCF] __stack_chk_fail nao achado na GOT\n");
+  }
+
   fprintf(stderr, "[F0] init_array...\n");
   so_execute_init_array();
   fprintf(stderr, "[F0] libunity init OK\n");
+  mm_probe("pos-init_array-unity");
 
   /* ---- JNI_OnLoad da libunity ---- */
   void *vm = NULL, *env = NULL; jni_shim_init(&vm, &env);
@@ -324,6 +430,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[F0] JNI_OnLoad não encontrado em libunity\n");
   }
   fprintf(stderr, "[F0] === libunity OK ===\n");
+  mm_probe("pos-JNI_OnLoad");
 
   /* ---- F1: carrega libil2cpp.so (2º módulo, lógica C# do jogo) ---- */
   g_m_unity = so_save();
@@ -331,6 +438,7 @@ int main(int argc, char **argv) {
   void *i2heap = mmap(NULL, i2s, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (i2heap != MAP_FAILED && so_load("libil2cpp.so", i2heap, i2s) >= 0) {
     g_il2cpp_base = (uintptr_t)text_base;
+    g_alloc_ib = g_il2cpp_base;
     fprintf(stderr, "[F1] libil2cpp: text=%p+%zu\n", text_base, text_size);
     so_relocate();
     so_resolve(dynlib_functions, dynlib_numfunctions, 0);
@@ -339,6 +447,7 @@ int main(int argc, char **argv) {
     so_execute_init_array();
     g_m_il2cpp = so_save();
     fprintf(stderr, "[F1] libil2cpp carregado OK\n");
+    mm_probe("pos-init_array-il2cpp");
   } else {
     fprintf(stderr, "[F1] FALHOU carregar libil2cpp (heap=%p)\n", i2heap);
   }
@@ -362,11 +471,26 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[F2] initJni...\n");
     ((void (*)(void *, void *, void *))fn)(env, &thiz, &ctx);
     fprintf(stderr, "[F2] initJni OK\n");
+    mm_probe("pos-initJni");
   }
   if ((fn = jni_find_native("nativeRecreateGfxState"))) {
+    mm_probe("pre-RecreateGfxState");
+    /* spy: hook na entrada do operator-new (0x3cbf2c) p/ capturar args da
+       chamada que estoura o canario. Instala AQUI p/ pegar so' o gfx path. */
+    if (getenv("CUP_ASPY")) {
+      extern void so_make_text_writable(void), so_make_text_executable(void);
+      g_gfx_cont = g_alloc_ub + 0x3cbf2c + 16;
+      so_make_text_writable();
+      hook_arm64(g_alloc_ub + 0x3cbf2c, (uintptr_t)onew_spy_tramp);
+      so_make_text_executable();
+      so_flush_caches();
+      g_in_gfx = 1;
+      fprintf(stderr, "[ONEW] hook em operator-new (0x3cbf2c) instalado\n");
+    }
     fprintf(stderr, "[F2] nativeRecreateGfxState...\n");
     ((void (*)(void *, void *, int, void *))fn)(env, &thiz, 0, &surf);
     fprintf(stderr, "[F2] nativeRecreateGfxState OK\n");
+    mm_probe("pos-RecreateGfxState");
   }
   if ((fn = jni_find_native("nativeResume"))) ((void (*)(void *, void *))fn)(env, &thiz);
   if ((fn = jni_find_native("nativeFocusChanged"))) ((void (*)(void *, void *, int))fn)(env, &thiz, 1);

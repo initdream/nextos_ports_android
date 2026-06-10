@@ -424,8 +424,13 @@ uintptr_t so_find_addr(const char *symbol) {
 uintptr_t so_find_addr_safe(const char *symbol) {
   for (int i = 0; i < num_syms; i++) {
     char *name = dynstrtab + syms[i].st_name;
-    if (strcmp(name, symbol) == 0)
+    if (strcmp(name, symbol) == 0) {
+      /* import (UNDEF, st_value=0): dlsym real devolve NULL; sem este guard
+         devolviamos text_base+0 = base do modulo -> ponteiro lixo no Unity */
+      if (syms[i].st_shndx == SHN_UNDEF)
+        continue;
       return (uintptr_t)text_base + syms[i].st_value;
+    }
   }
   return 0;
 }
