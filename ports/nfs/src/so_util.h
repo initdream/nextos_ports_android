@@ -16,6 +16,8 @@
 extern sigjmp_buf g_init_jmp;
 extern volatile int g_init_armed;
 extern volatile int g_init_skips;
+extern sigjmp_buf g_probe_jmp;
+extern volatile int g_probe_armed;
 
 #define ALIGN_MEM(x, align) (((x) + ((align) - 1)) & ~((align) - 1))
 

@@ -30,11 +30,20 @@
 __attribute__((aligned(16))) _Thread_local char g_bionic_guard_pad[256];
 
 /* ---- crash handler ARMHF (campos arm_pc/arm_r0/arm_lr do sigcontext 32-bit) ---- */
+extern void *g_real_dynamic_cast;
 static void crash_handler(int sig, siginfo_t *info, void *uctx) {
   ucontext_t *uc = (ucontext_t *)uctx;
   mcontext_t *m = &uc->uc_mcontext;
+  int g_pc_mapped = 0;
   uintptr_t pc = m->arm_pc, lr = m->arm_lr, fault = (uintptr_t)info->si_addr;
   uintptr_t text = (uintptr_t)text_base;
+
+  /* probe de legibilidade (my_dynamic_cast): fault esperado → volta sinalizando
+   * "não legível". Checado ANTES de tudo (inclusive do assert-ignore). */
+  if ((sig == SIGSEGV || sig == SIGBUS) && g_probe_armed) {
+    g_probe_armed = 0;
+    siglongjmp(g_probe_jmp, 1);
+  }
 
   /* construtor do init_array crashou (precisa de ambiente bionic indisponível)
    * → pula ele e segue (so_execute_init_array armou o sigsetjmp). */
@@ -45,13 +54,34 @@ static void crash_handler(int sig, siginfo_t *info, void *uctx) {
    * NFS_NOASSERTIGNORE=1 desliga. */
   if (sig == SIGSEGV && info->si_code <= 0 && !getenv("NFS_NOASSERTIGNORE")) {
     static int a = 0;
-    if (a < 8) { fprintf(stderr, "[ASSERT-IGNORE] raise(SIGSEGV) deliberado (si_code=%d) -> continua\n", info->si_code); a++; }
+    extern long nfs_io_last_seek, nfs_io_seeks, nfs_io_read_bytes;
+    if (a < 8) { fprintf(stderr, "[ASSERT-IGNORE] raise(SIGSEGV) deliberado (si_code=%d) -> continua "
+                 "[io: seeks=%ld last=%ld read=%ld]\n", info->si_code,
+                 nfs_io_seeks, nfs_io_last_seek, nfs_io_read_bytes); a++; }
     return;
   }
 
   if ((sig == SIGSEGV || sig == SIGBUS) && g_init_armed) {
     g_init_armed = 0;
     siglongjmp(g_init_jmp, 1);
+  }
+
+  /* 🎯 __dynamic_cast em objeto de typeinfo corrompido (vtable[-1] aponta p/
+   * código). A engine, no parse de asset, faz dynamic_cast (e RTTI recursivo de
+   * classes-base via blx interno) em objetos cujo typeinfo é lixo → o deref
+   * `ldr ip,[r0,#24]` (off 0x36) faulta. Como o shim só pega a chamada externa
+   * (libapp GOT), a recursão interna da libc++ escapa; aqui forçamos o retorno
+   * NULL pulando p/ o epílogo (off 0xa6, `mov r0,r4; add sp,#64; pop`) com r4=0
+   * — NULL é "cast falhou", resultado C++ válido. NFS_NODCASTREC=1 desliga. */
+  if (sig == SIGSEGV && g_real_dynamic_cast && !getenv("NFS_NODCASTREC")) {
+    uintptr_t dc = ((uintptr_t)g_real_dynamic_cast) & ~1u;
+    if (pc == dc + 0x36) {
+      static int dr = 0;
+      m->arm_r4 = 0;
+      m->arm_pc = dc + 0xa6;     /* epílogo: mov r0,r4(=0); add sp,#64; pop */
+      if (dr < 8) { fprintf(stderr, "[DCAST-REC] typeinfo lixo @dyncast+0x36 -> retorna NULL (#%d)\n", dr); dr++; }
+      return;
+    }
   }
 
   /* 🩹 recupera o memcpy/op com DESTINO NULO e n pequeno (padrão recorrente da
@@ -68,6 +98,11 @@ static void crash_handler(int sig, siginfo_t *info, void *uctx) {
     }
   }
 
+  {
+    extern long nfs_io_last_seek, nfs_io_seeks, nfs_io_read_bytes;
+    fprintf(stderr, "\n[io-state] seeks=%ld last=%ld read=%ld\n",
+            nfs_io_seeks, nfs_io_last_seek, nfs_io_read_bytes);
+  }
   fprintf(stderr, "\n=== CRASH sig=%d addr=%p ===\n", sig, (void *)fault);
   fprintf(stderr, "  PC=%p", (void *)pc);
   if (pc >= text && pc < text + text_size)
@@ -87,30 +122,62 @@ static void crash_handler(int sig, siginfo_t *info, void *uctx) {
           (unsigned long)m->arm_r10, (unsigned long)m->arm_fp,
           (unsigned long)m->arm_ip, (unsigned long)m->arm_sp);
 
-  /* qual módulo é o PC e o LR (lê /proc/self/maps) */
+  /* qual região é cada registrador (lê /proc/self/maps) — full line p/ PC/LR/r0 */
   { FILE *mf = fopen("/proc/self/maps", "r");
     if (mf) { char ln[512];
+      uintptr_t regs[6] = { pc, lr, m->arm_r0, m->arm_r1, m->arm_r5, m->arm_r6 };
+      const char *rn[6] = { "PC", "LR", "r0", "r1", "r5", "r6" };
       while (fgets(ln, sizeof(ln), mf)) {
         unsigned long s, e; char perm[8], path[300]; path[0] = 0;
         if (sscanf(ln, "%lx-%lx %7s %*x %*s %*d %299s", &s, &e, perm, path) >= 3) {
-          if (pc >= s && pc < e) fprintf(stderr, "  PC em %s + 0x%lx\n", path[0] ? path : "?", pc - s);
-          if (lr >= s && lr < e) fprintf(stderr, "  LR em %s + 0x%lx\n", path[0] ? path : "?", lr - s);
+          if (pc >= s && pc < e && perm[2] == 'x') g_pc_mapped = 1;
+          for (int q = 0; q < 6; q++)
+            if (regs[q] >= s && regs[q] < e)
+              fprintf(stderr, "  %s em [%08lx-%08lx %s %s] +0x%lx\n", rn[q], s, e, perm,
+                      path[0] ? path : "(anon)", regs[q] - s);
         }
       }
       fclose(mf); }
   }
+  /* hexdump do código em PC (só se PC está numa região executável mapeada —
+   * senão o próprio dump faultaria e mataria o handler antes do stack scan) */
+  if (pc > 0x1000 && g_pc_mapped) {
+    fprintf(stderr, "  --- bytes @PC (%p) ---\n", (void *)(pc & ~3u));
+    const uint32_t *w = (const uint32_t *)((pc & ~3u) - 16);
+    for (int q = 0; q < 8; q++) fprintf(stderr, "    %p: %08x\n", (void *)(w + q), w[q]);
+  }
 
-  /* backtrace simples via FP chain (ARM: [fp-4]=lr salvo, [fp-8]=fp ant.;
-   * varia por -fomit-frame-pointer, então é best-effort) */
-  fprintf(stderr, "  --- stack scan (retornos no .so) ---\n");
+  /* backtrace: varre a pilha e resolve cada retorno contra TODAS as regiões
+   * executáveis (mapeia anon→módulo via faixas conhecidas no maps). */
+  fprintf(stderr, "  --- stack scan (retornos em qq região r-x) ---\n");
   uintptr_t sp = m->arm_sp;
   int n = 0;
-  for (uintptr_t a = sp; a < sp + 0x2000 && n < 24; a += 4) {
+  /* carrega faixas r-x do maps p/ rotular cada retorno */
+  struct { uintptr_t s, e; char tag[64]; } rx[64]; int nrx = 0;
+  { FILE *mf = fopen("/proc/self/maps", "r");
+    if (mf) { char ln[512];
+      while (fgets(ln, sizeof(ln), mf) && nrx < 64) {
+        unsigned long s, e; char perm[8], path[300]; path[0] = 0;
+        if (sscanf(ln, "%lx-%lx %7s %*x %*s %*d %299s", &s, &e, perm, path) >= 3 && perm[2] == 'x') {
+          rx[nrx].s = s; rx[nrx].e = e;
+          const char *b = path[0] ? (strrchr(path, '/') ? strrchr(path, '/') + 1 : path) : "(anon)";
+          snprintf(rx[nrx].tag, sizeof rx[nrx].tag, "%s", b); nrx++;
+        }
+      }
+      fclose(mf); }
+  }
+  for (uintptr_t a = sp; a < sp + 0x2000 && n < 40; a += 4) {
     uintptr_t v = *(uintptr_t *)a;
     if (v >= text && v < text + text_size) {
-      fprintf(stderr, "    [sp+0x%lx] %s+0x%lx\n", (unsigned long)(a - sp),
-              SO_NAME, (unsigned long)(v - text));
+      fprintf(stderr, "    [sp+0x%lx] %s+0x%lx\n", (unsigned long)(a - sp), SO_NAME, (unsigned long)(v - text));
       n++;
+    } else {
+      for (int q = 0; q < nrx; q++)
+        if (v >= rx[q].s && v < rx[q].e) {
+          fprintf(stderr, "    [sp+0x%lx] %s+0x%lx (%08lx)\n", (unsigned long)(a - sp),
+                  rx[q].tag, (unsigned long)(v - rx[q].s), (unsigned long)v);
+          n++; break;
+        }
     }
   }
   fprintf(stderr, "=== END CRASH ===\n");
@@ -194,6 +261,17 @@ int main(int argc, char *argv[]) {
 
   /* dependências primeiro (cada uma vira fonte de símbolos p/ as seguintes) */
   if (load_module("libc++_shared.so", 24, 1) < 0) return 1; /* std::__ndk1 */
+  /* captura o __dynamic_cast REAL da libc++ (busca do FIM do g_comb p/ achar o
+   * snapshot da libc++, não o nosso shim do início) p/ o my_dynamic_cast delegar
+   * quando a cadeia typeinfo é válida. */
+  { extern void *g_real_dynamic_cast;
+    for (int i = g_comb_n - 1; i >= 0; i--)
+      if (strcmp(g_comb[i].symbol, "__dynamic_cast") == 0 && g_comb[i].func) {
+        g_real_dynamic_cast = (void *)g_comb[i].func; break;
+      }
+    debugPrintf("real __dynamic_cast=%p\n", g_real_dynamic_cast);
+    extern void nfs_install_dyncast_hook(void);
+    nfs_install_dyncast_hook(); }
   if (load_module("libNimble.so", 4, 1) < 0) return 1;      /* bridge JNI */
   if (load_module("libfmodex.so", 8, 1) < 0) return 1;      /* áudio FMOD */
   if (load_module("libfmodevent.so", 8, 1) < 0) return 1;

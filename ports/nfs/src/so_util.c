@@ -51,6 +51,11 @@ sigjmp_buf g_init_jmp;
 volatile int g_init_armed;
 volatile int g_init_skips;
 
+/* probe de legibilidade: o my_dynamic_cast arma isto antes de desreferenciar um
+ * ponteiro suspeito; se faultar, o crash_handler dá siglongjmp de volta. */
+sigjmp_buf g_probe_jmp;
+volatile int g_probe_armed;
+
 void *data_base, *data_virtbase;
 size_t data_size;
 
