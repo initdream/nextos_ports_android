@@ -11,6 +11,8 @@
  */
 
 #include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "jni_shim.h"
@@ -30,6 +32,7 @@ static void *java_vm_ptr;
 enum {
   MID_UNKNOWN = 0,
   MID_GET_STORAGE_DIR,
+  MID_GET_OBB_PATH,
   MID_GET_PACK_NAME,
   MID_SET_ACTIVITY,
   MID_ERROR_DIALOG,
@@ -104,6 +107,12 @@ static void *jni_GetMethodID(void *env, void *clazz, const char *name,
     return &g_method_tags[MID_GET_CLASS_LOADER];
   if (strcmp(name, "loadClass") == 0)
     return &g_method_tags[MID_LOAD_CLASS];
+  /* NFS: paths de storage/OBB (instância) */
+  if (strstr(name, "ObbFullPath") || strstr(name, "ObbPath"))
+    return &g_method_tags[MID_GET_OBB_PATH];
+  if (strstr(name, "ExternalStorageDirectory") || strstr(name, "StorageDirectory") ||
+      strstr(name, "StorageDir"))
+    return &g_method_tags[MID_GET_STORAGE_DIR];
   return &g_method_tags[MID_GENERIC];
 }
 
@@ -113,6 +122,10 @@ static void *jni_GetStaticMethodID(void *env, void *clazz, const char *name,
   (void)clazz;
   debugPrintf("jni_shim: GetStaticMethodID(%s, %s)\n", name, sig);
   if (strcmp(name, "getStorageDir") == 0)
+    return &g_method_tags[MID_GET_STORAGE_DIR];
+  if (strstr(name, "ObbFullPath") || strstr(name, "ObbPath"))
+    return &g_method_tags[MID_GET_OBB_PATH];
+  if (strstr(name, "ExternalStorageDirectory") || strstr(name, "StorageDirectory"))
     return &g_method_tags[MID_GET_STORAGE_DIR];
   if (strcmp(name, "getPackName") == 0)
     return &g_method_tags[MID_GET_PACK_NAME];
@@ -141,10 +154,30 @@ static void *jni_GetStaticFieldID(void *env, void *clazz, const char *name,
   return &g_method_tags[FID_GENERIC];
 }
 
+/* path base dos dados (env NFS_DATA) + path completo do OBB */
+static const char *nfs_data_dir(void) {
+  const char *d = getenv("NFS_DATA");
+  return (d && *d) ? d : "/storage/roms/nfs/data";
+}
+static const char *nfs_obb_path(void) {
+  static char p[512];
+  snprintf(p, sizeof(p), "%s/Android/obb/%s/main.%d.%s.obb",
+           nfs_data_dir(), g_package_name, 1003128, g_package_name);
+  return p;
+}
+
 /* CallObjectMethod (index 36) - variadic */
 static void *jni_CallObjectMethod(void *env, void *obj, void *methodID, ...) {
   (void)env;
   (void)obj;
+  if (methodID == &g_method_tags[MID_GET_STORAGE_DIR]) {
+    debugPrintf("jni_shim: CallObjectMethod -> storageDir = %s\n", nfs_data_dir());
+    return make_jstring(nfs_data_dir());
+  }
+  if (methodID == &g_method_tags[MID_GET_OBB_PATH]) {
+    debugPrintf("jni_shim: CallObjectMethod -> obbPath = %s\n", nfs_obb_path());
+    return make_jstring(nfs_obb_path());
+  }
   debugPrintf("jni_shim: CallObjectMethod(mid=%p)\n", methodID);
   static int fake_obj;
   return &fake_obj;
@@ -181,8 +214,12 @@ static void *jni_CallStaticObjectMethod(void *env, void *clazz,
   (void)clazz;
 
   if (methodID == &g_method_tags[MID_GET_STORAGE_DIR]) {
-    debugPrintf("jni_shim: CallStaticObjectMethod -> getStorageDir = \".\"\n");
-    return make_jstring(".");
+    debugPrintf("jni_shim: CallStaticObjectMethod -> storageDir = %s\n", nfs_data_dir());
+    return make_jstring(nfs_data_dir());
+  }
+  if (methodID == &g_method_tags[MID_GET_OBB_PATH]) {
+    debugPrintf("jni_shim: CallStaticObjectMethod -> obbPath = %s\n", nfs_obb_path());
+    return make_jstring(nfs_obb_path());
   }
   if (methodID == &g_method_tags[MID_GET_PACK_NAME]) {
     debugPrintf(
