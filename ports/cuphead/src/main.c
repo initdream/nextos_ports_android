@@ -1501,6 +1501,15 @@ int main(int argc, char **argv) {
   int max_f = getenv("CUP_FRAMES") ? atoi(getenv("CUP_FRAMES")) : 600;
   void *fpump = jni_find_native("nativePause");  /* só p/ existência */ (void)fpump;
   g_render_tid = (int)syscall(SYS_gettid);   /* p/ recovery longjmp (CUP_SKIPBAD) */
+  /* CUP_AUTOTAP: o disclaimer/menu espera "toque/botão pra continuar". Injeta
+     periodicamente um botão de confirmação via nativeInjectEvent (KeyEvent) p/
+     avançar. CUP_AUTOTAP=keycode (default 66=ENTER; 96=BUTTON_A, 23=DPAD_CENTER). */
+  extern struct hk_inject_s { int action, keycode, source, deviceId, metaState, repeat,
+                              scancode, flags, unicode; long eventTime, downTime; } g_hk_inject;
+  extern void *hk_keyevent_object(void);
+  void *inject = jni_find_native("nativeInjectEvent");
+  int tapkey = getenv("CUP_AUTOTAP") ? atoi(getenv("CUP_AUTOTAP")) : 0;
+  if (tapkey && inject) fprintf(stderr, "[AUTOTAP] keycode=%d via nativeInjectEvent=%p\n", tapkey, inject);
   for (int f = 0; render && (max_f <= 0 || f < max_f); f++) {
     if (f < 200) { fprintf(stderr, "[r%d>\n", f); dbg_sync(); }  /* ENTRA no render */
     if (g_skipbad) {
@@ -1520,6 +1529,19 @@ int main(int argc, char **argv) {
     opensles_shim_pump_callbacks();
     /* bombeia eventos SDL (foco/janela) p/ o input do Unity não esfomear */
     SDL_Event ev; while (SDL_PollEvent(&ev)) {}
+    /* AUTOTAP: a cada ~90 frames, manda DOWN; ~3 frames depois, UP (1 "toque") */
+    if (tapkey && inject && f > 120) {
+      int phase = f % 90;
+      if (phase == 0 || phase == 3) {
+        g_hk_inject.action = (phase == 0) ? 0 : 1;   /* 0=DOWN 1=UP */
+        g_hk_inject.keycode = tapkey;
+        g_hk_inject.source = 0x501;                  /* gamepad|keyboard */
+        g_hk_inject.deviceId = 0; g_hk_inject.repeat = 0; g_hk_inject.flags = 0;
+        g_hk_inject.metaState = 0; g_hk_inject.scancode = 0; g_hk_inject.unicode = 0;
+        ((int (*)(void *, void *, void *))inject)(env, &thiz, hk_keyevent_object());
+        if (f < 600) fprintf(stderr, "[AUTOTAP] %s key=%d (f=%d)\n", phase ? "UP" : "DOWN", tapkey, f);
+      }
+    }
     if (f % 60 == 0) { fprintf(stderr, "[render %d]\n", f); dbg_sync(); }
   }
   fprintf(stderr, "[F2] === render loop terminou ===\n");
