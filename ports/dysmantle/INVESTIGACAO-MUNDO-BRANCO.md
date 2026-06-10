@@ -176,3 +176,24 @@ virar grama verde, tex23 é detalhe-luminância e falta o tint (hip 1); se cinza
   NÓS mudamos" (pak/textura) como no Bully.
 - ⚠️ infra de diag toda env-gated (default estável). hooks default-ON inofensivos: hook_genverts/
   initbufs (format-0, reduz erros mas não muda visual), STRIDEFIX OFF.
+
+## SESSÃO 3 (manhã) — testada hip da TEXTURA; chão não usa vary_color
+| Teste | Método | Resultado |
+|---|---|---|
+| Decode ETC2 do script | ler fix_empty_textures.py | CORRETO (decode_etc2→RGB colorido); NÃO trunca (anexa se não cabe); só preenche size==0 |
+| Texturas de grama no pak orig | parse + decode | TÊM DADOS (não mexemos) e são COLORIDAS (edge-grassland-grass-diffuse [76,93,42] verde, sat 53) |
+| tex23/24 coloridas? | TEXRGB (canais R,G,B) | tex24=COLORIDA (azul 2f3849); **tex23=grayscale-esverdeado dessaturado (4c5655=76,86,85)** ≠ grama |
+| offset da cor por stride | ATTRCOL | cor@12 tanto stride 24 quanto 40 (meu tint estava no offset certo) |
+| Tingir vary_color de verde | TINT_GREEN (reescreve cor@12 dos buffers 40B) | **chão NÃO mudou** → o chão NÃO usa vary_color; cor vem 100% da textura tex23 |
+
+**🔑 CONCLUSÃO SESSÃO 3:** o chão amostra a textura **tex23 (cinza-esverdeada dessaturada)**, NÃO
+a grama verde ([76,93,42]) que existe no pak. E o chão não responde ao vary_color. Então:
+**a textura ERRADA (ou um blend/detail map cinza) está sendo amostrada como base do chão**, em vez
+da textura de grama colorida. Não é decode (correto), não é vary_color (chão ignora), não é
+geometria (correta). É a **seleção/composição de textura do terreno** — provavelmente um atlas de
+tiles ou lookup que aponta pro tile errado/cinza no nosso ambiente.
+
+**ESTADO:** mundo renderiza geometricamente perfeito; falta a COR do terreno (amostra tex cinza
+em vez da grama verde). É um bug fundo do pipeline de terreno do DYSMANTLE (atlas/tile lookup),
+nível Hollow Knight de dificuldade. Jogo segue 100% jogável (imagem+som+controle), só o visual do
+chão washed-white. Infra de diag toda env-gated; TINT_GREEN/STRIDEFIX off por default.

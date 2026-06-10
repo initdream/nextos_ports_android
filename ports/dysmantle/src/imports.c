@@ -473,6 +473,13 @@ static void my_glVertexAttribPointer(unsigned idx, int sz, unsigned typ,
     fprintf(stderr, "[ATTR] idx=%u size=%d type=0x%x norm=%d stride=%d off=%ld\n",
             idx, sz, typ, norm, stride, (long)(uintptr_t)ptr); n++;
   }
+  /* loga o atributo de COR (ubyte normalizado) p/ cada stride distinto */
+  if (getenv("DYSMANTLE_ATTR_LOG") && typ == 0x1401 && norm) {
+    static int seen[128]; static int sn = 0; int known = 0;
+    for (int i = 0; i < sn; i++) if (seen[i] == stride) { known = 1; break; }
+    if (!known && sn < 128) { seen[sn++] = stride;
+      fprintf(stderr, "[ATTRCOL] stride=%d cor_off=%ld size=%d\n", stride, (long)(uintptr_t)ptr, sz); }
+  }
   /* AUTO-FIX por DIVISIBILIDADE: o stride real SEMPRE divide o tamanho do
    * buffer. Se o stride do atributo (ex 24) NÃO divide o tamanho mas existe um
    * stride de vértice conhecido MAIOR que divide (ex 40), usa esse. Os offsets
@@ -616,6 +623,20 @@ static void my_glBufferData(unsigned tgt, long size, const void *data, unsigned 
    * vértices. Escolhe o MENOR stride com >85% de UVs válidas. */
   /* registra o TAMANHO do buffer (p/ deduzir stride por divisibilidade no draw) */
   if (tgt == 0x8892 && g_cur_array_buf < 4096) g_buf_size[g_cur_array_buf] = size;
+  /* TESTE: tinge a cor-de-vértice (rgba8 @12) dos buffers GRANDES (terreno,
+   * stride 40) de verde — se o chão ficar verde, vary_color branco é o muro. */
+  if (tgt == 0x8892 && data && getenv("DYSMANTLE_TINT_GREEN") && size > 2000 &&
+      (size % 40) == 0) {
+    unsigned char *b = (unsigned char *)data; /* nota: data é const; copiamos */
+    static unsigned char *cp = NULL; static long cpsz = 0;
+    if (cpsz < size) { free(cp); cp = malloc(size); cpsz = size; }
+    if (cp) {
+      memcpy(cp, b, size);
+      for (long v = 0; v + 40 <= size; v += 40) { cp[v+12]=40; cp[v+13]=180; cp[v+14]=60; }
+      if (real) real(tgt, size, cp, usage); /* re-upload tingido (sobrescreve) */
+      static int tn = 0; if (tn < 3) { fprintf(stderr, "[TINT] buffer %ld verde\n", size); tn++; }
+    }
+  }
   static int n = 0;
   if (getenv("DYSMANTLE_BUF_LOG") && (n < 60 || e)) {
     fprintf(stderr, "[BUFDATA] tid=%d tgt=0x%x size=%ld data=%s usage=0x%x -> err=0x%x\n",
@@ -732,15 +753,17 @@ static void my_glTexImage2D(unsigned tgt, int lvl, int ifmt, int w, int h,
     unsigned tid = g_bound_tex[g_active_unit < 8 ? g_active_unit : 0];
     if (px && lvl == 0 && w >= 64 && h >= 64 && fmt == 0x1908) {
       const unsigned char *b = (const unsigned char *)px;
-      char grid[96]; int gi = 0;
-      for (int gy = 0; gy < 4; gy++)
-        for (int gx = 0; gx < 4; gx++) {
-          long o = ((long)(gy*h/4 + h/8) * w + (gx*w/4 + w/8)) * 4;
-          int lum = (b[o] + b[o+1] + b[o+2]) / 3;
-          gi += snprintf(grid+gi, sizeof(grid)-gi, "%02x ", lum);
-        }
+      char grid[160]; int gi = 0; int colorful = 0;
+      for (int k = 0; k < 6; k++) {
+        long o = ((long)((k*7+3)%h * 0 + (k+1)*h/8) * w + (k+1)*w/8) * 4;
+        int R=b[o],G=b[o+1],B=b[o+2];
+        int mx = R>G?(R>B?R:B):(G>B?G:B), mn = R<G?(R<B?R:B):(G<B?G:B);
+        if (mx - mn > 24) colorful++;
+        gi += snprintf(grid+gi, sizeof(grid)-gi, "%02x%02x%02x ", R,G,B);
+      }
       static int gn = 0;
-      if (gn < 30) { fprintf(stderr, "[TEXGRID] tex=%u %dx%d lum: %s\n", tid, w, h, grid); gn++; }
+      if (gn < 30) { fprintf(stderr, "[TEXRGB] tex=%u %dx%d %s rgb: %s\n",
+                             tid, w, h, colorful>=2?"COLORIDA":"grayscale", grid); gn++; }
     }
     if (n < 80 || e) {
       char pix[80] = "(null)";
