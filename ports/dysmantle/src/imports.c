@@ -255,7 +255,6 @@ DynLibFunction dysmantle_overrides[] = {
   {"glGetIntegerv", (uintptr_t)my_glGetIntegerv},
   {"glGetStringi", (uintptr_t)my_glGetStringi},
   {"glGetError", (uintptr_t)my_glGetError},
-  {"__stack_chk_fail", (uintptr_t)my_stack_chk_fail},
   /* ANativeWindow */
   {"ANativeWindow_fromSurface", (uintptr_t)aw_fromSurface},
   {"ANativeWindow_acquire", (uintptr_t)aw_acquire},

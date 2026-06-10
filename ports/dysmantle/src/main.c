@@ -44,6 +44,7 @@ static void build_base_table(void) {
 }
 
 static void resolve_addr(uintptr_t a, char *out, int outsz);
+static void brk_handler(int sig, siginfo_t *info, void *uc);
 static void crash_handler(int sig, siginfo_t *info, void *uc) {
   uintptr_t fault = (uintptr_t)info->si_addr;
   uintptr_t tb = (uintptr_t)text_base;
@@ -120,6 +121,9 @@ static void install_crash_handler(void) {
   struct sigaction sb; memset(&sb, 0, sizeof(sb));
   sb.sa_sigaction = bt_handler; sb.sa_flags = SA_SIGINFO;
   sigaction(SIGUSR1, &sb, NULL);
+  struct sigaction sc; memset(&sc, 0, sizeof(sc));
+  sc.sa_sigaction = brk_handler; sc.sa_flags = SA_SIGINFO;
+  sigaction(SIGTRAP, &sc, NULL);
 }
 
 static void preload_device_libs(void) {
@@ -153,6 +157,10 @@ static void patch_func_ret0(const char *sym) {
   uint32_t w[] = {0x52800000, 0xd65f03c0}; /* mov w0,#0 ; ret */
   patch_words(sym, w, 2);
 }
+static void patch_func_ret1(const char *sym) {
+  uint32_t w[] = {0x52800020, 0xd65f03c0}; /* mov w0,#1 ; ret */
+  patch_words(sym, w, 2);
+}
 /* patch num vaddr arbitrário (load_base derivado de android_main vaddr 0x4651a4) */
 static void patch_vaddr(uintptr_t vaddr, uint32_t word) {
   uintptr_t lb = so_find_addr("android_main") - 0x4651a4;
@@ -166,33 +174,53 @@ static void patch_vaddr(uintptr_t vaddr, uint32_t word) {
   fprintf(stderr, "patch_vaddr: 0x%lx = 0x%08x @ %p\n", (unsigned long)vaddr, word, (void *)a);
 }
 
-/* ---- hooks de trace p/ achar o stack-smash no renderer init ---- */
-static long (*o_initver)(void *);
-static long w_initver(void *s){ fprintf(stderr,"ENTER InitializeVersions\n"); long r=o_initver(s); fprintf(stderr,"EXIT InitializeVersions=%ld\n",r); return r; }
-static long (*o_initsl)(void *);
-static long w_initsl(void *s){ fprintf(stderr,"ENTER InitShadingLangVersion\n"); long r=o_initsl(s); fprintf(stderr,"EXIT InitShadingLangVersion=%ld\n",r); return r; }
-static void (*o_getfuncs)(void *);
-static void w_getfuncs(void *s){ fprintf(stderr,"ENTER APIManager::GetFunctions\n"); o_getfuncs(s); fprintf(stderr,"EXIT APIManager::GetFunctions\n"); }
-static const char *(*o_helpergetstr)(unsigned);
-static const char *w_helpergetstr(unsigned n){ fprintf(stderr,"ENTER GL::Helper::GetString(0x%x)\n", n); const char *r=o_helpergetstr(n); fprintf(stderr,"EXIT GL::Helper::GetString=%p\n",(void*)r); return r; }
-static void hook_got(const char *sym, uintptr_t wrap, void *save) {
-  uintptr_t slot = so_find_rel_addr_safe(sym);
-  if (!slot) { fprintf(stderr, "trace-hook: GOT %s não achado\n", sym); return; }
-  *(uintptr_t *)save = *(uintptr_t *)slot;
-  *(uintptr_t *)slot = wrap;
-  fprintf(stderr, "trace-hook: %s\n", sym);
+/* ---- BRK-trap tracer (funciona em função LOCAL, ≠ GOT-hook) ----
+ * Arma BRK #0 no entry; no SIGTRAP loga, restaura a instrução original e
+ * re-executa (one-shot). O ÚLTIMO ENTER antes do crash = função que corrompe. */
+#define MAX_BRK 24
+static struct { uintptr_t addr; const char *name; uint32_t orig; } g_brk[MAX_BRK];
+static volatile int g_brk_n = 0;
+static void arm_brk(uintptr_t vaddr, const char *name) {
+  if (g_brk_n >= MAX_BRK) return;
+  uintptr_t lb = so_find_addr("android_main") - 0x4651a4;
+  uintptr_t a = lb + vaddr;
+  uintptr_t pg = a & ~0xFFFUL;
+  if (mprotect((void *)pg, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return;
+  g_brk[g_brk_n].addr = a; g_brk[g_brk_n].name = name; g_brk[g_brk_n].orig = *(uint32_t *)a;
+  *(uint32_t *)a = 0xd4200000; /* brk #0 */
+  mprotect((void *)pg, 0x2000, PROT_READ | PROT_EXEC);
+  __builtin___clear_cache((char *)a, (char *)a + 4);
+  fprintf(stderr, "arm_brk: %s @ 0x%lx\n", name, (unsigned long)vaddr);
+  g_brk_n++;
 }
-static long (*o_ctxinit)(void *, void *, int);
-static long w_ctxinit(void *a, void *b, int c){ fprintf(stderr,"ENTER ContextImpEGL::Initialize\n"); long r=o_ctxinit(a,b,c); fprintf(stderr,"EXIT ContextImpEGL::Initialize=%ld\n",r); return r; }
-static void (*o_getpre)(void *);
-static void w_getpre(void *s){ fprintf(stderr,"ENTER GetPreInitializationFunctions\n"); o_getpre(s); fprintf(stderr,"EXIT GetPreInitializationFunctions\n"); }
-static void install_trace_hooks(void) {
-  hook_got("_ZN13ContextImpEGL10InitializeEP10nx_state_ti", (uintptr_t)w_ctxinit, &o_ctxinit);
-  hook_got("_ZN2GL10APIManager29GetPreInitializationFunctionsEP21ContextImplementation", (uintptr_t)w_getpre, &o_getpre);
-  hook_got("_ZN28RendererImplementationOpenGL18InitializeVersionsEv", (uintptr_t)w_initver, &o_initver);
-  hook_got("_ZN28RendererImplementationOpenGL32InitializeShadingLanguageVersionEv", (uintptr_t)w_initsl, &o_initsl);
-  hook_got("_ZN2GL10APIManager12GetFunctionsEv", (uintptr_t)w_getfuncs, &o_getfuncs);
-  hook_got("_ZN2GL6Helper9GetStringEj", (uintptr_t)w_helpergetstr, &o_helpergetstr);
+static volatile uintptr_t g_canary_addr = 0;
+static void brk_handler(int sig, siginfo_t *info, void *uc) {
+  (void)sig; (void)info;
+  ucontext_t *u = (ucontext_t *)uc;
+  uintptr_t pc = u->uc_mcontext.pc;
+  for (int i = 0; i < g_brk_n; i++) {
+    if (g_brk[i].addr == pc) {
+      const char *nm = g_brk[i].name;
+      fprintf(stderr, "[BRK] %s  w0=0x%lx\n", nm, (unsigned long)u->uc_mcontext.regs[0]);
+      fflush(stderr);
+      uintptr_t pg = pc & ~0xFFFUL;
+      mprotect((void *)pg, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
+      *(uint32_t *)pc = g_brk[i].orig;   /* restaura -> re-executa (one-shot) */
+      mprotect((void *)pg, 0x2000, PROT_READ | PROT_EXEC);
+      __builtin___clear_cache((char *)pc, (char *)pc + 4);
+      return;
+    }
+  }
+  fprintf(stderr, "[BRK] SIGTRAP inesperado @ %p\n", (void *)pc); fflush(stderr);
+  _exit(133);
+}
+static void install_brk_traps(void) {
+  arm_brk(0x52462c, "after-MakeCurrent(w0=eglMC)");
+  arm_brk(0x524638, "PATH:makecurrent-FAILED-log");
+  arm_brk(0x524678, "PATH:return0-cbnz");
+  arm_brk(0x524694, "PATH:success-GetJavaActivity");
+  arm_brk(0x5246c8, "PATH:success-after-setAuto");
+  arm_brk(0x5246dc, "RET:success");
 }
 
 /* GOT-hook de NXI_GetProductValue -> força opengl_version="2.0" (caminho ES2) */
@@ -254,11 +282,11 @@ int main(int argc, char *argv[]) {
   /* Módulo B: libNativeGame.so */
   load_module(GAME_SO, GAME_HEAP_MB, comb, comb_n);
 
-  /* Neutraliza SwappyGL (frame pacing AGDK): SwappyGL_init faz JNI pesado p/
-   * consultar o display e corrompe a pilha com nosso JNI fake -> stack smash
-   * em ContextImpEGL::Initialize. init=ret, isEnabled=return 0 (engine usa
-   * eglSwapBuffers direto via ContextImpEGL::SwapBuffers). */
-  patch_func_ret("SwappyGL_init");
+  /* SwappyGL (frame pacing AGDK): a engine checa o retorno de SwappyGL_init
+   * (tbz w0,#0 -> se par=falha -> "Unable to initialize the renderer").
+   * Stub init=return 1 (sucesso, sem rodar o JNI pesado). isEnabled=0 -> a
+   * engine usa eglSwapBuffers direto via ContextImpEGL::SwapBuffers. */
+  patch_func_ret1("SwappyGL_init");
   patch_func_ret0("SwappyGL_isEnabled");
 
   /* GOT-hook NXI_GetProductValue: a engine lê "opengl_version" do config; se
@@ -266,6 +294,7 @@ int main(int argc, char *argv[]) {
    * dimensionado p/ ES2 -> stack smash no nosso contexto Utgard (ES2).
    * Forçamos "2.0" p/ alinhar a engine ao caminho ES2. */
   hook_getproductvalue();
+  // install_brk_traps();
 
   uintptr_t am = so_find_addr("android_main");
   if (!am) { fprintf(stderr, "android_main NÃO encontrado\n"); exit(1); }

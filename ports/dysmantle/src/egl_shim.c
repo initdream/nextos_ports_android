@@ -20,6 +20,28 @@
 #define SCREEN_WIDTH 1280
 #define SCREEN_HEIGHT 720
 
+/* A engine (bionic) lê a stack-canary de tpidr_el0+0x28 (TLS_SLOT_STACK_GUARD).
+ * Sob glibc esse offset colide com uma TLS var que o Mali/SDL escreve no
+ * MakeCurrent/CreateContext -> a canary "muda" no meio da função -> stack smash
+ * FALSO-POSITIVO. Salvamos/restauramos tpidr+0x28 ao redor das chamadas SDL_GL
+ * p/ a engine ver o guard ESTÁVEL. */
+static int gl_makecurrent(SDL_Window *w, SDL_GLContext c) {
+  unsigned long tp; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+  unsigned long g = *(unsigned long *)(tp + 0x28);
+  int (*f)(SDL_Window *, SDL_GLContext) = &SDL_GL_MakeCurrent;
+  int r = f(w, c);
+  *(unsigned long *)(tp + 0x28) = g;
+  return r;
+}
+static SDL_GLContext gl_createcontext(SDL_Window *w) {
+  unsigned long tp; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+  unsigned long g = *(unsigned long *)(tp + 0x28);
+  SDL_GLContext (*f)(SDL_Window *) = &SDL_GL_CreateContext;
+  SDL_GLContext c = f(w);
+  *(unsigned long *)(tp + 0x28) = g;
+  return c;
+}
+
 typedef struct {
   SDL_GLContext sdl_context;
   EGLBoolean is_pbuffer;
@@ -32,9 +54,9 @@ static pthread_mutex_t egl_context_create_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int frame_count = 0;
 static int next_context_id = 1;
 
-static _Thread_local _egl_context *current_context = NULL;
-static _Thread_local _egl_context *last_context = NULL;
-static _Thread_local int has_real_gl = 0;
+static _egl_context *current_context = NULL;
+static _egl_context *last_context = NULL;
+static int has_real_gl = 0;
 
 SDL_Window *egl_shim_get_window(void) { return egl_window; }
 
@@ -60,14 +82,14 @@ void egl_shim_create_window(void) {
   }
   debugPrintf("egl_shim: Window created %dx%d\n", SCREEN_WIDTH, SCREEN_HEIGHT);
 
-  egl_share_root = SDL_GL_CreateContext(egl_window);
+  egl_share_root = gl_createcontext(egl_window);
   if (!egl_share_root) {
     debugPrintf("egl_shim: SDL_GL_CreateContext FAILED: %s\n", SDL_GetError());
     return;
   }
   debugPrintf("egl_shim: GL share-root context created\n");
 
-  SDL_GL_MakeCurrent(egl_window, NULL);
+  gl_makecurrent(egl_window, NULL);
   debugPrintf("egl_shim: Context released, ready for game\n");
 }
 
@@ -88,7 +110,7 @@ int egl_shim_ensure_current(void) {
   if (!egl_window || !ctx || !ctx->sdl_context)
     return 0;
 
-  int ret = SDL_GL_MakeCurrent(egl_window, ctx->sdl_context);
+  int ret = gl_makecurrent(egl_window, ctx->sdl_context);
   if (ret == 0) {
     has_real_gl = 1;
     current_context = ctx;
@@ -172,10 +194,10 @@ EGLContext egl_shim_CreateContext(EGLDisplay dpy, EGLConfig config,
   pthread_mutex_lock(&egl_context_create_mutex);
   SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
   if (egl_share_root)
-    SDL_GL_MakeCurrent(egl_window, egl_share_root);
-  c->sdl_context = SDL_GL_CreateContext(egl_window);
+    gl_makecurrent(egl_window, egl_share_root);
+  c->sdl_context = gl_createcontext(egl_window);
   SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
-  SDL_GL_MakeCurrent(egl_window, NULL);
+  gl_makecurrent(egl_window, NULL);
   pthread_mutex_unlock(&egl_context_create_mutex);
 
   if (!c->sdl_context) {
@@ -196,14 +218,14 @@ EGLBoolean egl_shim_MakeCurrent(EGLDisplay dpy, EGLSurface draw,
   (void)dpy; (void)read;
 
   _egl_context *context = (_egl_context *)ctx;
-  static _Thread_local int mc_count = 0;
+  static int mc_count = 0;
   int mc = ++mc_count;
 
   /* === UNBIND === */
   if (context == NULL || draw == NULL) {
     current_context = NULL;
     if (egl_window) {
-      SDL_GL_MakeCurrent(egl_window, NULL);
+      gl_makecurrent(egl_window, NULL);
       /* debugPrintf("egl_shim: GL released [tid=%lx] reason=eglMakeCurrent(NULL)\n",
                     (unsigned long)pthread_self()); */
     }
@@ -219,10 +241,10 @@ EGLBoolean egl_shim_MakeCurrent(EGLDisplay dpy, EGLSurface draw,
   if (!egl_window || !context->sdl_context)
     return EGL_TRUE;
 
-  int ret = SDL_GL_MakeCurrent(egl_window, context->sdl_context);
+  int ret = gl_makecurrent(egl_window, context->sdl_context);
   if (ret == 0) {
     has_real_gl = 1;
-    static _Thread_local int acq_log = 0;
+    static int acq_log = 0;
     if (acq_log < 20 || mc % 500 == 0) {
       //debugPrintf("egl_shim: MakeCurrent #%d %s [tid=%lx] ACQUIRED [ctx_id=%d]\n",
       //            mc, is_window ? "WINDOW" : "PBUFFER",
