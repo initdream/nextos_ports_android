@@ -1062,6 +1062,41 @@ static void my_stack_chk_fail(void) {
   if (n++ < 3) fprintf(stderr, "[stack_chk_fail] FALSO-POSITIVO TLS ignorado\n");
 }
 
+/* GUARDA no memcpy: o caminho skinned-actor (StageImporter::AddActorFromNode →
+ * ModelInstance::InitializeFromModel) crasha com memcpy(dst=NULL, n=11) ao
+ * importar o mapa (config change). Se dst/src inválidos, loga o caller e PULA
+ * (em vez de SIGSEGV) → o loading do mundo continua. */
+static int copy_bad(const char *who, void *dst, const void *src, size_t n) {
+  if ((uintptr_t)dst >= 0x10000 && (uintptr_t)src >= 0x10000) return 0;
+  static int g = 0;
+  if (g < 30) { fprintf(stderr, "[%s-GUARD] dst=%p src=%p n=%zu — PULANDO\n", who, dst, src, n); g++; }
+  return 1;
+}
+static void *my_memcpy(void *dst, const void *src, size_t n) {
+  static void *(*real)(void *, const void *, size_t) = NULL;
+  if (!real) real = dlsym(RTLD_DEFAULT, "memcpy");
+  if (copy_bad("memcpy", dst, src, n)) return dst;
+  return real(dst, src, n);
+}
+static void *my_memmove(void *dst, const void *src, size_t n) {
+  static void *(*real)(void *, const void *, size_t) = NULL;
+  if (!real) real = dlsym(RTLD_DEFAULT, "memmove");
+  if (copy_bad("memmove", dst, src, n)) return dst;
+  return real(dst, src, n);
+}
+static void *my_memcpy_chk(void *dst, const void *src, size_t n, size_t dl) {
+  static void *(*real)(void *, const void *, size_t) = NULL;
+  if (!real) real = dlsym(RTLD_DEFAULT, "memcpy");
+  (void)dl; if (copy_bad("memcpy_chk", dst, src, n)) return dst;
+  return real(dst, src, n);
+}
+static void *my_memmove_chk(void *dst, const void *src, size_t n, size_t dl) {
+  static void *(*real)(void *, const void *, size_t) = NULL;
+  if (!real) real = dlsym(RTLD_DEFAULT, "memmove");
+  (void)dl; if (copy_bad("memmove_chk", dst, src, n)) return dst;
+  return real(dst, src, n);
+}
+
 DynLibFunction dysmantle_overrides[] = {
   /* liblog */
   {"__android_log_print", (uintptr_t)b_log_print},
@@ -1142,6 +1177,10 @@ DynLibFunction dysmantle_overrides[] = {
   {"pthread_attr_setstacksize", (uintptr_t)my_attr_setstacksize},
   {"fopen", (uintptr_t)my_fopen},
   {"__stack_chk_fail", (uintptr_t)my_stack_chk_fail},
+  {"memcpy", (uintptr_t)my_memcpy},
+  {"memmove", (uintptr_t)my_memmove},
+  {"__memcpy_chk", (uintptr_t)my_memcpy_chk},
+  {"__memmove_chk", (uintptr_t)my_memmove_chk},
   /* ANativeWindow */
   {"ANativeWindow_fromSurface", (uintptr_t)aw_fromSurface},
   {"ANativeWindow_acquire", (uintptr_t)aw_acquire},

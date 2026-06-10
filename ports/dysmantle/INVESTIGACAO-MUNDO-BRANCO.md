@@ -230,3 +230,20 @@ trava porque o campo de formato (this+232) é a contagem de entries (=2), não o
 o formato real (0x7F) está em entry@4 mas a função não o usa. Layout da ModelSurface ambíguo p/
 RE estática. PRÓXIMO REAL: gdb no device p/ rastrear a vtable que decide stream-path × interleaved-path,
 ou RE do construtor da ModelSurface p/ achar onde o formato deveria ser setado (é 0). Nível HK.
+
+## 🔌 CRASH ao mudar config / re-importar mapa = ESTADO DE GPU DEGRADADO (reboot resolve)
+- Sintoma: depois de horas de testes (muitos `killall -9 dysmantle`), o jogo passou a CRASHAR
+  no carregamento do mundo (`StageImporter::AddActorFromNode → SOActor::SetType →
+  ActorRendererModelSkinned::OnAllocateActor → ModelInstance::InitializeFromModel`), num
+  `memcpy/op(dst=NULL, n=11)` numa worker thread. NÃO é canary (__stack_chk_fail=0), NÃO é RAM
+  (500MB livres, swap vazio, overcommit=1), NÃO é o save, NÃO é meu hook (genv/initbuf/memcpy guards).
+- **CAUSA = memória/estado de GPU do Mali Utgard (fbdev) VAZANDO entre runs.** Cada `killall -9`
+  não devolve a memória de textura da GPU direito → após N runs, alocação de textura do skinned
+  actor falha → buffer nulo → crash. (Confirma a teoria do usuário de "memória de textura", mas
+  é ACUMULADO entre execuções, não num run só.)
+- **FIX = REBOOT do device.** Após reboot: CRASH=0, jogo carrega o mundo normal de novo.
+- ⚠️ LIÇÃO p/ testes: ao testar o mesmo jogo Mali dezenas de vezes com killall -9, REBOOTAR o
+  device periodicamente (ou quando aparecerem crashes estranhos no load). Não é bug do port.
+- Infra anti-crash adicionada (env-default, inofensiva): guards de memcpy/memmove/__memcpy_chk/
+  __memmove_chk que pulam cópia com dst/src nulo (não pegou esse crash pq é interno ao libc, mas
+  protege contra null genuíno). TEX_HALF disponível p/ reduzir pressão de textura se reincidir.
