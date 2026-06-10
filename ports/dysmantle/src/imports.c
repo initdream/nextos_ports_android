@@ -75,9 +75,10 @@ static int  aw_getHeight(void *w) { (void)w; return DYS_H; }
 /* ---------------- AAsset / AAssetManager / AAssetDir ----------------
  * O jogo lê assets/*.pak via AAssetManager. Servimos de um diretório real
  * no device (extraído do APK). Base configurável por env, default "assets". */
-typedef struct { FILE *fp; long len; } DysAsset;
+typedef struct { FILE *fp; long len; char path[512]; } DysAsset;
 typedef struct { DIR *d; } DysAssetDir;
 #include <dirent.h>
+#include <fcntl.h>
 
 static const char *assets_base(void) {
   const char *b = getenv("DYSMANTLE_ASSETS");
@@ -92,10 +93,28 @@ static void *aam_open(void *mgr, const char *fn, int mode) {
   if (!fp) { fprintf(stderr, "[AAsset] MISS %s\n", path); return NULL; }
   DysAsset *a = calloc(1, sizeof(DysAsset));
   a->fp = fp; fseek(fp, 0, SEEK_END); a->len = ftell(fp); fseek(fp, 0, SEEK_SET);
+  snprintf(a->path, sizeof(a->path), "%s", path);
+  fprintf(stderr, "[AAsset] open %s len=%ld\n", fn, a->len);
   return a;
 }
-static int    aa_read(void *h, void *buf, size_t n) { DysAsset *a = h; return a ? (int)fread(buf, 1, n, a->fp) : -1; }
-static long   aa_seek(void *h, long off, int wh)     { DysAsset *a = h; if (!a) return -1; fseek(a->fp, off, wh); return ftell(a->fp); }
+static int g_ar = 0;
+static int    aa_read(void *h, void *buf, size_t n) {
+  DysAsset *a = h; if (!a) return -1;
+  long p = ftell(a->fp); int r = (int)fread(buf, 1, n, a->fp);
+  if (a->len > 100000000L && g_ar < 30) {
+    unsigned char *b = buf;
+    fprintf(stderr, "[pak read] pos=%ld n=%zu got=%d b=%02x%02x%02x%02x\n",
+            p, n, r, r>0?b[0]:0, r>1?b[1]:0, r>2?b[2]:0, r>3?b[3]:0);
+    g_ar++;
+  }
+  return r;
+}
+static long   aa_seek(void *h, long off, int wh) {
+  DysAsset *a = h; if (!a) return -1; fseek(a->fp, off, wh);
+  if (a->len > 100000000L && g_ar < 30)
+    fprintf(stderr, "[pak seek] off=%ld wh=%d -> %ld\n", off, wh, ftell(a->fp));
+  return ftell(a->fp);
+}
 static long   aa_seek64(void *h, long off, int wh)   { return aa_seek(h, off, wh); }
 static long   aa_getLength(void *h)   { DysAsset *a = h; return a ? a->len : 0; }
 static long   aa_getRemaining(void *h){ DysAsset *a = h; return a ? a->len - ftell(a->fp) : 0; }
@@ -103,7 +122,95 @@ static void   aa_close(void *h)       { DysAsset *a = h; if (a) { fclose(a->fp);
 static int    aa_openFd(void *h, long *start, long *len) {
   DysAsset *a = h; if (!a) return -1;
   if (start) *start = 0; if (len) *len = a->len;
-  return fileno(a->fp);
+  fflush(a->fp);
+  int fd = dup(fileno(a->fp));
+  fprintf(stderr, "[AAsset] openFd %s len=%ld -> fd=%d\n", a->path, a->len, fd);
+  return fd;
+}
+/* override read() p/ diagnóstico: loga os primeiros reads de fd alto (jogo). */
+static long my_read(int fd, void *buf, size_t n) {
+  static long (*real)(int, void *, size_t) = NULL;
+  if (!real) real = dlsym(RTLD_DEFAULT, "read");
+  off_t pos = (fd >= 10) ? lseek(fd, 0, SEEK_CUR) : -1;
+  long r = real(fd, buf, n);
+  static int c = 0;
+  if (fd >= 17 && c < 120) {
+    unsigned char *b = buf;
+    fprintf(stderr, "[read] fd=%d pos=%ld n=%zu got=%ld b=%02x%02x%02x%02x\n",
+            fd, (long)pos, n, r, r>0?b[0]:0, r>1?b[1]:0, r>2?b[2]:0, r>3?b[3]:0);
+    c++;
+  }
+  return r;
+}
+/* std::ifstream (basic_filebuf::open): o jogo abre o pak de texturas via
+ * ifstream com path relativo -> não acha no CWD -> lê lixo (0xffd9). Logamos e
+ * redirecionamos pra assets/. g_real_filebuf_open vem do snapshot (main.c). */
+void *g_real_filebuf_open = NULL;
+static void *my_filebuf_open(void *self, const char *path, unsigned mode) {
+  void *(*real)(void *, const char *, unsigned) = g_real_filebuf_open;
+  void *r = real ? real(self, path, mode) : NULL;
+  static int c = 0;
+  if (c < 120) { fprintf(stderr, "[ifstream] '%s' mode=%u -> %s\n", path, mode, r?"OK":"FAIL"); c++; }
+  if (!r && path && path[0] != '/') {
+    char alt[1024]; snprintf(alt, sizeof(alt), "%s/%s", assets_base(), path);
+    r = real ? real(self, alt, mode) : NULL;
+    if (r && c < 130) fprintf(stderr, "[ifstream] -> redirect assets/%s OK\n", path);
+  }
+  return r;
+}
+
+/* fread/fseek override p/ diagnóstico: captura leituras de arquivo (texturas). */
+static size_t my_fread(void *buf, size_t sz, size_t nm, void *fp) {
+  static size_t (*real)(void *, size_t, size_t, void *) = NULL;
+  if (!real) real = dlsym(RTLD_DEFAULT, "fread");
+  long pos = ftell(fp);
+  size_t r = real(buf, sz, nm, fp);
+  static int c = 0;
+  unsigned char *b = buf;
+  /* loga reads GRANDES (JPEG/textura, não entradas de índice) + marcadores JPEG */
+  if (c < 60 && (sz*nm >= 1000 || (r>=2 && b[0]==0xff && (b[1]==0xd8||b[1]==0xd9)))) {
+    fprintf(stderr, "[fread] fp=%p pos=%ld sz=%zu got=%zu b=%02x%02x%02x%02x\n",
+            fp, pos, sz*nm, r, r>0?b[0]:0, b[1], b[2], b[3]);
+    c++;
+  }
+  return r;
+}
+static int my_fseek(void *fp, long off, int wh) {
+  static int (*real)(void *, long, int) = NULL;
+  if (!real) real = dlsym(RTLD_DEFAULT, "fseek");
+  static int c = 0;
+  if (c < 80) { fprintf(stderr, "[fseek] fp=%p off=%ld wh=%d\n", fp, off, wh); c++; }
+  return real(fp, off, wh);
+}
+
+/* fopen override: loga path; se for arquivo do jogo não-achado no CWD,
+ * tenta em assets/ (o jogo pode usar paths relativos/diferentes). */
+static void *my_fopen(const char *path, const char *mode) {
+  static void *(*real)(const char *, const char *) = NULL;
+  if (!real) real = dlsym(RTLD_DEFAULT, "fopen");
+  void *fp = real(path, mode);
+  static int c = 0;
+  if (c < 200) { fprintf(stderr, "[fopen] '%s' %s -> %s\n", path, mode, fp?"OK":"FAIL"); c++; }
+  if (!fp && path && path[0] != '/') {
+    char alt[1024]; snprintf(alt, sizeof(alt), "%s/%s", assets_base(), path);
+    fp = real(alt, mode);
+    if (fp && c < 70) { fprintf(stderr, "[fopen] -> redirect assets/%s OK\n", path); }
+  }
+  return fp;
+}
+static long my_read_chk(int fd, void *buf, size_t n, size_t buflen) {
+  static long (*real)(int, void *, size_t) = NULL;
+  if (!real) real = dlsym(RTLD_DEFAULT, "read");
+  off_t pos = lseek(fd, 0, SEEK_CUR);
+  long r = real(fd, buf, n > buflen ? buflen : n);
+  static int c = 0;
+  if (c < 50) {
+    unsigned char *b = buf;
+    fprintf(stderr, "[read_chk] fd=%d pos=%ld n=%zu got=%ld b=%02x%02x%02x%02x\n",
+            fd, (long)pos, n, r, r>0?b[0]:0, r>1?b[1]:0, r>2?b[2]:0, r>3?b[3]:0);
+    c++;
+  }
+  return r;
 }
 static void *aam_openDir(void *mgr, const char *dirn) {
   (void)mgr; char path[1024];
@@ -207,12 +314,14 @@ static unsigned my_glGetError(void) {
   return real ? real() : 0;
 }
 
-/* __stack_chk_fail neutralizado: a "corrupção" da canary no renderer init pode
- * ser falso-positivo (nossos valores EGL/struct). Em vez de abortar, logamos e
- * RETORNAMOS -> a função segue p/ o ret normal. DIAGNÓSTICO. */
+/* __stack_chk_fail neutralizado: a stack-canary da engine (bionic) é lida de
+ * tpidr_el0+0x28, que sob glibc colide com TLS vars nossas/do libc++ -> a canary
+ * "muda" no meio da função = FALSO-POSITIVO. Em vez de abortar, retornamos -> a
+ * função segue o ret normal. (O guard do egl_shim já foi estabilizado tirando
+ * _Thread_local; isto cobre os demais paths.) */
 static void my_stack_chk_fail(void) {
   static int n = 0;
-  if (n++ < 8) fprintf(stderr, "[stack_chk_fail] IGNORADO (#%d) - seguindo\n", n);
+  if (n++ < 3) fprintf(stderr, "[stack_chk_fail] FALSO-POSITIVO TLS ignorado\n");
 }
 
 DynLibFunction dysmantle_overrides[] = {
@@ -255,6 +364,13 @@ DynLibFunction dysmantle_overrides[] = {
   {"glGetIntegerv", (uintptr_t)my_glGetIntegerv},
   {"glGetStringi", (uintptr_t)my_glGetStringi},
   {"glGetError", (uintptr_t)my_glGetError},
+  {"read", (uintptr_t)my_read},
+  {"fopen", (uintptr_t)my_fopen},
+  {"fread", (uintptr_t)my_fread},
+  {"fseek", (uintptr_t)my_fseek},
+  {"_ZNSt6__ndk113basic_filebufIcNS_11char_traitsIcEEE4openEPKcj", (uintptr_t)my_filebuf_open},
+  {"__read_chk", (uintptr_t)my_read_chk},
+  {"__stack_chk_fail", (uintptr_t)my_stack_chk_fail},
   /* ANativeWindow */
   {"ANativeWindow_fromSurface", (uintptr_t)aw_fromSurface},
   {"ANativeWindow_acquire", (uintptr_t)aw_acquire},

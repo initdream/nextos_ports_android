@@ -215,12 +215,11 @@ static void brk_handler(int sig, siginfo_t *info, void *uc) {
   _exit(133);
 }
 static void install_brk_traps(void) {
-  arm_brk(0x52462c, "after-MakeCurrent(w0=eglMC)");
-  arm_brk(0x524638, "PATH:makecurrent-FAILED-log");
-  arm_brk(0x524678, "PATH:return0-cbnz");
-  arm_brk(0x524694, "PATH:success-GetJavaActivity");
-  arm_brk(0x5246c8, "PATH:success-after-setAuto");
-  arm_brk(0x5246dc, "RET:success");
+  arm_brk(0x56b438, "SoundMgr::Initialize");
+  arm_brk(0x56ca34, "CreateImplementation");
+  arm_brk(0x56dbd8, "GetPrimary(Oboe)");
+  arm_brk(0x56cb08, "InitWithFallback");
+  arm_brk(0x56f0b0, "SoundImpOboe::InitializeStream");
 }
 
 /* GOT-hook de NXI_GetProductValue -> força opengl_version="2.0" (caminho ES2) */
@@ -274,6 +273,13 @@ int main(int argc, char *argv[]) {
   if (!cxx_tbl || cxx_n <= 0) { fprintf(stderr, "snapshot %s vazio\n", CXX_SO); exit(1); }
   fprintf(stderr, "libc++: %d símbolos exportados\n", cxx_n);
 
+  /* expõe basic_filebuf::open real (do snapshot) p/ o override em imports.c */
+  extern void *g_real_filebuf_open;
+  for (int i = 0; i < cxx_n; i++)
+    if (strcmp(cxx_tbl[i].symbol, "_ZNSt6__ndk113basic_filebufIcNS_11char_traitsIcEEE4openEPKcj") == 0)
+      g_real_filebuf_open = (void *)cxx_tbl[i].func;
+  fprintf(stderr, "filebuf::open real = %p\n", g_real_filebuf_open);
+
   int comb_n = g_base_n + cxx_n;
   DynLibFunction *comb = malloc(sizeof(DynLibFunction) * comb_n);
   memcpy(comb, g_base, sizeof(DynLibFunction) * g_base_n);
@@ -288,6 +294,11 @@ int main(int argc, char *argv[]) {
    * engine usa eglSwapBuffers direto via ContextImpEGL::SwapBuffers. */
   patch_func_ret1("SwappyGL_init");
   patch_func_ret0("SwappyGL_isEnabled");
+
+  /* SoundImpOboe::Initialize(float): a init do Oboe crasha em STL/JNI no nosso
+   * ambiente (problema conhecido do Oboe em so-loaders). Retornamos 0 (falha) ->
+   * a engine cai no fallback (sem som) e segue. Áudio via opensles_shim depois. */
+  patch_func_ret0("_ZN12SoundImpOboe10InitializeEf");
 
   /* GOT-hook NXI_GetProductValue: a engine lê "opengl_version" do config; se
    * pedir ES3 ela monta o APIManager ES3 (mais funções) num buffer de pilha
