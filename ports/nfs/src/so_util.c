@@ -12,6 +12,7 @@
 #include <assert.h>
 #include <dlfcn.h>
 #include <elf.h>
+#include <setjmp.h>
 #include <errno.h>
 #include <malloc.h>
 #include <stdint.h>
@@ -43,6 +44,12 @@
 
 void *text_base, *text_virtbase;
 size_t text_size;
+
+/* recuperação de construtores que crasham no init_array (ver so_execute_init_array
+ * + crash_handler). Globais p/ o handler em main.c dar siglongjmp. */
+sigjmp_buf g_init_jmp;
+volatile int g_init_armed;
+volatile int g_init_skips;
 
 void *data_base, *data_virtbase;
 size_t data_size;
@@ -425,17 +432,34 @@ void so_execute_init_array(void) {
           (void *)((uintptr_t)text_virtbase + sec_hdr[i].sh_addr);
       int total = (int)(sec_hdr[i].sh_size / 4);
       int dbg = getenv("NFS_INITDBG") != NULL;
-      /* ponteiros de 4 bytes no armhf */
+      /* ponteiros de 4 bytes no armhf. Cada construtor é envolto em sigsetjmp:
+       * se crashar (SIGSEGV — precisa de ambiente bionic que não temos), o
+       * crash_handler dá longjmp de volta e PULAMOS aquele ctor, seguindo. */
+      /* skip por índice (só p/ o módulo principal = libapp, total==189):
+       * NFS_SKIPCTOR="186,187" pula ctors que crasham (determinístico; a
+       * recuperação por sinal não funciona se o ctor crasha em worker thread). */
+      char list[256] = "";
+      const char *skipidx = getenv("NFS_SKIPCTOR");
+      if (skipidx && total == 189) snprintf(list, sizeof(list), ",%s,", skipidx);
       for (int j = 0; j < total; j++) {
-        if (init_array[j] != 0) {
-          if (dbg) {
-            fprintf(stderr, "[init %d/%d] ctor=%p\n", j, total, (void *)init_array[j]);
-            fflush(stderr);
+        if (init_array[j] == 0) continue;
+        if (list[0]) {
+          char pat[16]; snprintf(pat, sizeof(pat), ",%d,", j);
+          if (strstr(list, pat)) {
+            if (dbg) fprintf(stderr, "[init %d/%d] PULADO por indice\n", j, total);
+            continue;
           }
+        }
+        if (dbg) { fprintf(stderr, "[init %d/%d] ctor=%p\n", j, total, (void *)init_array[j]); fflush(stderr); }
+        if (sigsetjmp(g_init_jmp, 1) == 0) {
+          g_init_armed = 1;
           init_array[j]();
-          if (dbg) { /* sonda: detecta corrupção logo após o construtor j */
-            void *p = malloc(128 * 1024); if (p) free(p);
-          }
+          g_init_armed = 0;
+        } else {
+          g_init_armed = 0;
+          if (g_init_skips < 12)
+            fprintf(stderr, "[init] ctor %d crashou -> PULADO (sinal)\n", j);
+          g_init_skips++;
         }
       }
     }

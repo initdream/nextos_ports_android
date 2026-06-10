@@ -90,7 +90,7 @@ static void *pad_memalign(size_t al, size_t n) { return memalign(al, n + NFS_PAD
 /* ---- stubs ---- */
 static int b_dso_handle;                       /* __dso_handle = endereço dummy */
 static void *b_cxa_type_match(void *a, void *b, char c) { (void)a; (void)b; (void)c; return (void *)0; }
-extern int __sigsetjmp(void *, int);           /* glibc; bionic sigsetjmp == isso */
+/* __sigsetjmp: declarado por <setjmp.h> (via so_util.h); bionic sigsetjmp == isso */
 /* AndroidBitmap (jnigraphics) — stub: sinaliza erro p/ a engine cair no fallback */
 static int abm_getInfo(void *env, void *bmp, void *info) { (void)env; (void)bmp; (void)info; return -1; }
 static int abm_lock(void *env, void *bmp, void **pix) { (void)env; (void)bmp; if (pix) *pix = 0; return -1; }

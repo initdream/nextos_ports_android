@@ -9,6 +9,13 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <setjmp.h>
+
+/* recuperação de construtores (.init_array) que crasham — o crash_handler
+ * dá siglongjmp p/ g_init_jmp quando g_init_armed. */
+extern sigjmp_buf g_init_jmp;
+extern volatile int g_init_armed;
+extern volatile int g_init_skips;
 
 #define ALIGN_MEM(x, align) (((x) + ((align) - 1)) & ~((align) - 1))
 

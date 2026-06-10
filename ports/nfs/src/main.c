@@ -24,6 +24,9 @@
 
 #define MEMORY_MB 64
 #define SO_NAME "libapp.so"
+/* NOTA: NFS usa __stack_chk_guard GLOBAL (resolve p/ o canário do glibc, estável)
+ * — NÃO o slot TLS. Logo o pad TLS do DYSMANTLE é desnecessário aqui (e mudava
+ * sig11→sig4). Removido. */
 
 /* ---- crash handler ARMHF (campos arm_pc/arm_r0/arm_lr do sigcontext 32-bit) ---- */
 static void crash_handler(int sig, siginfo_t *info, void *uctx) {
@@ -31,6 +34,13 @@ static void crash_handler(int sig, siginfo_t *info, void *uctx) {
   mcontext_t *m = &uc->uc_mcontext;
   uintptr_t pc = m->arm_pc, lr = m->arm_lr, fault = (uintptr_t)info->si_addr;
   uintptr_t text = (uintptr_t)text_base;
+
+  /* construtor do init_array crashou (precisa de ambiente bionic indisponível)
+   * → pula ele e segue (so_execute_init_array armou o sigsetjmp). */
+  if ((sig == SIGSEGV || sig == SIGBUS) && g_init_armed) {
+    g_init_armed = 0;
+    siglongjmp(g_init_jmp, 1);
+  }
 
   fprintf(stderr, "\n=== CRASH sig=%d addr=%p ===\n", sig, (void *)fault);
   fprintf(stderr, "  PC=%p", (void *)pc);

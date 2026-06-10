@@ -65,3 +65,22 @@
   PRÓXIMO: quando o device voltar, testar NFS_INIT=1 (init_array completa sem corromper?) →
   depois nativeOnCreate → EGL/render.
 - init_array agora DEFAULT-OFF (NFS_INIT=1 liga); com o padding, a meta é reativar por default.
+
+## F2 — progresso e MURO ATUAL (engine init multi-thread)
+- ✅ **padding malloc (+64B)** ELIMINOU a heap corruption (ctor 11 = std::string overflow que
+  bionic tolera). init_array agora roda os ctors 0-185 do libapp.
+- ✅ **JNI_OnLoad funciona (0x10002 = JNI_VERSION_1_2)**, 0 crash, no estado DEFAULT (init OFF).
+- ⚠️ **MURO: engine init multi-thread.** Com NFS_INIT=1: ctors finais do libapp (186,187,188 —
+  config/strtoul que acessam globais nulos) crasham, E um ctor anterior spawna uma WORKER THREAD
+  que crasha async em null+0x8 (não é FMOD — skip do FMOD não resolve). Skip por índice (NFS_SKIPCTOR)
+  passa os finais mas a worker thread segue crashando. Recuperação por sinal (sigsetjmp/longjmp)
+  NÃO funciona cross-thread.
+- __stack_chk_guard/__stack_chk_fail: libapp usa o GLOBAL (resolve p/ glibc, estável) — NÃO o slot
+  TLS, então o pad TLS do DYSMANTLE é desnecessário aqui (removido; mudava sig11→sig4).
+- Infra adicionada (env-gated): NFS_INIT (liga init_array), NFS_SKIPINIT="lib", NFS_SKIPCTOR="i,j"
+  (skip ctor por índice, só libapp), NFS_INITDBG (log por ctor), recuperação por sinal (so_util).
+- **PRÓXIMO (multi-sessão):** a worker thread da engine precisa de um global que provavelmente é
+  setado em nativeOnCreate (race: thread roda antes). Investigar: (1) qual ctor spawna a thread;
+  (2) o que a thread deref nula em +0x8; (3) talvez adiar/bloquear as threads até nativeOnCreate,
+  ou prover o global. Nível engine-comercial (DYSMANTLE/Hollow Knight). Estado DEFAULT estável
+  (boot+JNI_OnLoad) preservado.
