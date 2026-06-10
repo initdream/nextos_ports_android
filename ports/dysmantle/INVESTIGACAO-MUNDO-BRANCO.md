@@ -262,3 +262,16 @@ ou RE do construtor da ModelSurface p/ achar onde o formato deveria ser setado (
   evitar.)
 - Reverte a teoria de "mundo branco" tb? NÃO — mundo branco (geometria format-0) é outro assunto
   (terreno não desenha). Este achado é só sobre o CRASH no loading quando shadows ON.
+
+## 📝 OBSERVAÇÕES DE GAMEPLAY (usuário, p/ a próxima sessão do mundo branco)
+- Jogando um pouco (com shadows OFF = config correta), o quadro é MAIS NUANCEADO do que "tudo some":
+  - **RENDERIZA:** baús/barris, portas, prateleiras (muitos props aparecem normal!)
+  - **NÃO renderiza:** latas de lixo (lixeiras) — e o chão/terreno (branco).
+- **Implicação:** NÃO é o pipeline de geometria inteiro quebrado — a MAIORIA dos objetos desenha.
+  Só tipos ESPECÍFICOS faltam (lixeira + terreno). Logo é estudável como um problema localizado
+  (modelo/textura/material específico daqueles objetos), não um muro do engine.
+- ⚠️ REVALIDAR o mundo branco com shadows OFF na próxima sessão — parte da investigação anterior
+  pode ter sido contaminada pelo estado de crash do dynamic-shadows. Reconfirmar o que realmente
+  falta com o jogo estável.
+- Próxima sessão = "nova seção" dedicada (decisão do usuário): jogar, mapear o que aparece × falta,
+  e atacar os casos específicos (lixeira, terreno).
