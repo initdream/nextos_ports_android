@@ -130,3 +130,15 @@
 - PRÓXIMO: instrumentar o parse (qual asset/nome a engine procura e não acha; ver se o índice do
   OBB é lido certo; checar se falta um arquivo além do OBB — só 1 fopen). Possível: a engine espera
   um 2º arquivo (patch obb / config) ou o índice do OBB precisa de outro parse.
+
+## F4 — config strings preenchidos (não era o garbage), frontier confirmado
+- jni_shim agora retorna ApplicationVersion="1.3.128", DeviceName="NextOS", Locale="en_US",
+  Language="en", OsVersion="9" (eram vazios). A engine loga corretos, MAS o objeto garbage
+  persiste (mesmo crash 0xe12fff36 pós assert). Logo a versão/config NÃO era a causa.
+- 0x626e50 = tokenizer (split por '.'/',') com callback (blx r7=global). Garbage object segue
+  no parse de asset, antes de ler dados (só ~1046 bytes lidos do OBB: header 1028 + início do dir).
+- RULED OUT cumulativo: relocações, softfp (todas+f variants), arquivos faltando, asserts
+  (deliberados si_code=-6), version/config strings, screen size, OBB path/abertura.
+- **O bug é fundo no parse do índice do OBB / criação do objeto de asset** — precisa de RE focada
+  multi-sessão (instrumentar a criação do objeto entre o header-read e o crash; entender o formato
+  do índice do OBB EA; ver se o objeto é não-construído vs asset-não-achado). Cheguei a ~95% do boot.

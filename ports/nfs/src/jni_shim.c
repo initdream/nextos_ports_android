@@ -44,6 +44,11 @@ enum {
   MID_USE_ASSETS_FS,
   MID_IS_FULL_APK,
   MID_GET_ASSET_SIZE,
+  MID_APP_VERSION,
+  MID_DEVICE_NAME,
+  MID_LOCALE,
+  MID_LANGUAGE,
+  MID_OS_VERSION,
   MID_GENERIC,
   FID_OBB_VERSIONCODE,
   FID_WIDTH,
@@ -108,6 +113,18 @@ static void *jni_FindClass(void *env, const char *name) {
   return &fake_class;
 }
 
+/* config strings (versão/device/locale): retornar VAZIO faz a engine tokenizar
+ * "" e criar objeto garbage → assert. Damos valores válidos. */
+static void *jni_match_config(const char *name) {
+  if (strstr(name, "ApplicationVersion") || strstr(name, "VersionName"))
+    return &g_method_tags[MID_APP_VERSION];
+  if (strstr(name, "DeviceName")) return &g_method_tags[MID_DEVICE_NAME];
+  if (strstr(name, "Locale")) return &g_method_tags[MID_LOCALE];
+  if (strstr(name, "Language")) return &g_method_tags[MID_LANGUAGE];
+  if (strstr(name, "OsVersion") || strstr(name, "OSVersion")) return &g_method_tags[MID_OS_VERSION];
+  return 0;
+}
+
 static void *jni_GetMethodID(void *env, void *clazz, const char *name,
                              const char *sig) {
   (void)env;
@@ -131,6 +148,8 @@ static void *jni_GetMethodID(void *env, void *clazz, const char *name,
   if (strcmp(name, "useAssetsFileSystem") == 0) return &g_method_tags[MID_USE_ASSETS_FS];
   if (strcmp(name, "isFullApkAssets") == 0) return &g_method_tags[MID_IS_FULL_APK];
   if (strcmp(name, "getAssetSize") == 0) return &g_method_tags[MID_GET_ASSET_SIZE];
+  void *cfg = jni_match_config(name);
+  if (cfg) return cfg;
   if (strstr(name, "ExternalStorageDirectory") || strstr(name, "StorageDirectory") ||
       strstr(name, "StorageDir"))
     return &g_method_tags[MID_GET_STORAGE_DIR];
@@ -142,6 +161,7 @@ static void *jni_GetStaticMethodID(void *env, void *clazz, const char *name,
   (void)env;
   (void)clazz;
   debugPrintf("jni_shim: GetStaticMethodID(%s, %s)\n", name, sig);
+  { void *cfg = jni_match_config(name); if (cfg) return cfg; }
   if (strcmp(name, "getStorageDir") == 0)
     return &g_method_tags[MID_GET_STORAGE_DIR];
   if (strstr(name, "ObbFullPath") || strstr(name, "ObbPath"))
@@ -205,10 +225,21 @@ static const char *nfs_obb_path(void) {
   return p;
 }
 
+/* retorna o jstring da config (ou NULL se methodID não é config) */
+static void *jni_config_jstr(void *methodID) {
+  if (methodID == &g_method_tags[MID_APP_VERSION]) return make_jstring("1.3.128");
+  if (methodID == &g_method_tags[MID_DEVICE_NAME]) return make_jstring("NextOS");
+  if (methodID == &g_method_tags[MID_LOCALE]) return make_jstring("en_US");
+  if (methodID == &g_method_tags[MID_LANGUAGE]) return make_jstring("en");
+  if (methodID == &g_method_tags[MID_OS_VERSION]) return make_jstring("9");
+  return 0;
+}
+
 /* CallObjectMethod (index 36) - variadic */
 static void *jni_CallObjectMethod(void *env, void *obj, void *methodID, ...) {
   (void)env;
   (void)obj;
+  { void *cv = jni_config_jstr(methodID); if (cv) return cv; }
   if (methodID == &g_method_tags[MID_GET_STORAGE_DIR]) {
     debugPrintf("jni_shim: CallObjectMethod -> storageDir = %s\n", nfs_data_dir());
     return make_jstring(nfs_data_dir());
@@ -268,6 +299,7 @@ static void *jni_CallStaticObjectMethod(void *env, void *clazz,
                                         void *methodID, ...) {
   (void)env;
   (void)clazz;
+  { void *cv = jni_config_jstr(methodID); if (cv) return cv; }
 
   if (methodID == &g_method_tags[MID_GET_STORAGE_DIR]) {
     debugPrintf("jni_shim: CallStaticObjectMethod -> storageDir = %s\n", nfs_data_dir());
