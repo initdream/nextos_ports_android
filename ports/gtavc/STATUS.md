@@ -1,6 +1,6 @@
 # GTA VC Android -> NextOS status
 
-Device de teste: `DEVICE_IP`, login `root`, senha (padrao do CFW).
+Device de teste: `192.168.31.87`, login `root`, senha `emuelec`.
 
 Regra de teste importante:
 - parar EmulationStation antes de rodar jogos/ports pesados;
@@ -48,7 +48,7 @@ Achados em 2026-06-05:
   - proximo passo e testar novamente a partir desse estado e capturar o proximo `ms_line` se houver novo hang.
 
 Estado do binario:
-- local: `$HOME/nextos_ports_android/ports/gtavc/gtavc`
+- local: `/home/felipe/nextos_ports_android/ports/gtavc/gtavc`
 - remoto: `/storage/roms/ports/gtavc/gtavc`
 - md5 do build low-memory enviado: `0813b804b7f13ff467f7687a9c1f5a72`
 

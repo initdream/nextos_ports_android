@@ -370,11 +370,8 @@ static void hook_egl(void) {
 /* ---- hooks de tela/render como FUNÇÃO (bully-NX hooka; nós só setávamos flags
  * srp). GameRenderer::Setup pode dimensionar a textura/fbo pela tela -> se
  * Width/Height retornam 0, a whitetexture sai 0x0 e falha (NULL). ---- */
-/* resolucao REAL da tela (egl_shim pega via SDL_GetDesktopDisplayMode) -> adapta
- * sozinho a 640x480 / 720p / etc. (antes era 1280x720 fixo = zoom/corte em telas menores) */
-extern int bully_screen_w(void); extern int bully_screen_h(void);
-static int os_screen_w(void) { return bully_screen_w(); }
-static int os_screen_h(void) { return bully_screen_h(); }
+static int os_screen_w(void) { return 1280; }
+static int os_screen_h(void) { return 720; }
 static int os_can_render(void) { return 1; }
 static int os_is_suspended(void) { return 0; }
 static void hook_screen(void) {
@@ -605,9 +602,7 @@ void jni_load(void) {
   bully_release_current();
 
   if (OnSurfaceCreated) { fprintf(stderr, "[drv] implOnSurfaceCreated...\n"); OnSurfaceCreated(fake_env, NULL); }
-  if (OnSurfaceChanged) { int sw = bully_screen_w(), sh = bully_screen_h();
-    fprintf(stderr, "[drv] implOnSurfaceChanged %dx%d (resolucao real do fb)...\n", sw, sh);
-    OnSurfaceChanged(fake_env, NULL, NULL, sw, sh); }
+  if (OnSurfaceChanged) { fprintf(stderr, "[drv] implOnSurfaceChanged 1280x720...\n"); OnSurfaceChanged(fake_env, NULL, NULL, 1280, 720); }
   /* RE-SEED dos EGL globals após surface-changed (o engine reseta OS_EGLSurface
    * aqui; sem re-seed a render thread fica sem contexto -> whitetexture NULL).
    * Igual bully-NX sync_engine_egl_globals("post-surface-changed"). */

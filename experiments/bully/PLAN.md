@@ -1,6 +1,6 @@
 # bully-pc — Bully: Anniversary Edition (so-loader) — bring-up no PC primeiro
 
-Estratégia (ideia do autor): **fazer funcionar no PC x86_64 primeiro** (iteração rápida, gdb,
+Estratégia (ideia do Felipe): **fazer funcionar no PC x86_64 primeiro** (iteração rápida, gdb,
 sem freeze do Mali / SSH), depois portar pro device (aarch64 + Mali). NÃO mexe no `core/` nem na
 sessão do Hollow — tudo vive aqui em `experiments/bully-pc/`.
 
@@ -42,7 +42,7 @@ gdb normal. O código do jogo é idêntico entre arquiteturas; só o build do fr
 2. **jni_shim** (porta do `ref-bully_vita/jni_patch.c`, 64-bit + SDL2 input em vez de SceCtrl).
 3. **egl_shim → SDL2** (reusa a ideia do `core/egl_shim.c`; cria janela 1280x720 + contexto GLES2 no PC/Mesa).
 4. **imports table** (415): a maioria passthrough via `dlsym(RTLD_DEFAULT)` (libc/m), OpenAL real (link `-lopenal`), libc++ via **módulo companheiro** `libc++_shared.so` (carregar com o so_loader, igual multi-módulo do hollow) OU link `-lc++` do sistema. GL via `eglGetProcAddress`→SDL. NDK `AAsset*`/`ANativeWindow*` → bridge (ler OBB) / SDL window. Os que sobrarem = stub `ret0` (bully_vita lista vários: renderbuffers, AAssetManager → ret0).
-5. **AAssetManager/OBB**: o jogo lê de `main.obb`/`patch.obb`. bully_vita aponta `FileGetArchiveName` pros .obb e usa fopen normal (os OBB são zips/arquivos). Copiar os 2 OBB (do zip que o autor baixou) pro `gamefiles/`.
+5. **AAssetManager/OBB**: o jogo lê de `main.obb`/`patch.obb`. bully_vita aponta `FileGetArchiveName` pros .obb e usa fopen normal (os OBB são zips/arquivos). Copiar os 2 OBB (do zip que o Felipe baixou) pro `gamefiles/`.
 
 ## Passos
 1. [ ] `so_util` x86_64 + carregar libGame.so, relocate, resolve (logar UNRESOLVED).
@@ -54,7 +54,7 @@ gdb normal. O código do jogo é idêntico entre arquiteturas; só o build do fr
 7. [ ] **fase device**: rebuild aarch64 (so_util do core) + validar os 5 GLES3 no Mali + gptokeyb + empacotar port.
 
 ## Arquivos
-- `gamefiles/` (gitignored): libGame.so x86_64 + companheiros. **OBB a copiar** (main 1.78G + patch 1.16G do zip do autor).
+- `gamefiles/` (gitignored): libGame.so x86_64 + companheiros. **OBB a copiar** (main 1.78G + patch 1.16G do zip do Felipe).
 - `ref-bully_vita/`: referência (jni_patch.c, main.c com a import table, openal_patch.c).
 - APK arm64 (device): `split_config.arm64_v8a.apk` do `.apkm` (libGame.so arm64 = 19MB).
 

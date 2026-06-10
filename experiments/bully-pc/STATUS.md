@@ -34,7 +34,7 @@ Entradas nativas tb: `_Z8GameInitb` (GameInit), `_Z9NvAPKInit...` (assets, é HO
 
 ## ▶️ PRÓXIMO (portar o driver do bully-NX, Switch→Linux/SDL)
 1. Trocar `jni_load` (RegisterNatives) pelo **driver impl*** (sequência acima) — resolver os símbolos via `so_symbol`.
-2. Portar `asset_archive.c` do bully-NX (lê dos OBB/APK reais; NvAPKInit hookado) — copiar `main.obb`/`patch.obb` pro `gamefiles/` (estão no zip do autor).
+2. Portar `asset_archive.c` do bully-NX (lê dos OBB/APK reais; NvAPKInit hookado) — copiar `main.obb`/`patch.obb` pro `gamefiles/` (estão no zip do Felipe).
 3. Threading: o jogo cria GameMain + render thread; tratar handoff de contexto EGL (no NX solta o ctx no main e a render thread pega). No PC/SDL: SDL_GL context + multiplos contextos compartilhados OU rodar GL na thread certa.
 4. Gate flags + `OS_ScreenGetWidth/Height` + `sync_engine_egl_globals` (ver bully-NX).
 5. 1º frame no PC → depois rebuild aarch64 (so_util do core) + Mali + empacotar.
@@ -46,7 +46,7 @@ Driver multi-thread + endereços build-específicos = trabalho médio-alto, MAS 
 
 ## 🎉 MARCO 2026-06-03: init ponta-a-ponta no PC + dados v1.4.311 achados
 
-**Dados resolvidos:** o `.apkm` v1.4.311 tem **`split_data_1.apk` (1GB)** com `assets/data_0.zip`+`data_1.zip`+`.idx` = dado real do jogo (Play Asset Delivery). Estagiado em `gamefiles/assets/` (1.1GB). O OBB antigo do autor (2022, layout `Bully/*.msh`) NÃO serve; a v1.4.311 usa os data zips.
+**Dados resolvidos:** o `.apkm` v1.4.311 tem **`split_data_1.apk` (1GB)** com `assets/data_0.zip`+`data_1.zip`+`.idx` = dado real do jogo (Play Asset Delivery). Estagiado em `gamefiles/assets/` (1.1GB). O OBB antigo do Felipe (2022, layout `Bully/*.msh`) NÃO serve; a v1.4.311 usa os data zips.
 
 **Driver estático portado** (jni_shim.c reescrito): resolve os 38 `Java_..._impl*` por símbolo, ancora gates em `StorageRootPath` (init=srp-0x174/susp=-0x17c/render=-0x2e8), hooka 11 `NvAPK*`→`asset_archive.c` (vendorizado do bully-NX, lê dos data zips), `AttachCurrentThread`/`GetEnv` na fake_vm, dispatchers JNI com **`va_list`/`va_arg`** (NÃO uintptr_t* — crash 64-bit), métodos has/get/setAppLocalValue+getParameter.
 

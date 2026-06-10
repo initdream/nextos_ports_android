@@ -103,7 +103,7 @@ A escola é densa (muitos NPCs). Travava **DURO** (wedge). Diagnóstico provou q
    - `BULLY_TEX_HALF=1` — pula mipmaps (o Mali usa `GL_LINEAR`, então mips são desperdício) e reduz
      texturas ≥512 pela metade (512→256 = 1/4 da memória; UV normalizado não quebra).
 
-   (Inspiração do autor: o GTA SA roda liso porque gerencia melhor a textura dos pedestres.)
+   (Inspiração do Felipe: o GTA SA roda liso porque gerencia melhor a textura dos pedestres.)
 
 ### 3.5 Controle (perfeito) e áudio
 - **Controle por EVENTOS** (o jogo não faz polling; usa `implOnGamepad{ButtonDown,Up,AxesChanged,
