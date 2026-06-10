@@ -326,9 +326,148 @@ static const unsigned char *my_glGetString(unsigned name) {
 }
 
 /* Roteador p/ funções GL que precisamos controlar (anti stack-smash). */
+static void rgl(const char *n, void **slot);
+static void my_glShaderSource(unsigned, int, const char *const *, const int *);
+static void my_glCompileShader(unsigned);
+static void my_glLinkProgram(unsigned);
+static void my_glTexImage3D(unsigned, int, int, int, int, int, int, unsigned,
+                            unsigned, const void *);
+static void my_glTexStorage3D(unsigned, int, unsigned, int, int, int);
+static void my_glCompressedTexImage3D(unsigned, int, unsigned, int, int, int,
+                                      int, int, const void *);
+static void my_glCompressedTexImage2D(unsigned, int, unsigned, int, int, int,
+                                      int, const void *);
+static void my_glTexStorage2D(unsigned, int, unsigned, int, int);
 void *dysmantle_gl_proc_override(const char *name) {
   if (name && strcmp(name, "glGetString") == 0) return (void *)my_glGetString;
+  if (name && strcmp(name, "glShaderSource") == 0) return (void *)my_glShaderSource;
+  if (name && strcmp(name, "glCompileShader") == 0) return (void *)my_glCompileShader;
+  if (name && strcmp(name, "glLinkProgram") == 0) return (void *)my_glLinkProgram;
+  /* GLES3-only (texture arrays/3D): logamos p/ flagrar o uso no Mali GLES2 */
+  if (name && strcmp(name, "glTexImage3D") == 0) return (void *)my_glTexImage3D;
+  if (name && strcmp(name, "glTexStorage3D") == 0) return (void *)my_glTexStorage3D;
+  if (name && strcmp(name, "glCompressedTexImage3D") == 0) return (void *)my_glCompressedTexImage3D;
+  if (name && strcmp(name, "glCompressedTexImage2D") == 0) return (void *)my_glCompressedTexImage2D;
+  if (name && strcmp(name, "glTexStorage2D") == 0) return (void *)my_glTexStorage2D;
   return NULL;
+}
+/* loga textura COMPRIMIDA + erro GL pós-upload (ETC2/ASTC que o Mali rejeita
+ * → textura branca). Mali-450 só aceita ETC1 (0x8d64). */
+static void my_glCompressedTexImage2D(unsigned tgt, int lvl, unsigned ifmt,
+                                      int w, int h, int border, int sz,
+                                      const void *px) {
+  static void (*real)(unsigned, int, unsigned, int, int, int, int,
+                      const void *) = NULL;
+  rgl("glCompressedTexImage2D", (void **)&real);
+  static unsigned (*gerr)(void) = NULL; rgl("glGetError", (void **)&gerr);
+  if (gerr) while (gerr()) {}
+  if (real) real(tgt, lvl, ifmt, w, h, border, sz, px);
+  unsigned e = gerr ? gerr() : 0;
+  static int n = 0;
+  if (n < 40 || e) {
+    fprintf(stderr, "[CTEX] glCompressedTexImage2D ifmt=0x%x %dx%d sz=%d lvl=%d -> err=0x%x\n",
+            ifmt, w, h, sz, lvl, e);
+    n++;
+  }
+}
+static void my_glTexStorage2D(unsigned tgt, int lvls, unsigned ifmt, int w,
+                              int h) {
+  static void (*real)(unsigned, int, unsigned, int, int) = NULL;
+  rgl("glTexStorage2D", (void **)&real);
+  static int n = 0;
+  if (n < 40) { fprintf(stderr, "[TEXSTOR] glTexStorage2D ifmt=0x%x %dx%d lvls=%d\n", ifmt, w, h, lvls); n++; }
+  if (real) real(tgt, lvls, ifmt, w, h);
+}
+/* glTexImage2D: loga ifmt/fmt/type/dim + erro GL. ifmt GLES3 (ex: GL_RGBA8
+ * 0x8058, GL_SRGB8 0x8C41, sized) NÃO existe no GLES2 → INVALID_ENUM →
+ * textura branca. GLES2 quer ifmt = base (GL_RGBA 0x1908) sem sized. */
+/* DIAG: força clear color (magenta) p/ distinguir branco-geometria de fundo */
+static void my_glClearColor(float r, float g, float b, float a) {
+  static void (*real)(float, float, float, float) = NULL;
+  rgl("glClearColor", (void **)&real);
+  if (getenv("DYSMANTLE_CLEAR_TEST")) { r = 1.0f; g = 0.0f; b = 1.0f; a = 1.0f; }
+  if (real) real(r, g, b, a);
+}
+
+/* glTexParameteri: Mali-450 GLES2 NÃO completa textura NPOT com GL_REPEAT nem
+ * com min-filter mipmap → amostra branco. Forçamos CLAMP_TO_EDGE + filtro
+ * não-mipmap (NPOT-safe). DYSMANTLE_NPOT_OFF desliga. */
+static int g_npot_fix = -1;
+static void my_glTexParameteri(unsigned tgt, unsigned pname, int param) {
+  static void (*real)(unsigned, unsigned, int) = NULL;
+  rgl("glTexParameteri", (void **)&real);
+  if (g_npot_fix < 0) g_npot_fix = getenv("DYSMANTLE_NPOT_OFF") ? 0 : 1;
+  if (g_npot_fix) {
+    if (pname == 0x2802 /*WRAP_S*/ || pname == 0x2803 /*WRAP_T*/)
+      param = 0x812F; /* CLAMP_TO_EDGE */
+    else if (pname == 0x2801 /*MIN_FILTER*/) {
+      if (param == 0x2700 || param == 0x2701 || param == 0x2702 || param == 0x2703)
+        param = 0x2601; /* mipmap → LINEAR */
+    }
+  }
+  if (real) real(tgt, pname, param);
+}
+static int g_tex_log = -1, g_tex_fix = -1;
+static void my_glTexImage2D(unsigned tgt, int lvl, int ifmt, int w, int h,
+                            int border, unsigned fmt, unsigned typ,
+                            const void *px) {
+  static void (*real)(unsigned, int, int, int, int, int, unsigned, unsigned,
+                      const void *) = NULL;
+  rgl("glTexImage2D", (void **)&real);
+  static unsigned (*gerr)(void) = NULL; rgl("glGetError", (void **)&gerr);
+  if (g_tex_log < 0) g_tex_log = getenv("DYSMANTLE_TEX_LOG") ? 1 : 0;
+  if (g_tex_fix < 0) g_tex_fix = getenv("DYSMANTLE_TEX_NOFIX") ? 0 : 1;
+  int orig = ifmt;
+  if (g_tex_fix) {
+    /* normaliza internalformat sized (GLES3) → base (GLES2) */
+    switch (ifmt) {
+      case 0x8058: /*RGBA8*/ case 0x8C43: /*SRGB8_ALPHA8*/ case 0x881A: /*RGBA16F*/
+      case 0x8814: /*RGBA32F*/ ifmt = 0x1908; break; /* GL_RGBA */
+      case 0x8051: /*RGB8*/ case 0x8C41: /*SRGB8*/ case 0x881B: /*RGB16F*/
+      case 0x8815: /*RGB32F*/ ifmt = 0x1907; break; /* GL_RGB */
+      case 0x8229: /*R8*/ case 0x822E: /*R32F*/ ifmt = 0x1909; break; /* LUMINANCE */
+      case 0x822B: /*RG8*/ ifmt = 0x190A; break; /* LUMINANCE_ALPHA */
+      default: break;
+    }
+  }
+  if (gerr) while (gerr()) {}
+  if (real) real(tgt, lvl, ifmt, w, h, border, fmt, typ, px);
+  unsigned e = gerr ? gerr() : 0;
+  if (g_tex_log) {
+    static int n = 0;
+    if (n < 60 || e) {
+      fprintf(stderr, "[TEX2D] ifmt=0x%x(orig0x%x) %dx%d fmt=0x%x typ=0x%x lvl=%d -> err=0x%x\n",
+              ifmt, orig, w, h, fmt, typ, lvl, e); n++;
+    }
+  }
+}
+static void my_glTexImage3D(unsigned tgt, int lvl, int ifmt, int w, int h,
+                            int d, int border, unsigned fmt, unsigned typ,
+                            const void *px) {
+  static void (*real)(unsigned, int, int, int, int, int, int, unsigned,
+                      unsigned, const void *) = NULL;
+  rgl("glTexImage3D", (void **)&real);
+  fprintf(stderr, "[TEX3D] glTexImage3D tgt=0x%x ifmt=0x%x %dx%dx%d fmt=0x%x\n",
+          tgt, ifmt, w, h, d, fmt);
+  if (real) real(tgt, lvl, ifmt, w, h, d, border, fmt, typ, px);
+}
+static void my_glTexStorage3D(unsigned tgt, int lvls, unsigned ifmt, int w,
+                              int h, int d) {
+  static void (*real)(unsigned, int, unsigned, int, int, int) = NULL;
+  rgl("glTexStorage3D", (void **)&real);
+  fprintf(stderr, "[TEX3D] glTexStorage3D tgt=0x%x ifmt=0x%x %dx%dx%d\n", tgt,
+          ifmt, w, h, d);
+  if (real) real(tgt, lvls, ifmt, w, h, d);
+}
+static void my_glCompressedTexImage3D(unsigned tgt, int lvl, unsigned ifmt,
+                                      int w, int h, int d, int border,
+                                      int sz, const void *px) {
+  static void (*real)(unsigned, int, unsigned, int, int, int, int, int,
+                      const void *) = NULL;
+  rgl("glCompressedTexImage3D", (void **)&real);
+  fprintf(stderr, "[TEX3D] glCompressedTexImage3D tgt=0x%x ifmt=0x%x %dx%dx%d\n",
+          tgt, ifmt, w, h, d);
+  if (real) real(tgt, lvl, ifmt, w, h, d, border, sz, px);
 }
 
 /* A engine resolve as funções GL via dlsym DIRETO (libGLESv2 do device),
@@ -394,6 +533,60 @@ static unsigned my_glGetError(void) {
   return real ? real() : 0;
 }
 
+/* ---- Interceptação de SHADERS (diag do mundo branco) ----
+ * Loga source (gated DYSMANTLE_SHADER_DUMP) e SEMPRE loga erro de compile/link.
+ * A engine é ES3; shaders #version 300 es podem falhar no Mali GLES2 → render
+ * cai p/ fallback branco. */
+static int g_shader_dump = -1;
+static int shader_dump_on(void) {
+  if (g_shader_dump < 0) g_shader_dump = getenv("DYSMANTLE_SHADER_DUMP") ? 1 : 0;
+  return g_shader_dump;
+}
+static void my_glShaderSource(unsigned sh, int count, const char *const *str,
+                              const int *len) {
+  static void (*real)(unsigned, int, const char *const *, const int *) = NULL;
+  rgl("glShaderSource", (void **)&real);
+  if (shader_dump_on()) {
+    fprintf(stderr, "[SHADER src #%u] count=%d:\n", sh, count);
+    for (int i = 0; i < count && i < 8; i++)
+      fprintf(stderr, "%.*s", len && len[i] > 0 ? len[i] : 2000, str[i]);
+    fprintf(stderr, "\n[/SHADER src #%u]\n", sh);
+  }
+  if (real) real(sh, count, str, len);
+}
+static void my_glCompileShader(unsigned sh) {
+  static void (*real)(unsigned) = NULL; rgl("glCompileShader", (void **)&real);
+  static void (*giv)(unsigned, unsigned, int *) = NULL;
+  rgl("glGetShaderiv", (void **)&giv);
+  static void (*glog)(unsigned, int, int *, char *) = NULL;
+  rgl("glGetShaderInfoLog", (void **)&glog);
+  if (real) real(sh);
+  if (giv && glog) {
+    int ok = 1; giv(sh, 0x8B81 /*COMPILE_STATUS*/, &ok);
+    if (!ok) {
+      char buf[1024]; int n = 0; glog(sh, sizeof(buf) - 1, &n, buf);
+      buf[n > 0 ? n : 0] = 0;
+      fprintf(stderr, "[SHADER #%u COMPILE FALHOU] %s\n", sh, buf);
+    }
+  }
+}
+static void my_glLinkProgram(unsigned pr) {
+  static void (*real)(unsigned) = NULL; rgl("glLinkProgram", (void **)&real);
+  static void (*giv)(unsigned, unsigned, int *) = NULL;
+  rgl("glGetProgramiv", (void **)&giv);
+  static void (*plog)(unsigned, int, int *, char *) = NULL;
+  rgl("glGetProgramInfoLog", (void **)&plog);
+  if (real) real(pr);
+  if (giv && plog) {
+    int ok = 1; giv(pr, 0x8B82 /*LINK_STATUS*/, &ok);
+    if (!ok) {
+      char buf[1024]; int n = 0; plog(pr, sizeof(buf) - 1, &n, buf);
+      buf[n > 0 ? n : 0] = 0;
+      fprintf(stderr, "[PROGRAM #%u LINK FALHOU] %s\n", pr, buf);
+    }
+  }
+}
+
 /* __stack_chk_fail neutralizado: a stack-canary da engine (bionic) é lida de
  * tpidr_el0+0x28, que sob glibc colide com TLS vars nossas/do libc++ -> a canary
  * "muda" no meio da função = FALSO-POSITIVO. Em vez de abortar, retornamos -> a
@@ -452,6 +645,15 @@ DynLibFunction dysmantle_overrides[] = {
   {"glGetIntegerv", (uintptr_t)my_glGetIntegerv},
   {"glGetStringi", (uintptr_t)my_glGetStringi},
   {"glGetError", (uintptr_t)my_glGetError},
+  /* GL core interceptados p/ diag/fix do mundo branco (resolvidos pela tabela,
+   * NÃO via eglGetProcAddress) */
+  {"glTexImage2D", (uintptr_t)my_glTexImage2D},
+  {"glShaderSource", (uintptr_t)my_glShaderSource},
+  {"glCompileShader", (uintptr_t)my_glCompileShader},
+  {"glLinkProgram", (uintptr_t)my_glLinkProgram},
+  {"glCompressedTexImage2D", (uintptr_t)my_glCompressedTexImage2D},
+  {"glTexParameteri", (uintptr_t)my_glTexParameteri},
+  {"glClearColor", (uintptr_t)my_glClearColor},
   {"pthread_attr_setstacksize", (uintptr_t)my_attr_setstacksize},
   {"fopen", (uintptr_t)my_fopen},
   {"__stack_chk_fail", (uintptr_t)my_stack_chk_fail},

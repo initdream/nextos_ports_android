@@ -366,11 +366,16 @@ static void process_sdl_events(void) {
      * Ex default: aperta A no frame 300 (confirma menu inicial), depois
      * DOWN/A pra navegar. Cada frame ~ pump do pollAll. */
     if (getenv("DYSMANTLE_PB_SELFTEST")) {
+      /* Sequência ensinada pelo Felipe: no menu inicial = 1× pra BAIXO,
+       * depois A/X pra entrar no jogo. Frames ~ pumps (poll_n).
+       * Cada press = down no frame f, up em f+10. */
       struct { int f, act, kc; } seq[] = {
-        {300, 0, AKEYCODE_BUTTON_A}, {310, 1, AKEYCODE_BUTTON_A},
-        {360, 0, AKEYCODE_DPAD_DOWN}, {370, 1, AKEYCODE_DPAD_DOWN},
-        {420, 0, AKEYCODE_BUTTON_A}, {430, 1, AKEYCODE_BUTTON_A},
-        {480, 0, AKEYCODE_BUTTON_START}, {490, 1, AKEYCODE_BUTTON_START},
+        {360, 0, AKEYCODE_BUTTON_A},   {370, 1, AKEYCODE_BUTTON_A},   /* title->menu */
+        {480, 0, AKEYCODE_DPAD_DOWN},  {490, 1, AKEYCODE_DPAD_DOWN},  /* 1x baixo */
+        {560, 0, AKEYCODE_BUTTON_A},   {570, 1, AKEYCODE_BUTTON_A},   /* A entra */
+        {620, 0, AKEYCODE_BUTTON_X},   {630, 1, AKEYCODE_BUTTON_X},   /* X (alt) */
+        {760, 0, AKEYCODE_BUTTON_A},   {770, 1, AKEYCODE_BUTTON_A},   /* confirma */
+        {900, 0, AKEYCODE_BUTTON_A},   {910, 1, AKEYCODE_BUTTON_A},
       };
       for (unsigned i = 0; i < sizeof(seq)/sizeof(seq[0]); i++)
         if (poll_n == seq[i].f) {

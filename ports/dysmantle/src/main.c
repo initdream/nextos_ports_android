@@ -321,6 +321,65 @@ static void install_brk_traps(void) {
   arm_brk(0x46f980, "PBeng_OnControllerStatusChange"); /* callback fired! */
 }
 
+/* DIAG: detour inline em NX_Graphics_CreateVertexBufferWithVertices p/ logar
+ * o vertex format que a engine pede (a malha do mundo/armas falha c/ "unknown
+ * vertex format"). A função é chamada por ponteiro (0 BL diretos) → hook_arm64
+ * inline pega tudo. Trampolim = 1ª instrução (PIC: sub sp,sp,#0x80) + B addr+4. */
+static uint64_t (*real_createvb)(uint32_t, const void *, uint32_t, int);
+static uint32_t g_vb_fmt0 = 7; /* formato p/ remapear o format-0 (2D sprite) */
+static int g_vb_log = 0;
+static int g_vb_dump = 0;
+static uint64_t my_createvb(uint32_t fmt, const void *v, uint32_t cnt, int fl) {
+  if (g_vb_dump && fmt == 0 && v && cnt >= 4) {
+    static int dn = 0;
+    if (dn < 6) {
+      const unsigned char *b = (const unsigned char *)v;
+      const float *f = (const float *)v;
+      fprintf(stderr, "[VBDUMP#%d] fmt0 cnt=%u flags=%d\n", dn, cnt, fl);
+      for (int row = 0; row < 8; row++) {
+        fprintf(stderr, "  +%02d:", row * 16);
+        for (int c = 0; c < 4; c++)
+          fprintf(stderr, " %11.4f", f[row * 4 + c]);
+        fprintf(stderr, "   |");
+        for (int c = 0; c < 16; c++)
+          fprintf(stderr, "%02x", b[row * 16 + c]);
+        fprintf(stderr, "\n");
+      }
+      dn++;
+    }
+  }
+  uint32_t use = (fmt == 0) ? g_vb_fmt0 : fmt;
+  uint64_t r = real_createvb(use, v, cnt, fl);
+  if (g_vb_log) {
+    static uint64_t seen = 0;
+    int isfail = (r == 0);
+    if (isfail || !((seen >> (use & 63)) & 1)) {
+      fprintf(stderr, "[VB] fmt=0x%x(->0x%x) count=%u flags=%d -> %s\n", fmt,
+              use, cnt, fl, isfail ? "FALHOU" : "ok");
+      seen |= (1ULL << (use & 63));
+    }
+  }
+  return r;
+}
+static void hook_createvb(void) {
+  uintptr_t lb = so_find_addr("android_main") - 0x4651a4;
+  uintptr_t addr = lb + 0x4837d4;
+  uint32_t *tr = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (tr == MAP_FAILED) { fprintf(stderr, "hook_createvb: mmap falhou\n"); return; }
+  tr[0] = *(uint32_t *)addr;   /* sub sp,sp,#0x80 (PIC) */
+  tr[1] = 0x58000051u;         /* ldr x17, #8 */
+  tr[2] = 0xd61f0220u;         /* br x17 */
+  *(uint64_t *)&tr[3] = addr + 4;
+  __builtin___clear_cache((char *)tr, (char *)tr + 32);
+  real_createvb = (uint64_t(*)(uint32_t, const void *, uint32_t, int))tr;
+  so_make_text_writable();
+  hook_arm64(addr, (uintptr_t)my_createvb);
+  so_make_text_executable();
+  so_flush_caches();
+  fprintf(stderr, "hook_createvb: detour @ %p tramp=%p\n", (void *)addr, (void *)tr);
+}
+
 /* GOT-hook Paddleboat_getControllerData: loga se/quando a engine lê o pad */
 static int32_t (*orig_pb_getdata)(int32_t, void *) = NULL;
 static int32_t my_pb_getdata(int32_t idx, void *data) {
@@ -348,8 +407,15 @@ static const char *(*orig_getprod)(const char *) = NULL;
 static const char *my_getprod(const char *key) {
   const char *r = orig_getprod ? orig_getprod(key) : NULL;
   if (key && strcmp(key, "opengl_version") == 0) {
-    fprintf(stderr, "[cfg] opengl_version real='%s' -> forçando '2.0'\n", r ? r : "(null)");
-    return "2.0";
+    const char *forced = getenv("DYSMANTLE_GLVER");
+    if (!forced) forced = "2.0";
+    if (!forced[0]) { /* DYSMANTLE_GLVER="" → deixa o valor real (null) */
+      fprintf(stderr, "[cfg] opengl_version real='%s' (não forçado)\n", r ? r : "(null)");
+      return r;
+    }
+    fprintf(stderr, "[cfg] opengl_version real='%s' -> forçando '%s'\n",
+            r ? r : "(null)", forced);
+    return forced;
   }
   return r;
 }
@@ -455,11 +521,14 @@ int main(int argc, char *argv[]) {
    * JPEG-encode e crasha (libjpeg). Falha gracioso (return 0) -> pula o cache. */
   patch_func_ret0("_ZN15ImageWriterJPEG10InitializeEv");
 
-  /* 🔑 NX_Graphics_IsTextureFormatSupported -> 1 (true): o APK modado tem os JPEGs
-   * de UI VAZIOS (size 0) e só a versão .ktx (ETC2). A engine, achando que ETC2
-   * não é suportado (Mali-450=GLES2), cai no .jpg vazio -> crash. Forçando
-   * "suportado", carrega o .ktx (TEM dados) via KtxImageLoader -> sem crash. */
-  patch_func_ret1("_Z36NX_Graphics_IsTextureFormatSupportedRK22nx_bitmap_parameters_t");
+  /* 🔑 NX_Graphics_IsTextureFormatSupported: ANTES forçávamos →1 p/ a engine
+   * carregar o .ktx (ETC2) das texturas de UI cujo .jpg vinha VAZIO. PORÉM isso
+   * faz a engine carregar ETC2 p/ TUDO (mundo) → Mali-450 não amostra ETC2 →
+   * MUNDO BRANCO. Agora que os .jpg vazios já foram preenchidos nos paks
+   * (fix_empty_textures.py), deixamos a engine ver "ETC2 não suportado" e
+   * carregar JPEG/PNG (que o Mali amostra). DYSMANTLE_FORCE_ETC2=1 reativa. */
+  if (getenv("DYSMANTLE_FORCE_ETC2"))
+    patch_func_ret1("_Z36NX_Graphics_IsTextureFormatSupportedRK22nx_bitmap_parameters_t");
 
   /* GOT-hook NXI_GetProductValue: a engine lê "opengl_version" do config; se
    * pedir ES3 ela monta o APIManager ES3 (mais funções) num buffer de pilha
@@ -475,6 +544,14 @@ int main(int argc, char *argv[]) {
   if (!getenv("DYSMANTLE_PB_NOFORCE"))
     patch_vaddr(0x46f53c, 0xd503201f); /* nop o cbz dirty-check */
   if (getenv("DYSMANTLE_PB_DEBUG")) hook_pb_getdata();
+  /* 🌍 fix do mundo branco: a engine pede vertex buffers com format=0 (o
+   * converter Legacy não trata → "unknown vertex format" → malha não sobe).
+   * Remapeamos format 0 → um layout 2D válido (default 0x7 = pos+uv+cor).
+   * Ajustável s/ rebuild: DYSMANTLE_VB_FMT0=N. DYSMANTLE_VB_LOG=1 loga. */
+  { const char *f = getenv("DYSMANTLE_VB_FMT0"); if (f) g_vb_fmt0 = atoi(f); }
+  g_vb_log = getenv("DYSMANTLE_VB_LOG") ? 1 : 0;
+  g_vb_dump = getenv("DYSMANTLE_VB_DUMP") ? 1 : 0;
+  hook_createvb();
   if (getenv("DYSMANTLE_PB_TRAPS")) install_brk_traps();
 
   /* registra o .eh_frame do jogo no unwinder C++: o módulo é custom-loaded (não
