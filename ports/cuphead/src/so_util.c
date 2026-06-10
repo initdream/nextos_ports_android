@@ -298,6 +298,11 @@ int so_relocate(void) {
         int type = ELF64_R_TYPE(rels[j].r_info);
         switch (type) {
         case R_AARCH64_ABS64:
+          /* import (UNDEF): NAO e' base+0 — e' um simbolo externo (ex malloc@LIBC).
+             Deixa o slot p/ so_resolve preencher (senao vira il2cpp_base+0 -> br
+             p/ o header ELF -> SIGILL). Simbolos LOCAIS (vtables/RTTI) seguem normal. */
+          if (sym->st_shndx == SHN_UNDEF)
+            break;
           *ptr = (uintptr_t)text_virtbase + sym->st_value + rels[j].r_addend;
           break;
         case R_AARCH64_RELATIVE:
@@ -355,16 +360,21 @@ int so_resolve(DynLibFunction *funcs, int num_funcs,
         int type = ELF64_R_TYPE(rels[j].r_info);
         switch (type) {
         case R_AARCH64_GLOB_DAT:
-        case R_AARCH64_JUMP_SLOT: {
+        case R_AARCH64_JUMP_SLOT:
+        /* ABS64 p/ simbolo UNDEF = import (ex malloc@LIBC numa tabela de thunks do
+           il2cpp). so_relocate pulou (senao vira base+0). Resolve aqui igual GOT,
+           somando o addend. */
+        case R_AARCH64_ABS64: {
           if (sym->st_shndx == SHN_UNDEF) {
             if (taint_missing_imports)
               *ptr = rels[j].r_offset;
 
             char *name = dynstrtab + sym->st_name;
+            uintptr_t add = (type == R_AARCH64_ABS64) ? rels[j].r_addend : 0;
             int found = 0;
             for (int k = 0; k < num_funcs; k++) {
               if (strcmp(name, funcs[k].symbol) == 0) {
-                *ptr = funcs[k].func;
+                *ptr = funcs[k].func + add;
                 found = 1;
                 break;
               }
@@ -372,7 +382,7 @@ int so_resolve(DynLibFunction *funcs, int num_funcs,
             if (!found) {
               /* fallback: libc/libm/zlib/socket/dl padrão resolvem no glibc real do device */
               void *real = dlsym(RTLD_DEFAULT, name);
-              if (real) { *ptr = (uintptr_t)real; found = 1; }
+              if (real) { *ptr = (uintptr_t)real + add; found = 1; }
             }
             if (!found)
               fprintf(stderr, "*** UNRESOLVED import: \"%s\" (GOT offset 0x%lx) ***\n",

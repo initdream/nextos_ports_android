@@ -86,11 +86,24 @@ static FILE *my_fopen(const char *p, const char *m) {
   }
   return fopen(p, m);
 }
+#define ASSET_BASE_M "/storage/roms/cuphead-recon/"
+static int g_dllog = 0;
 static int my_open(const char *p, int fl, ...) {
   if (p && !strcmp(p, "/proc/cpuinfo")) {
     FILE *t = tmpfile();
     if (t) { for (int i = 0; i < 4; i++) fprintf(t, "processor\t: %d\nCPU implementer\t: 0x41\nCPU architecture: 8\n\n", i);
       fflush(t); int fd = dup(fileno(t)); fclose(t); lseek(fd, 0, SEEK_SET); return fd; }
+  }
+  /* il2cpp abre <data>/Metadata/global-metadata.dat via open() com data path errado
+     (resquicio re4-recon). Redireciona pelo basename p/ o arquivo real deployado. */
+  if (p) {
+    const char *base = strrchr(p, '/'); base = base ? base + 1 : p;
+    if (!strcmp(base, "global-metadata.dat")) {
+      const char *real = ASSET_BASE_M "bin/Data/Managed/Metadata/global-metadata.dat";
+      if (g_dllog) fprintf(stderr, "[open-redir] %s -> %s\n", p, real);
+      return open(real, fl);
+    }
+    if (g_dllog) fprintf(stderr, "[open] %s\n", p);
   }
   va_list ap; va_start(ap, fl); int mo = va_arg(ap, int); va_end(ap);
   return open(p, fl, mo);
@@ -246,7 +259,6 @@ __asm__(
   "  br x17\n"
 );
 extern void onew_spy_tramp(void);
-static int g_dllog = 0;
 static void *my_dlopen(const char *nm, int flag) {
   if (g_dllog) fprintf(stderr, "[dlopen] \"%s\"\n", nm ? nm : "(null)");
   /* il2cpp: nosso modulo ja' carregado (F1). Casa "il2cpp" em qualquer forma. */
@@ -468,6 +480,14 @@ int main(int argc, char **argv) {
     *(uint32_t *)((uintptr_t)text_base + 0x35793c) = 0xd65f03c0u; /* ret */
     fprintf(stderr, "[FORCEIL2] 0x357938 -> mov w0,#1; ret\n");
   }
+  /* CUP_NOEXTRACT: a extracao de recursos do APK (0x94184c) copia de um VFS source
+     (o APK) que nao temos -> falha ("Failed to extract resources"). Mas os assets
+     JA estao deployados em bin/Data/. Forca a extracao reportar sucesso. */
+  if (getenv("CUP_NOEXTRACT")) {
+    *(uint32_t *)((uintptr_t)text_base + 0x94184c) = 0x52800020u; /* mov w0,#1 */
+    *(uint32_t *)((uintptr_t)text_base + 0x941850) = 0xd65f03c0u; /* ret */
+    fprintf(stderr, "[NOEXTRACT] 0x94184c -> mov w0,#1; ret\n");
+  }
 
   so_finalize(); so_flush_caches();
   g_alloc_ub = (uintptr_t)text_base;
@@ -509,6 +529,13 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[F1] libil2cpp: text=%p+%zu\n", text_base, text_size);
     so_relocate();
     so_resolve(dynlib_functions, dynlib_numfunctions, 0);
+    /* il2cpp abre o global-metadata.dat via open() -> intercepta p/ redirecionar.
+       patch_got opera no modulo ATIVO (=il2cpp agora). Tb dlopen/dlsym/log. */
+    patch_got("open", (void *)my_open);
+    patch_got("dlopen", (void *)my_dlopen);
+    patch_got("dlsym", (void *)my_dlsym);
+    patch_got("__android_log_print", (void *)my_alog_print);
+    patch_got("__android_log_write", (void *)my_alog_write);
     so_finalize(); so_flush_caches();
     fprintf(stderr, "[F1] libil2cpp init_array...\n");
     so_execute_init_array();
