@@ -46,6 +46,42 @@ __attribute__((aligned(16))) static _Thread_local char g_bionic_guard_pad[256] =
 /* fsync(stderr→debug.log): garante que o log sobrevive a hang/power-cycle */
 static void dbg_sync(void) { fsync(2); }
 
+/* sem_shim: semáforos próprios (bionic sem_t 4B vs glibc 32B) — ver sem_shim.c.
+   CAUSA-RAIZ do deadlock no boot: sem_post do glibc não acordava o sem_wait da
+   thread pool do Unity. CUP_NOSEMSHIM=1 desliga (volta ao glibc cru). */
+extern int sh_sem_init(void *, int, unsigned);
+extern int sh_sem_wait(void *);
+extern int sh_sem_trywait(void *);
+extern int sh_sem_timedwait(void *, const struct timespec *);
+extern int sh_sem_post(void *);
+extern int sh_sem_getvalue(void *, int *);
+extern int sh_sem_destroy(void *);
+extern int g_main_tid;
+extern void sh_tick_preload(void);
+extern void sh_sem_set_poll(int ms);
+static void set_import(const char *name, void *fn);
+static int patch_got(const char *name, void *fn);
+static void install_sem_shim(void) {
+  if (getenv("CUP_NOSEMSHIM")) return;
+  set_import("sem_init", (void *)sh_sem_init);
+  set_import("sem_wait", (void *)sh_sem_wait);
+  set_import("sem_trywait", (void *)sh_sem_trywait);
+  set_import("sem_timedwait", (void *)sh_sem_timedwait);
+  set_import("sem_post", (void *)sh_sem_post);
+  set_import("sem_getvalue", (void *)sh_sem_getvalue);
+  set_import("sem_destroy", (void *)sh_sem_destroy);
+}
+static void patch_sem_shim(void) {
+  if (getenv("CUP_NOSEMSHIM")) return;
+  patch_got("sem_init", (void *)sh_sem_init);
+  patch_got("sem_wait", (void *)sh_sem_wait);
+  patch_got("sem_trywait", (void *)sh_sem_trywait);
+  patch_got("sem_timedwait", (void *)sh_sem_timedwait);
+  patch_got("sem_post", (void *)sh_sem_post);
+  patch_got("sem_getvalue", (void *)sh_sem_getvalue);
+  patch_got("sem_destroy", (void *)sh_sem_destroy);
+}
+
 /* ---------- crash handler (arm64) ---------- */
 static void on_crash(int sig, siginfo_t *si, void *uc_) {
   ucontext_t *uc = (ucontext_t *)uc_;
@@ -563,6 +599,14 @@ extern int my_sigaction();  /* bionic_shims.c (ABI sigset bionic/glibc) */
    o boot (a main fica presa no nativeRender esperando o áudio progredir). */
 static void *g_fmod_env;
 static volatile int g_fmod_run = 1;
+/* TESTE CUP_PRELOAD_TICK: posta periodicamente os sems em que threads não-main
+   bloqueiam (acorda a UnityPreload p/ processar o item pendente da fila). */
+static void *preload_tick_thread(void *arg) {
+  (void)arg;
+  fprintf(stderr, "[TICK] thread de preload-tick ativa (16ms)\n");
+  while (g_fmod_run) { sh_tick_preload(); usleep(16000); }
+  return NULL;
+}
 static void *fmod_audio_thread(void *arg) {
   (void)arg;
   void *fp = NULL;
@@ -586,6 +630,8 @@ static void *fmod_audio_thread(void *arg) {
 int main(int argc, char **argv) {
   (void)argc; (void)argv;
   setvbuf(stdout, NULL, _IONBF, 0); setvbuf(stderr, NULL, _IONBF, 0);
+  g_main_tid = (int)syscall(SYS_gettid);  /* p/ o sem_shim distinguir main de workers */
+  if (getenv("CUP_SEMPOLL")) sh_sem_set_poll(atoi(getenv("CUP_SEMPOLL")));  /* polling do sem_wait */
 
   /* log persistente: stderr -> debug.log (unbuffered + fsync nos marcos =
      sobrevive a hang/power-cycle do device). CUP_NOLOGFILE=1 desativa. */
@@ -666,6 +712,8 @@ int main(int argc, char **argv) {
   set_import("ANativeWindow_acquire", (void *)my_aw_noop);
   set_import("ANativeWindow_release", (void *)my_aw_noop);
 
+  install_sem_shim();  /* semáforos próprios bionic→glibc (fix deadlock boot) */
+
   fprintf(stderr, "[F0] resolvendo %zu imports...\n", dynlib_numfunctions);
   if (so_resolve(dynlib_functions, dynlib_numfunctions, 0) < 0) { fprintf(stderr, "resolve FALHOU\n"); return 1; }
   /* PATCH-GOT: os imports NDK nao estao em dynlib_functions -> set_import foi
@@ -695,6 +743,7 @@ int main(int argc, char **argv) {
   patch_got("access", (void *)my_access);
   patch_got("exit", (void *)my_exit);
   patch_got("_exit", (void *)my_exit);
+  patch_sem_shim();  /* sem_* nos slots GOT do libunity */
   /* sensores/looper/profiler google: stub no-op (nao usados no path do gfx) */
   const char *ndk_noop[] = {
     "ALooper_forThread","ALooper_prepare","ASensorManager_getInstance",
@@ -794,6 +843,7 @@ int main(int argc, char **argv) {
     patch_got("__android_log_print", (void *)my_alog_print);
     patch_got("__android_log_write", (void *)my_alog_write);
     patch_got("__android_log_vprint", (void *)my_alog_vprint);
+    patch_sem_shim();  /* sem_* nos slots GOT do libil2cpp */
     so_finalize(); so_flush_caches();
     fprintf(stderr, "[F1] libil2cpp init_array...\n");
     so_execute_init_array();
@@ -877,6 +927,10 @@ int main(int argc, char **argv) {
     pthread_t at; pthread_create(&at, NULL, fmod_audio_thread, NULL);
     pthread_detach(at);
     fprintf(stderr, "[AUDIO] thread de áudio FMOD criada\n");
+  }
+  if (getenv("CUP_PRELOAD_TICK")) {
+    pthread_t tt; pthread_create(&tt, NULL, preload_tick_thread, NULL);
+    pthread_detach(tt);
   }
 
   void *render = jni_find_native("nativeRender");
