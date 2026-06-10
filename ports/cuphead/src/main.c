@@ -23,6 +23,7 @@
 #include <ucontext.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <SDL2/SDL.h>
 
 #include "so_util.h"
 #include "imports.h"
@@ -46,7 +47,12 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
     fprintf(stderr, " x%-2d=0x%016lx", i, (unsigned long)uc->uc_mcontext.regs[i]);
     if (i % 3 == 2) fprintf(stderr, "\n");
   }
-  fprintf(stderr, "\n[stack scan]\n");
+  /* qual lib contém o pc? */
+  FILE *mp = fopen("/proc/self/maps", "r"); char ml[400];
+  while (mp && fgets(ml, sizeof ml, mp)) { unsigned long a, b;
+    if (sscanf(ml, "%lx-%lx", &a, &b) == 2 && pc >= a && pc < b) { fprintf(stderr, "[PC-LIB] %s", ml); break; } }
+  if (mp) fclose(mp);
+  fprintf(stderr, "[stack scan]\n");
   uintptr_t sp = uc->uc_mcontext.sp;
   for (int k = 0, hits = 0; k < 400 && hits < 24; k++) {
     uintptr_t v = *(uintptr_t *)(sp + k * 8);
@@ -108,15 +114,90 @@ static int my_aw_getHeight(void *w) { (void)w; return 720; }
 static int my_aw_getFormat(void *w) { (void)w; return 1; }
 static void my_aw_noop(void *w) { (void)w; }
 /* dlopen/dlsym: Unity dlopen libGLESv2/EGL/OpenSLES + dlsym em runtime */
-static char g_dl_self;
+/* ---------- egl_shim (janela GLES2 via SDL2, proven re4) ---------- */
+extern void egl_shim_create_window(void);
+extern void *egl_shim_GetDisplay(void *);
+extern unsigned egl_shim_Initialize(void *, int *, int *);
+extern unsigned egl_shim_Terminate(void *);
+extern unsigned egl_shim_ChooseConfig(void *, const int *, void **, int, int *);
+extern void *egl_shim_CreateWindowSurface(void *, void *, void *, const int *);
+extern void *egl_shim_CreatePbufferSurface(void *, void *, const int *);
+extern void *egl_shim_CreateContext(void *, void *, void *, const int *);
+extern unsigned egl_shim_MakeCurrent(void *, void *, void *, void *);
+extern unsigned egl_shim_SwapBuffers(void *, void *);
+extern unsigned egl_shim_DestroySurface(void *, void *);
+extern unsigned egl_shim_DestroyContext(void *, void *);
+extern unsigned egl_shim_QuerySurface(void *, void *, int, int *);
+extern unsigned egl_shim_GetConfigAttrib(void *, void *, int, int *);
+extern int egl_shim_GetError(void);
+extern void *egl_shim_GetProcAddress(const char *);
+extern unsigned egl_shim_BindAPI(unsigned);
+extern const char *egl_shim_QueryString(void *, int);
+extern unsigned egl_shim_SwapInterval(void *, int);
+extern void *egl_shim_GetCurrentContext(void);
+extern void *egl_shim_GetCurrentSurface(int);
+extern unsigned egl_shim_SurfaceAttrib(void *, void *, int, int);
+static void *egl_route(const char *nm) {
+  struct { const char *n; void *f; } m[] = {
+    {"eglGetDisplay", egl_shim_GetDisplay}, {"eglInitialize", egl_shim_Initialize},
+    {"eglTerminate", egl_shim_Terminate}, {"eglChooseConfig", egl_shim_ChooseConfig},
+    {"eglCreateWindowSurface", egl_shim_CreateWindowSurface},
+    {"eglCreatePbufferSurface", egl_shim_CreatePbufferSurface},
+    {"eglCreateContext", egl_shim_CreateContext}, {"eglMakeCurrent", egl_shim_MakeCurrent},
+    {"eglSwapBuffers", egl_shim_SwapBuffers}, {"eglDestroySurface", egl_shim_DestroySurface},
+    {"eglDestroyContext", egl_shim_DestroyContext}, {"eglQuerySurface", egl_shim_QuerySurface},
+    {"eglGetConfigAttrib", egl_shim_GetConfigAttrib}, {"eglGetError", egl_shim_GetError},
+    {"eglGetProcAddress", egl_shim_GetProcAddress}, {"eglBindAPI", egl_shim_BindAPI},
+    {"eglQueryString", egl_shim_QueryString}, {"eglSwapInterval", egl_shim_SwapInterval},
+    {"eglGetCurrentContext", egl_shim_GetCurrentContext},
+    {"eglGetCurrentSurface", egl_shim_GetCurrentSurface},
+    {"eglGetCurrentDisplay", egl_shim_GetDisplay}, {"eglSurfaceAttrib", egl_shim_SurfaceAttrib},
+    {0, 0}
+  };
+  for (int i = 0; m[i].n; i++) if (!strcmp(m[i].n, nm)) return m[i].f;
+  return NULL;
+}
+
+/* glGetString wrapper (proven re4): o preprocessador de shader do Unity chama
+ * glGetString(RENDERER/VERSION/EXT) numa thread sem contexto GL current -> real
+ * devolve NULL -> parse char-a-char de NULL estoura o buffer (stack smash em
+ * nativeRecreateGfxState). Cache + defaults Mali; NUNCA NULL. */
+static const unsigned char *(*r_glGetString)(unsigned) = NULL;
+static const unsigned char *g_glcache[5] = {0,0,0,0,0};
+static int glstr_idx(unsigned n){ switch(n){case 0x1F00:return 0;case 0x1F01:return 1;case 0x1F02:return 2;case 0x1F03:return 3;case 0x8B8C:return 4;} return -1; }
+static const unsigned char *my_glGetString(unsigned n){
+  if(!r_glGetString) r_glGetString=(const unsigned char*(*)(unsigned))dlsym(RTLD_DEFAULT,"glGetString");
+  const unsigned char *s = r_glGetString ? r_glGetString(n) : NULL;
+  int i = glstr_idx(n);
+  if(s){ if(i>=0 && !g_glcache[i]) g_glcache[i]=(const unsigned char*)strdup((const char*)s); }
+  else if(i>=0 && g_glcache[i]) s=g_glcache[i];
+  else if(i>=0) s=(const unsigned char*)(n==0x1F00?"ARM":n==0x1F01?"Mali-450 MP":n==0x1F02?"OpenGL ES 2.0":n==0x8B8C?"OpenGL ES GLSL ES 1.00":"");
+  return s;
+}
+
+static char g_dl_self, g_dl_il2cpp;
+static so_module *g_m_unity = NULL, *g_m_il2cpp = NULL;
 static void *my_dlopen(const char *nm, int flag) {
-  if (!nm || !nm[0] || strstr(nm, "libc") || strstr(nm, "libunity") || strstr(nm, "libmain") || strstr(nm, "libil2cpp"))
+  if (nm && strstr(nm, "libil2cpp")) { fprintf(stderr, "[DLOPEN] %s -> il2cpp module\n", nm); return &g_dl_il2cpp; }
+  if (!nm || !nm[0] || strstr(nm, "libc") || strstr(nm, "libunity") || strstr(nm, "libmain"))
     return &g_dl_self;
   void *h = dlopen(nm, flag); return h ? h : &g_dl_self;
 }
 static void *my_dlsym(void *h, const char *nm) {
   if (!nm) return NULL;
-  if (h == &g_dl_self) { void *p = (void *)so_find_addr_safe(nm); if (!p) p = dlsym(RTLD_DEFAULT, nm); return p; }
+  if (!strcmp(nm, "glGetString")) return (void *)my_glGetString;
+  if (nm[0] == 'e' && nm[1] == 'g' && nm[2] == 'l') { void *p = egl_route(nm); if (p) return p; }
+  if (h == &g_dl_il2cpp && g_m_il2cpp) {
+    so_module *c = so_save(); so_use(g_m_il2cpp);
+    void *p = (void *)so_find_addr_safe(nm);
+    so_use(c); free(c); return p;
+  }
+  if (h == &g_dl_self) {
+    void *p = (void *)so_find_addr_safe(nm);
+    if (!p && g_m_il2cpp) { so_module *c = so_save(); so_use(g_m_il2cpp); p = (void *)so_find_addr_safe(nm); so_use(c); free(c); }
+    if (!p) p = dlsym(RTLD_DEFAULT, nm);
+    return p;
+  }
   return dlsym(h, nm);
 }
 static const char *my_dlerror(void) { return NULL; }
@@ -173,6 +254,7 @@ int main(int argc, char **argv) {
   if (so_relocate() < 0) { fprintf(stderr, "relocate FALHOU\n"); return 1; }
 
   /* overrides */
+  set_import("glGetString", (void *)my_glGetString);
   set_import("sysconf", (void *)my_sysconf);
   set_import("fopen", (void *)my_fopen);
   set_import("open", (void *)my_open);
@@ -213,8 +295,60 @@ int main(int argc, char **argv) {
   } else {
     fprintf(stderr, "[F0] JNI_OnLoad não encontrado em libunity\n");
   }
+  fprintf(stderr, "[F0] === libunity OK ===\n");
 
-  fprintf(stderr, "[F0] === fim F0 (libunity carregada). Próximo: libil2cpp + lifecycle ===\n");
+  /* ---- F1: carrega libil2cpp.so (2º módulo, lógica C# do jogo) ---- */
+  g_m_unity = so_save();
+  size_t i2s = 96UL * 1024 * 1024;
+  void *i2heap = mmap(NULL, i2s, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (i2heap != MAP_FAILED && so_load("libil2cpp.so", i2heap, i2s) >= 0) {
+    fprintf(stderr, "[F1] libil2cpp: text=%p+%zu\n", text_base, text_size);
+    so_relocate();
+    so_resolve(dynlib_functions, dynlib_numfunctions, 0);
+    so_finalize(); so_flush_caches();
+    fprintf(stderr, "[F1] libil2cpp init_array...\n");
+    so_execute_init_array();
+    g_m_il2cpp = so_save();
+    fprintf(stderr, "[F1] libil2cpp carregado OK\n");
+  } else {
+    fprintf(stderr, "[F1] FALHOU carregar libil2cpp (heap=%p)\n", i2heap);
+  }
+  so_use(g_m_unity);  /* volta o contexto p/ libunity */
+
+  /* lista os métodos nativos registrados (achar initJni/nativeRender) */
+  extern void jni_dump_natives(void);
+  extern void *jni_find_native(const char *);
+  jni_dump_natives();
+
+  /* ---- F2: janela GLES2 (SDL2/egl_shim) + lifecycle Unity ---- */
+  extern int egl_shim_ensure_current(void);
+  if (SDL_Init(SDL_INIT_VIDEO) != 0) fprintf(stderr, "[F2] SDL_Init: %s\n", SDL_GetError());
+  egl_shim_create_window();
+  egl_shim_ensure_current();   /* deixa o contexto GL current na thread do jogo */
+  fprintf(stderr, "[F2] janela GLES2 criada\n");
+
+  static long thiz = 0xA1, ctx = 0xC0, surf = 0x5F;
+  void *fn;
+  if ((fn = jni_find_native("initJni"))) {
+    fprintf(stderr, "[F2] initJni...\n");
+    ((void (*)(void *, void *, void *))fn)(env, &thiz, &ctx);
+    fprintf(stderr, "[F2] initJni OK\n");
+  }
+  if ((fn = jni_find_native("nativeRecreateGfxState"))) {
+    fprintf(stderr, "[F2] nativeRecreateGfxState...\n");
+    ((void (*)(void *, void *, int, void *))fn)(env, &thiz, 0, &surf);
+    fprintf(stderr, "[F2] nativeRecreateGfxState OK\n");
+  }
+  if ((fn = jni_find_native("nativeResume"))) ((void (*)(void *, void *))fn)(env, &thiz);
+  if ((fn = jni_find_native("nativeFocusChanged"))) ((void (*)(void *, void *, int))fn)(env, &thiz, 1);
+
+  void *render = jni_find_native("nativeRender");
+  fprintf(stderr, "[F2] nativeRender=%p -> loop\n", render);
+  for (int f = 0; render && f < 600; f++) {
+    ((unsigned char (*)(void *, void *))render)(env, &thiz);
+    if (f < 5 || f % 60 == 0) fprintf(stderr, "[render %d]\n", f);
+  }
+  fprintf(stderr, "[F2] === render loop terminou ===\n");
   fflush(stderr);
   _exit(0);  /* hard exit — destrutores do .so crasham no teardown normal */
 }

@@ -6,9 +6,9 @@ CC=$TC/bin/aarch64-libreelec-linux-gnu-gcc
 SR=$TC/aarch64-libreelec-linux-gnu/sysroot
 cd "$(dirname "$0")"
 [ -x "$CC" ] || { echo "toolchain não encontrado: $CC"; exit 1; }
-# F0: só os fontes do core do loader (sem android_shim/egl_shim templates p/ NativeActivity)
-SRCS=$(ls src/*.c | grep -vE "android_shim|egl_shim|opensles_shim")
-$CC --sysroot="$SR" -D_GNU_SOURCE -I src -O2 -fPIC -fno-omit-frame-pointer -rdynamic \
+# inclui egl_shim (janela SDL2); exclui android_shim (NativeActivity) e opensles (audio=depois)
+SRCS=$(ls src/*.c | grep -vE "android_shim|opensles_shim")
+$CC --sysroot="$SR" -D_GNU_SOURCE -I src -I "$SR/usr/include" -O2 -fPIC -fno-omit-frame-pointer -rdynamic \
     -o cuphead $SRCS \
-    -ldl -lm -lpthread
+    -lSDL2 -ldl -lm -lpthread
 echo "BUILD OK -> $(file cuphead | cut -d, -f1-3)"

@@ -500,3 +500,30 @@ int so_unload(void) {
     fatal_error("Error: could not unmap library memory");
   return 0;
 }
+
+/* ===== multi-módulo (libunity + libil2cpp): salva/restaura o estado do loader ===== */
+struct so_module {
+  void *text_base, *text_virtbase, *data_base, *data_virtbase;
+  void *load_base, *load_virtbase, *so_base;
+  size_t text_size, data_size, load_size;
+  Elf64_Ehdr *elf_hdr; Elf64_Phdr *prog_hdr; Elf64_Shdr *sec_hdr;
+  Elf64_Sym *syms; int num_syms; char *shstrtab, *dynstrtab;
+};
+so_module *so_save(void) {
+  so_module *m = (so_module *)malloc(sizeof(so_module));
+  m->text_base=text_base; m->text_virtbase=text_virtbase;
+  m->data_base=data_base; m->data_virtbase=data_virtbase;
+  m->load_base=load_base; m->load_virtbase=load_virtbase; m->so_base=so_base;
+  m->text_size=text_size; m->data_size=data_size; m->load_size=load_size;
+  m->elf_hdr=elf_hdr; m->prog_hdr=prog_hdr; m->sec_hdr=sec_hdr;
+  m->syms=syms; m->num_syms=num_syms; m->shstrtab=shstrtab; m->dynstrtab=dynstrtab;
+  return m;
+}
+void so_use(so_module *m) {
+  text_base=m->text_base; text_virtbase=m->text_virtbase;
+  data_base=m->data_base; data_virtbase=m->data_virtbase;
+  load_base=m->load_base; load_virtbase=m->load_virtbase; so_base=m->so_base;
+  text_size=m->text_size; data_size=m->data_size; load_size=m->load_size;
+  elf_hdr=m->elf_hdr; prog_hdr=m->prog_hdr; sec_hdr=m->sec_hdr;
+  syms=m->syms; num_syms=m->num_syms; shstrtab=m->shstrtab; dynstrtab=m->dynstrtab;
+}

@@ -40,4 +40,8 @@ DynLibFunction *so_find_import(DynLibFunction *funcs, int num_funcs,
 void so_finalize(void);
 int so_unload(void);
 
+typedef struct so_module so_module;
+so_module *so_save(void);
+void so_use(so_module *m);
+
 #endif
