@@ -1,8 +1,62 @@
 // imports.gen.c — GERADO por new-port.sh para 'cuphead' (libil2cpp.so)
 // 201 simbolos. Resolva os UNKNOWN no fim do arquivo.
+#define _GNU_SOURCE
 #include "imports.h"
 #include "so_util.h"
+#include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
+#include <strings.h>
+#include <unistd.h>
+#include <math.h>
+#include <ctype.h>
+#include <wchar.h>
+#include <wctype.h>
+#include <time.h>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sched.h>
+#include <sys/ioctl.h>
+#include <malloc.h>
+#include <locale.h>
+#include <signal.h>
+#include <setjmp.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/mman.h>
+#include <netdb.h>
+#include <sys/time.h>
+#include <poll.h>
+#include <pthread.h>
+#include <zlib.h>
+static int *bionic_errno(void){return __errno_location();}
+extern int __cxa_atexit(void(*)(void*),void*,void*);
+extern void __cxa_finalize(void*);
+extern int __cxa_thread_atexit_impl(void(*)(void*),void*,void*);
+/* liblog (Android) não existe no glibc -> stubs p/ stderr */
+static int __android_log_print(int p,const char*t,const char*f,...){(void)p;(void)t;(void)f;return 0;}
+static int __android_log_write(int p,const char*t,const char*m){(void)p;fprintf(stderr,"[ALOG:%s] %s\n",t?t:"",m?m:"");return 0;}
+FILE *stderr_fake;
+
+// extern decls dos _fake (def em pthread_fake.c)
+extern long pthread_attr_destroy_fake(); extern long pthread_attr_getstack_fake();
+extern long pthread_attr_init_fake(); extern long pthread_condattr_destroy_fake();
+extern long pthread_condattr_init_fake(); extern long pthread_condattr_setclock_fake();
+extern long pthread_cond_broadcast_fake(); extern long pthread_cond_destroy_fake();
+extern long pthread_cond_init_fake(); extern long pthread_cond_signal_fake();
+extern long pthread_cond_timedwait_fake(); extern long pthread_cond_wait_fake();
+extern long pthread_create_fake(); extern long pthread_detach_fake();
+extern long pthread_getattr_np_fake(); extern long pthread_getspecific_fake();
+extern long pthread_key_create_fake(); extern long pthread_key_delete_fake();
+extern long pthread_mutexattr_destroy_fake(); extern long pthread_mutexattr_init_fake();
+extern long pthread_mutexattr_settype_fake(); extern long pthread_mutex_destroy_fake();
+extern long pthread_mutex_init_fake(); extern long pthread_mutex_lock_fake();
+extern long pthread_mutex_unlock_fake(); extern long pthread_once_fake();
+extern long pthread_self_fake(); extern long pthread_setspecific_fake();
+extern long sem_getvalue_fake(); extern long sem_init_fake();
+extern long sem_post_fake(); extern long sem_wait_fake();
 
 // === passthrough/pthread/shim: ligados automaticamente ===
 DynLibFunction dynlib_functions[] = {
@@ -39,7 +93,7 @@ DynLibFunction dynlib_functions[] = {
   // TODO {"dl_iterate_phdr", (uintptr_t)&stub_dl_iterate_phdr},  // <<< IMPLEMENTAR
   // TODO {"dlopen", (uintptr_t)&stub_dlopen},  // <<< IMPLEMENTAR
   // TODO {"dlsym", (uintptr_t)&stub_dlsym},  // <<< IMPLEMENTAR
-  {"__errno", (uintptr_t)&__errno},  // pass
+  {"__errno", (uintptr_t)&bionic_errno},  // pass
   {"exit", (uintptr_t)&exit},  // pass
   {"exp", (uintptr_t)&exp},  // pass
   // TODO {"exp2f", (uintptr_t)&stub_exp2f},  // <<< IMPLEMENTAR
@@ -209,6 +263,7 @@ DynLibFunction dynlib_functions[] = {
   // TODO {"writev", (uintptr_t)&stub_writev},  // <<< IMPLEMENTAR
 };
 const int dynlib_functions_count = sizeof(dynlib_functions)/sizeof(dynlib_functions[0]);
+size_t dynlib_numfunctions = sizeof(dynlib_functions)/sizeof(dynlib_functions[0]);
 
 // ===================== SIMBOLOS A IMPLEMENTAR =====================
 //   accept
