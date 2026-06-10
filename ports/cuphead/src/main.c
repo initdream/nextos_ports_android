@@ -629,14 +629,22 @@ volatile int g_in_waitall = 0;
 uintptr_t g_waitall_cont = 0;   /* 0x873a90 + 16 (usado pelo asm) */
 /* gate replica — usa as bases já capturadas (g_unity_base/g_unity_data) */
 int my_gate(void *op);
+static int jobs_pending(void) {
+  void *mgr = *(void **)(g_unity_data + 0xd3380);  /* job-scheduler 0x12b9380 */
+  if (!mgr) return 0;
+  return ((int (*)(void *))(g_unity_base + 0x6cdad0))(mgr);
+}
 int my_gate(void *op) {
-  if (g_in_waitall) return 1;
+  if (g_in_waitall) {
+    /* force-complete: ignora o BUDGET (time-slice), mas — se CUP_GATEJOBS — ainda
+       espera os JOBS terminarem (não integra op cujos sub-jobs não rodaram → objeto
+       malformado/vtable na arena). Sem o flag = comportamento antigo (bypass total). */
+    if (getenv("CUP_GATEJOBS")) return jobs_pending() ? 0 : 1;
+    return 1;
+  }
   int budget = ((int (*)(void *))(g_unity_base + 0x871884))((char *)op + 0x98);
   if (!budget) return 0;
-  void *mgr = *(void **)(g_unity_data + 0xd3380);  /* job-scheduler 0x12b9380 */
-  if (!mgr) return 1;
-  int pending = ((int (*)(void *))(g_unity_base + 0x6cdad0))(mgr);
-  return pending ? 0 : 1;
+  return jobs_pending() ? 0 : 1;
 }
 /* trampolim que re-executa o prólogo clobberado de 0x873a90 e segue em +16 */
 __asm__(
