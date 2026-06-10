@@ -146,8 +146,19 @@ static void crash_handler(int sig, siginfo_t *info, void *uctx) {
     const uint32_t *w = (const uint32_t *)((pc & ~3u) - 16);
     for (int q = 0; q < 8; q++) fprintf(stderr, "    %p: %08x\n", (void *)(w + q), w[q]);
   }
-  /* objeto do último dynamic_cast (provável fonte da vtable selvagem) */
+  /* ring dos últimos dynamic_cast (acha o nó de shader selvagem) */
   { extern const void *g_last_dcast_sub, *g_last_dcast_vt, *g_last_dcast_ti, *g_last_dcast_caller;
+    struct dcrec { const void *sub, *vt, *dst, *caller; };
+    extern struct dcrec g_dcring[]; extern int g_dcring_i;
+    fprintf(stderr, "  --- dcast ring (mais recente por último), text=%lx ---\n", (unsigned long)text);
+    for (int q = 0; q < 12; q++) {
+      struct dcrec *r = &g_dcring[(g_dcring_i + q) % 12];
+      if (!r->sub && !r->vt) continue;
+      long coff = ((uintptr_t)r->caller >= text && (uintptr_t)r->caller < text + text_size)
+                      ? (long)((uintptr_t)r->caller - text) : -1;
+      fprintf(stderr, "    sub=%p vt=%p dst=%p caller=%p(libapp+0x%lx)\n",
+              r->sub, r->vt, r->dst, r->caller, coff);
+    }
     fprintf(stderr, "  --- last dynamic_cast: sub=%p vt=%p ti=%p caller=%p ---\n",
             g_last_dcast_sub, g_last_dcast_vt, g_last_dcast_ti, g_last_dcast_caller);
     if ((uintptr_t)g_last_dcast_sub > 0x1000) {

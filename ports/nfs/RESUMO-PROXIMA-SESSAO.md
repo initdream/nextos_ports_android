@@ -76,10 +76,27 @@ O `dynamic_cast` que crasha (em `0x46b6fc`, dentro de `0x46b220`) é:
 - **Implicação**: a engine gera shaders no load (provável p/ GLES2/Mali). O grafo de shader tem um nó
   inválido — misparse dos dados de shader OU um tipo de nó cujo construtor/factory não rodou (vtable
   não setada) OU RTTI cross-módulo quebrado no factory de nós.
-- **Próximo passo**: achar onde o array de nós (`this->[24]`) é construído (função que contém o loop
-  ~0x46ad3c, e callers 0x3de064/0x46b958). Logar cada nó + sua vtable; o 1º nó com vtable fora das
-  faixas de módulo é o culpado. Ver se um tipo de Node (ex: UniformNode e irmãos) tem ctor que não
-  roda. Tipos: desmangle `N2im4isis9shadergenXX...E` p/ mapear a hierarquia de Node.
+- **Refino (ring de dcast no crash)**: só ~2-3 dcasts antes do crash. A cadeia:
+  (1) `libapp+0x46addc` faz `dcast<Node>(obj=0x47c6858)` — obj VÁLIDO, vtable=libapp+0xab3830.
+  (2) recursão INTERNA da libc++ (caller na libc++) caminha a hierarquia de Node e CRASHA
+      (handler faz `blx r0`=lixo "HT=1").
+  (3) `libapp+0x46b700` faz `dcast<UniformNode>(sub=NULL)` → retorna NULL (ok, array tem nó nulo).
+  Ou seja: castar um objeto VÁLIDO (0x47c6858, typeinfo @0xab3854) p/ Node crasha caminhando a
+  hierarquia de classes-base → **um type_info BASE da cadeia está corrompido** (vtable do type_info
+  = região "HT=1").
+- ❌ **DESCARTADO: bug de relocação.** libapp usa REL padrão (DT_REL 388264B, RELCOUNT=45699, tudo
+  em `.rel.dyn` que o so_relocate processa 100%). SEM packed/RELR/DT_ANDROID_REL. Então os type_infos
+  ESTÃO relocados certos. A corrupção é RUNTIME/heap (consistente c/ PAD mudar o crash).
+- **Próximo passo concreto (RUNTIME)**: dumpar NO DEVICE, no momento do dcast que crasha, a cadeia
+  real: obj(0x47c6858)→*obj=vtable→vtable[-1]=typeinfo→percorrer __base_info. Achar o type_info-base
+  cuja vtable cai FORA das faixas de módulo (= o corrompido). Aí ver QUEM escreveu por cima (provável
+  overflow de heap de um buffer vizinho, OU o objeto foi liberado e o slot reusado). Já tem
+  g_dcring + dump no crash_handler; estender p/ caminhar a cadeia de type_info e logar cada base.
+- Investigar tb: o nó NULO no array (entry #3, `dcast(NULL)` em 0x46b700) — o array de nós de shader
+  tem entradas nulas e/ou selvagens. Ver a construção do array (`this->[24]`, callers 0x3de064 etc).
+- Hipótese de heap: algum buffer de shader/string transborda e esmaga a .data.rel.ro? NÃO — .data.rel.ro
+  é do módulo (read-only após load idealmente). Mais provável: o OBJETO (nó) é que é selvagem/reusado,
+  e por sorte teve vtable plausível; ou um buffer de nós transbordou esmagando nós vizinhos.
 
 ### (antigo) caracterização genérica do ponteiro selvagem (ainda válida)
 - O objeto passado ao dynamic_cast tem vtable apontando p/ lixo. Os valores ("HT=1", "TDBG") são
