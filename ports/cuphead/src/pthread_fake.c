@@ -100,9 +100,32 @@ int sem_wait_fake(void **slot) { return sem_wait(sem_get(slot)); }
 int sem_trywait_fake(void **slot) { return sem_trywait(sem_get(slot)); }
 
 /* ---------- create / attr (mapeiam ~direto; attr bionic ignorado) ---------- */
+/* trampolim: instala um sigaltstack PRÓPRIO nesta thread antes de chamar o start
+ * real. Sem isso, um SIGSEGV numa thread do Unity roda o on_crash na pilha da
+ * própria thread (que pode estar corrompida/cheia) → re-fault → morte calada.
+ * Com altstack por-thread, o on_crash sempre consegue dumpar. */
+#include <signal.h>
+#include <sys/mman.h>
+struct thr_boot { void *(*start)(void *); void *arg; };
+static void *thr_trampoline(void *p) {
+  struct thr_boot b = *(struct thr_boot *)p;
+  free(p);
+  void *mem = mmap(NULL, SIGSTKSZ, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mem != MAP_FAILED) {
+    stack_t ss; ss.ss_sp = mem; ss.ss_size = SIGSTKSZ; ss.ss_flags = 0;
+    sigaltstack(&ss, NULL);
+  }
+  return b.start(b.arg);
+}
 int pthread_create_fake(pthread_t *t, const void *attr, void *(*start)(void *), void *arg) {
   (void)attr;
-  return pthread_create(t, NULL, start, arg);
+  struct thr_boot *b = malloc(sizeof *b);
+  if (!b) return pthread_create(t, NULL, start, arg);
+  b->start = start; b->arg = arg;
+  int rc = pthread_create(t, NULL, thr_trampoline, b);
+  if (rc) { free(b); rc = pthread_create(t, NULL, start, arg); }
+  return rc;
 }
 int pthread_attr_init_fake(void *a) { (void)a; return 0; }
 int pthread_attr_destroy_fake(void *a) { (void)a; return 0; }

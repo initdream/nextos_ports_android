@@ -74,6 +74,44 @@ static const char *resolve_jstring(void *jstr) {
   return jstr ? (const char *)jstr : "";
 }
 
+/* ---- SharedPreferences em memória (key->value) ----
+ * O Cuphead salva cuphead_settings_data_v1 via putString e LÊ de volta via
+ * getString/contains. Sem persistência, getString devolvia o default e contains=0
+ * → o SaveManager re-tentava/livelock e/ou crashava em null. Aqui guardamos os
+ * pares (strings e ints) numa tabela simples; o round-trip passa a funcionar. */
+#define MAX_PREFS 128
+static struct { char *key; char *sval; int ival; int has_s, has_i; } g_prefs[MAX_PREFS];
+static int g_prefs_n = 0;
+static int prefs_find(const char *key) {
+  for (int i = 0; i < g_prefs_n; i++)
+    if (g_prefs[i].key && !strcmp(g_prefs[i].key, key)) return i;
+  return -1;
+}
+static int prefs_slot(const char *key) {
+  int i = prefs_find(key);
+  if (i >= 0) return i;
+  if (g_prefs_n >= MAX_PREFS) return -1;
+  g_prefs[g_prefs_n].key = strdup(key ? key : "");
+  return g_prefs_n++;
+}
+static void prefs_put_string(const char *key, const char *val) {
+  int i = prefs_slot(key); if (i < 0) return;
+  if (g_prefs[i].sval) free(g_prefs[i].sval);
+  g_prefs[i].sval = strdup(val ? val : ""); g_prefs[i].has_s = 1;
+}
+static void prefs_put_int(const char *key, int val) {
+  int i = prefs_slot(key); if (i < 0) return;
+  g_prefs[i].ival = val; g_prefs[i].has_i = 1;
+}
+static const char *prefs_get_string(const char *key) {
+  int i = prefs_find(key);
+  return (i >= 0 && g_prefs[i].has_s) ? g_prefs[i].sval : NULL;
+}
+static int prefs_contains(const char *key) {
+  int i = prefs_find(key);
+  return (i >= 0 && (g_prefs[i].has_s || g_prefs[i].has_i)) ? 1 : 0;
+}
+
 /* ---- Registry de method/field IDs por NOME (recon Unity) ---- */
 struct mid_entry { const char *name; const char *sig; };
 static struct mid_entry g_midreg[1024];
@@ -356,6 +394,26 @@ static void *jni_CallObjectMethodV(void *env, void *obj, void *methodID,
         strcmp(nm, "setData") == 0 || strcmp(nm, "setAction") == 0 ||
         strcmp(nm, "append") == 0)
       return obj;
+    /* SharedPreferences.edit() -> editor (encadeável); retorna o proprio obj */
+    if (strcmp(nm, "edit") == 0) return obj;
+    /* SharedPreferences.Editor.putString(key,val) -> ARMAZENA + retorna editor
+       (encadeamento putString(...).putString(...).apply()). */
+    if (strcmp(nm, "putString") == 0) {
+      void *keyo = va_arg(ap, void *), *valo = va_arg(ap, void *);
+      const char *key = resolve_jstring(keyo), *val = resolve_jstring(valo);
+      prefs_put_string(key, val);
+      debugPrintf("[PREFS] putString key='%s' (%zu bytes) ARMAZENADO\n", key, strlen(val));
+      return obj;
+    }
+    if (strcmp(nm, "putInt") == 0) {
+      void *keyo = va_arg(ap, void *); int val = va_arg(ap, int);
+      prefs_put_int(resolve_jstring(keyo), val);
+      debugPrintf("[PREFS] putInt key='%s' val=%d ARMAZENADO\n", resolve_jstring(keyo), val);
+      return obj;
+    }
+    if (strcmp(nm, "putBoolean") == 0 || strcmp(nm, "putFloat") == 0 ||
+        strcmp(nm, "putLong") == 0) return obj;  /* encadeamento */
+    if (strcmp(nm, "remove") == 0) return obj;
     /* diretorios de dados -> path REAL gravavel (persistentDataPath do Unity).
        Sem isso (=""), PlayerPrefs/save quebram -> jogo trava em "first run". */
     if (strcmp(nm, "getFilesDir") == 0 || strcmp(nm, "getExternalFilesDir") == 0 ||
@@ -364,11 +422,15 @@ static void *jni_CallObjectMethodV(void *env, void *obj, void *methodID,
         strcmp(nm, "getPath") == 0 || strcmp(nm, "getAbsolutePath") == 0 ||
         strcmp(nm, "getCanonicalPath") == 0)
       return make_jstring("/storage/roms/cuphead-recon/userdata");
-    /* SharedPreferences.getString(key, default) -> loga a chave + retorna default */
+    /* SharedPreferences.getString(key, default) -> valor ARMAZENADO se existir,
+       senão o default. Faz o round-trip do save funcionar (era sempre default). */
     if (strcmp(nm, "getString") == 0) {
       void *keystr = va_arg(ap, void *);
       void *defstr = va_arg(ap, void *);
-      debugPrintf("[PREFS] getString key='%s'\n", resolve_jstring(keystr));
+      const char *key = resolve_jstring(keystr);
+      const char *stored = prefs_get_string(key);
+      debugPrintf("[PREFS] getString key='%s' -> %s\n", key, stored ? "ARMAZENADO" : "default");
+      if (stored) return make_jstring(stored);
       return defstr ? defstr : make_jstring("");
     }
     if (strcmp(nm, "toString") == 0)
@@ -392,6 +454,17 @@ static unsigned char jni_CallBooleanMethod(void *env, void *obj,
   if (nm) {
     if (strcmp(nm, "isEmpty") == 0) return 1;  /* lista vazia */
     if (strcmp(nm, "hasNext") == 0) return 0;  /* iterator vazio */
+    /* SharedPreferences.contains(key) -> 1 se ARMAZENADO (round-trip do save) */
+    if (strcmp(nm, "contains") == 0) {
+      va_list ap; va_start(ap, methodID);
+      void *keyo = va_arg(ap, void *); va_end(ap);
+      const char *key = resolve_jstring(keyo);
+      int has = prefs_contains(key);
+      debugPrintf("[PREFS] contains key='%s' -> %d\n", key, has);
+      return (unsigned char)has;
+    }
+    /* Editor.commit() -> true (sucesso) */
+    if (strcmp(nm, "commit") == 0) return 1;
   }
   return 0;
 }
@@ -411,7 +484,9 @@ static jint jni_CallIntMethodV(void *env, void *obj, void *methodID,
     if (strcmp(nm, "getRepeatCount") == 0) return g_hk_inject.repeat;
     if (strcmp(nm, "getScanCode") == 0) return g_hk_inject.scancode;
     if (strcmp(nm, "getInt") == 0) { void *k = va_arg(ap, void *); int d = va_arg(ap, int);
-      debugPrintf("[PREFS] getInt key='%s' def=%d\n", resolve_jstring(k), d); return d; }
+      const char *key = resolve_jstring(k); int i = prefs_find(key);
+      int v = (i >= 0 && g_prefs[i].has_i) ? g_prefs[i].ival : d;
+      debugPrintf("[PREFS] getInt key='%s' def=%d -> %d\n", key, d, v); return v; }
     if (strcmp(nm, "getFlags") == 0) return g_hk_inject.flags;
     if (strcmp(nm, "getUnicodeChar") == 0) return g_hk_inject.unicode;
     if (strcmp(nm, "size") == 0) return 0; /* List/Collection vazia */
@@ -476,6 +551,16 @@ static void *jni_CallStaticObjectMethod(void *env, void *clazz,
     static int once = 0; if (!once) { once = 1;
       debugPrintf("jni_shim: getDeviceIds() -> int[%d]\n", ndev); }
     return iarr_new(ids, ndev);
+  }
+  /* encode/decode (obfuscação do SaveManager do Cuphead): IDENTIDADE — devolve a
+     própria string de entrada. Assim putString(encode(K),encode(V)) guarda K/V
+     reais e getString(encode(K))→decode dá V de volta (round-trip consistente).
+     Antes retornava &fake_result (lixo) → chave/valor viravam vazio → save não
+     persistia → SaveManager re-tentava/crashava. */
+  if (nm && (!strcmp(nm, "encode") || !strcmp(nm, "decode"))) {
+    va_list ap; va_start(ap, methodID);
+    void *arg0 = va_arg(ap, void *); va_end(ap);
+    return arg0;  /* jstring de entrada (ponteiro strdup) */
   }
   debugPrintf("jni_shim: CallStaticObjectMethod(%s)\n", nm ? nm : "?");
   static int fake_result;
