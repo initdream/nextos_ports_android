@@ -871,7 +871,10 @@ static void my_glShaderSource(unsigned sh, int count, const char *const *str,
    * geometria). TEX=só a textura (sem _vary_color, p/ ver se a cor lava). */
   /* DYSMANTLE_NOCOL: troca "_vary_color * diffuse_sample" por "diffuse_sample"
    * no shader básico — testa se a cor de vértice (luz assada) lava branco. */
-  if (count == 1 && getenv("DYSMANTLE_NOCOL") && str[0] &&
+  const char *repl = NULL;
+  if (getenv("DYSMANTLE_NOCOL")) repl = "(vec4(1.0)) * diffuse_sample"; /* 28, branco */
+  else if (getenv("DYSMANTLE_GREEN")) repl = "vec4(0,1,0,1)*diffuse_sample"; /* 28, verde */
+  if (count == 1 && repl && str[0] &&
       strstr(str[0], "_vary_color * diffuse_sample")) {
     static char nb[16384];
     size_t L = (len && len[0] > 0) ? (size_t)len[0] : strlen(str[0]);
@@ -879,7 +882,7 @@ static void my_glShaderSource(unsigned sh, int count, const char *const *str,
       memcpy(nb, str[0], L); nb[L] = 0;
       char *p = strstr(nb, "_vary_color * diffuse_sample");
       if (p) {
-        memmove(p, "(vec4(1.0)) * diffuse_sample", 28); /* 28==28, neutraliza cor */
+        memmove(p, repl, 28);
         const char *pp = nb; int nl = (int)strlen(nb);
         if (real) { real(sh, 1, &pp, &nl); return; }
       }

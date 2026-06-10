@@ -161,3 +161,18 @@ terreno) OU da textura — **nenhum dos dois fornece cor**. As bordas pretas = f
 Quick test p/ desambiguar: forçar gl_FragColor = vec4(0,1,0,1)*diffuse no shader do chão — se
 virar grama verde, tex23 é detalhe-luminância e falta o tint (hip 1); se cinza-esverdeado, tex23
 é o problema (hip 2).
+
+## ✅ SESSÃO 2 FINAL — tint verde confirma: falta a COR do terreno
+- DYSMANTLE_GREEN (tinta o shader básico de verde): o chão mostra DETALHE/padrão (relevo do
+  bonker, variação do terreno) tudo verde. **A textura tem o padrão certo (detalhe grayscale);
+  falta só a COR.** Confirma hip 1: a cor (verde do gramado) deveria vir do _vary_color, que é
+  branco (255). [imagem: ~/dysmantle-build/fb_green.png]
+- **DIAGNÓSTICO FINAL DO MUNDO BRANCO:** geometria/stride/UV/textura-detalhe TODOS corretos.
+  Só a COR do terreno está faltando: cor-de-vértice branca (255,255,255) em vez do tint verde.
+- **PRÓXIMO (cor do terreno):** descobrir por que o stream de cor do vértice do terreno
+  (this+72, escrito por GenerateStreamData) fica branco. OU se tex23 deveria ser colorida e
+  nosso fix_empty_textures.py (ETC2→JPEG) a decodificou grayscale (testar: comparar tex23 com
+  asset original; ver se o decode ETC2 das texturas de TERRENO perde cor). Provável "algo que
+  NÓS mudamos" (pak/textura) como no Bully.
+- ⚠️ infra de diag toda env-gated (default estável). hooks default-ON inofensivos: hook_genverts/
+  initbufs (format-0, reduz erros mas não muda visual), STRIDEFIX OFF.
