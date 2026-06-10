@@ -55,6 +55,12 @@ static void crash_handler(int sig, siginfo_t *info, void *uc) {
   char r[300];
   resolve_addr(pc, r, sizeof(r));
   fprintf(stderr, "  PC=%p %s\n", (void *)pc, r);
+  fprintf(stderr, "  x0=%lx x1=%lx x2=%lx x3=%lx x30=%lx\n",
+          (unsigned long)u->uc_mcontext.regs[0], (unsigned long)u->uc_mcontext.regs[1],
+          (unsigned long)u->uc_mcontext.regs[2], (unsigned long)u->uc_mcontext.regs[3],
+          (unsigned long)u->uc_mcontext.regs[30]);
+  { char rr[200]; resolve_addr(u->uc_mcontext.regs[30], rr, sizeof(rr));
+    fprintf(stderr, "  x30(LR) %s\n", rr); }
   uintptr_t fp = u->uc_mcontext.regs[29];
   for (int f = 0; f < 24 && fp; f++) {
     uintptr_t *p = (uintptr_t *)fp; uintptr_t next = p[0], lr = p[1];
