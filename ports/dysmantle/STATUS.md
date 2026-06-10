@@ -26,9 +26,29 @@ base+range, frames `game@vaddr`) + BRK-traps one-shot com tid+args na cadeia
 NXT_CreateThread→NXTI_CreateThread→thread_entry→InitializeThread. O frame #2
 `lr=0x573f24` (= retorno do `bl __stack_chk_fail` em 0x573f20) entregou o fall-through.
 
-**PRÓXIMOS PASSOS:** controles (Paddleboat falha -2002 → mapear input via shim/gptokeyb),
-áudio (Oboe→Null, sem som; avaliar opensles_shim/Oboe fix), estabilidade de gameplay,
-texturas in-game (validar ETC2 decodificadas), empacotar p/ ES + R2.
+## 🔊 SOM RESOLVIDO (2026-06-10): Oboe REAL via OpenSLES→SDL2
+1. Sem patch ret0 no SoundImpOboe::Initialize (env `DYSMANTLE_NO_OBOE=1` reativa fallback Null).
+2. jni_shim: `GetDefaultAudioStreamParameters()[I]` → jintArray {44100,1024} + GetIntArrayElements(187)/Release(195).
+3. `__system_property_get("ro.build.version.sdk")="25"` → Oboe aceita Float (≥21), sem AAudio (<27).
+4. Oboe faz `dlopen("libOpenSLES.so")` runtime → my_dlopen→SL_MAGIC, my_dlsym→slCreateEngine_shim + &SL_IID_*_v.
+5. **SL_IID com identidades DO SHIM** (ctor sl_iid_init; ANDROIDSIMPLEBUFFERQUEUE→sl_IID_BUFFERQUEUE; shim compara ponteiro).
+6. **PCM_EX float32 (formatType=4) → S16 no bq_Enqueue** (is_float, clamp ×32767).
+7. Volume: ganho master do soft-clip era 0.30 (tuning Bully) → **1.0 default**, ajustável `SLSHIM_GAIN=x` sem rebuild.
+
+## 🎮 CONTROLE USB RESOLVIDO (2026-06-10): Paddleboat NATIVO alimentado direto
+- **-2002 era `NewObject` ausente** no jni_shim (slot 28-30) → NULL → GCM_FAILURE. Fix: NewObject→fake.
+- **Registro**: chamar `Java_..._GameControllerManager_onControllerConnected(env,NULL, jintArray[7], 4×jfloatArray[48])`
+  direto do C (pb_try_connect, depois de Paddleboat_isInitialized). deviceInfo={devId 7777, vendor, product,
+  axisBitsLow=X|Y|Z|RZ|HAT_X|HAT_Y|LT|RT, 0, 1, 0}. Precisa GetIntArrayRegion(203)+GetFloatArrayRegion(205)
+  (⚠️ExceptionCheck é 228 na spec, estava errado em 205).
+- **Eventos**: SDL→`Paddleboat_processGameActivityKeyInputEvent` (PbKeyEvent 56B: devId@0,src@4,action@8,keyCode@48)
+  e `...MotionInputEvent` (PbMotionEvent 1704B: ptrCount@56, pointers@64, stride 204 = id+axes[48]float; axes:
+  0=LX 1=LY 11=RX 14=RY 15/16=HAT 17/18=triggers). src: key=0x401, motion=0x1000010. deviceId TEM que casar.
+  Retorno 1 = consumido ✓. Layouts extraídos do binário (_Static_assert nos tamanhos).
+- BACK→BUTTON_SELECT(109) (AKEYCODE_BACK=4 é especial no Paddleboat); A/B sem swap.
+
+**PRÓXIMOS PASSOS:** validar resposta in-game do controle (Felipe), lag (comparar c/ DYSMANTLE_NO_OBOE=1),
+volume fino (SLSHIM_GAIN), estabilidade gameplay longa, empacotar p/ ES + R2 (desmascarar emustation!).
 
 ## (histórico) MARCO 1: RENDERER GLES2 100% INICIALIZADO + JOGO CARREGANDO TEXTURAS
 

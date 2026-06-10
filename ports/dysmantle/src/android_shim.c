@@ -228,8 +228,11 @@ _Static_assert(sizeof(PbMotionEvent) == 1704, "PbMotionEvent layout");
 
 static int g_pb_connected = 0;
 static int (*pb_isInitialized)(void);
-static int32_t (*pb_processKey)(const void *, size_t);
-static int32_t (*pb_processMotion)(const void *, size_t);
+/* wrappers DA ENGINE (Paddleboat::ProcessInputEvent): além de processar o
+ * evento, setam o flag "teve input" [impl+64] que o FrameStart exige p/
+ * ler getControllerData. Chamar a API C crua deixa a engine cega! */
+static int32_t (*pb_processKey)(const void *);
+static int32_t (*pb_processMotion)(const void *);
 static void (*pb_onConnected)(void *, void *, void *, void *, void *, void *,
                               void *);
 
@@ -238,10 +241,10 @@ static void pb_try_connect(void) {
   if (!pb_isInitialized) {
     pb_isInitialized =
         (int (*)(void))so_find_addr_safe("Paddleboat_isInitialized");
-    pb_processKey = (int32_t(*)(const void *, size_t))so_find_addr_safe(
-        "Paddleboat_processGameActivityKeyInputEvent");
-    pb_processMotion = (int32_t(*)(const void *, size_t))so_find_addr_safe(
-        "Paddleboat_processGameActivityMotionInputEvent");
+    pb_processKey = (int32_t(*)(const void *))so_find_addr_safe(
+        "_ZN10Paddleboat17ProcessInputEventERK20GameActivityKeyEvent");
+    pb_processMotion = (int32_t(*)(const void *))so_find_addr_safe(
+        "_ZN10Paddleboat17ProcessInputEventERK23GameActivityMotionEvent");
     pb_onConnected =
         (void (*)(void *, void *, void *, void *, void *, void *, void *))
             so_find_addr_safe("Java_com_google_android_games_paddleboat_"
@@ -282,7 +285,7 @@ static void pb_send_key(int action, int keycode) {
   ev.source = PB_SRC_GAMEPAD;
   ev.action = action; /* 0=down 1=up */
   ev.keyCode = keycode;
-  int32_t r = pb_processKey(&ev, sizeof(ev));
+  int32_t r = pb_processKey(&ev);
   debugPrintf("android_shim: pb_key action=%d kc=%d -> %d\n", action, keycode,
               (int)r);
 }
@@ -305,7 +308,7 @@ static void pb_send_motion(float lx, float ly, float rx, float ry, float hx,
   ev.pointers[0].axisValues[16] = hy;  /* AXIS_HAT_Y */
   ev.pointers[0].axisValues[17] = lt;  /* AXIS_LTRIGGER */
   ev.pointers[0].axisValues[18] = rt;  /* AXIS_RTRIGGER */
-  pb_processMotion(&ev, sizeof(ev));
+  pb_processMotion(&ev);
 }
 
 /* ---- Process SDL events into input queue ---- */
@@ -330,6 +333,53 @@ static void process_sdl_events(void) {
   // Try to open a gamepad if we don't have one yet
   init_gamecontroller();
   pb_try_connect();
+
+  /* diag: loga status Paddleboat do pad 0 periodicamente */
+  if (g_pb_connected) {
+    static int poll_n = 0;
+    static int32_t (*pb_getStatus)(int32_t) = NULL;
+    if (!pb_getStatus)
+      pb_getStatus = (int32_t(*)(int32_t))so_find_addr_safe(
+          "Paddleboat_getControllerStatus");
+    if (pb_getStatus && (poll_n++ % 180) == 0)
+      debugPrintf("android_shim: PB status(0)=%d\n", (int)pb_getStatus(0));
+
+    /* força polling: FrameStart só lê getControllerData se o flag "teve
+     * input" [impl+64] estiver setado, e Update() limpa ele todo frame
+     * (a ordem engole o set feito pelos eventos injetados no pollAll).
+     * Setamos 1 a cada pump -> engine lê o pad TODO frame (modo console). */
+    static uint8_t **pb_impl = NULL;
+    if (!pb_impl) {
+      pb_impl = (uint8_t **)so_find_addr_safe("_ZN10Paddleboat14implementationE");
+      debugPrintf("android_shim: pb_impl @ %p -> %p\n", (void *)pb_impl,
+                  pb_impl ? (void *)*pb_impl : NULL);
+    }
+    if (pb_impl && *pb_impl) {
+      uint8_t *impl = *pb_impl;
+      if ((poll_n % 180) == 1)
+        debugPrintf("android_shim: impl conn0=%d dirty=%d\n", impl[16],
+                    impl[64]);
+      impl[64] = 1;
+    }
+    /* self-test autônomo: sequência de botões cronometrada (sem humano).
+     * DYSMANTLE_PB_SCRIPT="frame:action:keycode,..." (action 0=down 1=up).
+     * Ex default: aperta A no frame 300 (confirma menu inicial), depois
+     * DOWN/A pra navegar. Cada frame ~ pump do pollAll. */
+    if (getenv("DYSMANTLE_PB_SELFTEST")) {
+      struct { int f, act, kc; } seq[] = {
+        {300, 0, AKEYCODE_BUTTON_A}, {310, 1, AKEYCODE_BUTTON_A},
+        {360, 0, AKEYCODE_DPAD_DOWN}, {370, 1, AKEYCODE_DPAD_DOWN},
+        {420, 0, AKEYCODE_BUTTON_A}, {430, 1, AKEYCODE_BUTTON_A},
+        {480, 0, AKEYCODE_BUTTON_START}, {490, 1, AKEYCODE_BUTTON_START},
+      };
+      for (unsigned i = 0; i < sizeof(seq)/sizeof(seq[0]); i++)
+        if (poll_n == seq[i].f) {
+          debugPrintf("SELFTEST f=%d act=%d kc=%d\n", seq[i].f, seq[i].act,
+                      seq[i].kc);
+          pb_send_key(seq[i].act, seq[i].kc);
+        }
+    }
+  }
 
   SDL_Event e;
   while (SDL_PollEvent(&e)) {

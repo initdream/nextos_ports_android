@@ -314,13 +314,33 @@ static void brk_handler(int sig, siginfo_t *info, void *uc) {
   _exit(133);
 }
 static void install_brk_traps(void) {
-  /* cadeia de criação de thread nomeada (crash memcpy NULL n=11 "UI AUTOEXEC") */
-  arm_brk(0x5716b8, "NXT_CreateThread");        /* x0=nome, x1=func, x2=arg */
-  arm_brk(0x573e94, "NXTI_CreateThread");       /* x0=ThreadInfo* */
-  arm_brk(0x573f24, "thread_entry");            /* x0=ThreadInfo* (nova thread) */
-  arm_brk(0x571d9c, "NXTI_InitializeThread");   /* x0=ThreadInfo& */
-  arm_brk(0x75cbe4, "nString_Set");             /* x0=this(TLS emutls!), x1=src */
-  arm_brk(0x573f74, "SetThreadNamePlatform");   /* x0=data, x1=len */
+  /* a engine LÊ o controle? (one-shot: 1º hit de cada um loga e some) */
+  arm_brk(0x46fe24, "PB_getControllerData");    /* (index, data*) */
+  arm_brk(0x46f48c, "PBeng_FrameStart");        /* engine lê pads/frame */
+  arm_brk(0x46f8c0, "PBeng_CheckConnStatuses"); /* engine scaneia status */
+  arm_brk(0x46f980, "PBeng_OnControllerStatusChange"); /* callback fired! */
+}
+
+/* GOT-hook Paddleboat_getControllerData: loga se/quando a engine lê o pad */
+static int32_t (*orig_pb_getdata)(int32_t, void *) = NULL;
+static int32_t my_pb_getdata(int32_t idx, void *data) {
+  int32_t r = orig_pb_getdata ? orig_pb_getdata(idx, data) : 1;
+  static int n = 0;
+  if (n < 5 || (n % 120) == 0) {
+    uint32_t buttons = data ? *(uint32_t *)((char *)data + 8) : 0;
+    fprintf(stderr, "[PBdata] #%d idx=%d ret=%d buttons=0x%x\n", n, idx, r,
+            buttons);
+  }
+  n++;
+  return r;
+}
+static void hook_pb_getdata(void) {
+  uintptr_t slot = so_find_rel_addr_safe("Paddleboat_getControllerData");
+  if (!slot) { fprintf(stderr, "hook: GOT Paddleboat_getControllerData não achado\n"); return; }
+  uintptr_t *p = (uintptr_t *)slot;
+  orig_pb_getdata = (int32_t(*)(int32_t, void *))*p;
+  *p = (uintptr_t)my_pb_getdata;
+  fprintf(stderr, "hook: Paddleboat_getControllerData GOT %p\n", (void *)slot);
 }
 
 /* GOT-hook de NXI_GetProductValue -> força opengl_version="2.0" (caminho ES2) */
@@ -446,7 +466,16 @@ int main(int argc, char *argv[]) {
    * dimensionado p/ ES2 -> stack smash no nosso contexto Utgard (ES2).
    * Forçamos "2.0" p/ alinhar a engine ao caminho ES2. */
   hook_getproductvalue();
-  install_brk_traps();
+  /* 🎮 Paddleboat MODO CONSOLE: o FrameStart da engine só chama
+   * getControllerData quando o flag dirty (impl+64) está setado, e esse
+   * flag depende do ciclo de eventos GameActivity (que no nosso shim não
+   * casa o timing). NOP no `cbz` que pula a leitura → a engine LÊ o pad
+   * TODO frame (como um console faria). Casa com onControllerConnected
+   * em slot 0. (env DYSMANTLE_PB_NOFORCE desliga p/ debug.) */
+  if (!getenv("DYSMANTLE_PB_NOFORCE"))
+    patch_vaddr(0x46f53c, 0xd503201f); /* nop o cbz dirty-check */
+  if (getenv("DYSMANTLE_PB_DEBUG")) hook_pb_getdata();
+  if (getenv("DYSMANTLE_PB_TRAPS")) install_brk_traps();
 
   /* registra o .eh_frame do jogo no unwinder C++: o módulo é custom-loaded (não
    * dlopen), então o unwinder não o conhece -> exceções (ex: falha de textura)
