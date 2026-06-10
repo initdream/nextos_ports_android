@@ -599,6 +599,77 @@ extern int my_sigaction();  /* bionic_shims.c (ABI sigset bionic/glibc) */
    o boot (a main fica presa no nativeRender esperando o áudio progredir). */
 static void *g_fmod_env;
 static volatile int g_fmod_run = 1;
+
+/* ---- CUP_PSPY: espião do PreloadManager (muro frame 111) ----
+ * RE (libunity, offsets confirmados no disasm):
+ *   [mgr+208/+224] = fila de PRELOAD  (array/count) — consumida pela thread
+ *                    UnityPreload (entry 0x8736cc): roda op->vt[+80] em bg e
+ *                    seta op[72]=1; move a op p/ fila de integração (push 0x873790).
+ *   [mgr+240/+256] = fila de INTEGRAÇÃO (array/count) — consumida pela main em
+ *                    UpdatePreloadingSingleStep (0x8733a8): chama op->vt[+88]
+ *                    (timesliced); o POP ([+256]-- em 0x873500) SÓ acontece se
+ *                    vt[+88] retornar true E op[72]==1.
+ *   HasPendingOperations (0x8739c4) = lock(mgr+0x78); [+224]||[+256]; unlock.
+ *   WaitForAllAsyncOperationsToComplete (0x873a90) gira enquanto pendente.
+ * O spy substitui 0x8739c4 por uma réplica C (mesma semântica, mesmos locks
+ * 0x8f5d0c/0x8f5d14) que captura o ponteiro do mgr; uma thread despeja as filas
+ * (op, vtable, flags, alvos de vt[+80/+88/+112]) p/ identificar a op presa. */
+#define UN_HASPEND   0x8739c4
+#define UN_MTX_LOCK  0x8f5d0c
+#define UN_MTX_UNLK  0x8f5d14
+static void *volatile g_preload_mgr;
+static int my_haspending(void *mgr) {
+  g_preload_mgr = mgr;
+  void (*lk)(void *) = (void (*)(void *))(g_unity_base + UN_MTX_LOCK);
+  void (*ul)(void *) = (void (*)(void *))(g_unity_base + UN_MTX_UNLK);
+  lk((char *)mgr + 0x78);
+  uintptr_t pq = *(uintptr_t *)((char *)mgr + 224);
+  uintptr_t iq = *(uintptr_t *)((char *)mgr + 256);
+  ul((char *)mgr + 0x78);
+  return (pq || iq) ? 1 : 0;
+}
+static void pspy_dump_op(const char *qn, unsigned i, uintptr_t op) {
+  uintptr_t vt = *(uintptr_t *)op;
+  uintptr_t vt_off = (vt >= g_unity_base) ? vt - g_unity_base : vt;
+  uintptr_t f80 = *(uintptr_t *)(vt + 80), f88 = *(uintptr_t *)(vt + 88);
+  uintptr_t f112 = *(uintptr_t *)(vt + 112);
+  fprintf(stderr,
+          "[PSPY]  %s[%u] op=%lx vt=u+0x%lx done72=%d w64=%d w68=%d "
+          "bg(+80)=u+0x%lx integ(+88)=u+0x%lx q(+112)=u+0x%lx\n",
+          qn, i, op, vt_off, *(int *)(op + 72), *(int *)(op + 64),
+          *(int *)(op + 68), f80 - g_unity_base, f88 - g_unity_base,
+          f112 - g_unity_base);
+  /* primeiros 0xC0 bytes da op (estado interno: progress/flags/ponteiros) */
+  for (int k = 0; k < 24; k += 4)
+    fprintf(stderr, "[PSPY]   +%02x: %016lx %016lx %016lx %016lx\n", k * 8,
+            ((uintptr_t *)op)[k], ((uintptr_t *)op)[k + 1],
+            ((uintptr_t *)op)[k + 2], ((uintptr_t *)op)[k + 3]);
+}
+static void *preload_spy_thread(void *arg) {
+  (void)arg;
+  fprintf(stderr, "[PSPY] thread ativa (2s)\n");
+  while (g_fmod_run) {
+    sleep(2);
+    char *m = (char *)g_preload_mgr;
+    if (!m) continue;
+    /* leitura SEM lock (racy, mas nunca bloqueia/deadlocka o diagnóstico) */
+    uintptr_t pq_a = *(uintptr_t *)(m + 208), pq_n = *(uintptr_t *)(m + 224);
+    uintptr_t iq_a = *(uintptr_t *)(m + 240), iq_n = *(uintptr_t *)(m + 256);
+    /* job-scheduler global (libunity bss 0x12b9380; o gate da integração só passa
+       quando estes 3 contadores estão <=0 — 0x6cdad0). +0x70=jobs / +0x168 / +0x16c */
+    void *jm = *(void **)(g_unity_data + 0xd3380);
+    if (jm) fprintf(stderr, "[PSPY] jobmgr=%p +70=%d +168=%d +16c=%d\n", jm,
+                    *(int *)((char *)jm + 0x70), *(int *)((char *)jm + 0x168),
+                    *(int *)((char *)jm + 0x16c));
+    fprintf(stderr, "[PSPY] mgr=%p preloadQ=%lu integQ=%lu\n", m, pq_n, iq_n);
+    for (unsigned i = 0; i < pq_n && i < 2; i++)
+      if (((uintptr_t *)pq_a)[i]) pspy_dump_op("PQ", i, ((uintptr_t *)pq_a)[i]);
+    for (unsigned i = 0; i < iq_n && i < 2; i++)
+      if (((uintptr_t *)iq_a)[i]) pspy_dump_op("IQ", i, ((uintptr_t *)iq_a)[i]);
+    dbg_sync();
+  }
+  return NULL;
+}
 /* TESTE CUP_PRELOAD_TICK: posta periodicamente os sems em que threads não-main
    bloqueiam (acorda a UnityPreload p/ processar o item pendente da fila). */
 static void *preload_tick_thread(void *arg) {
@@ -632,6 +703,8 @@ int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IONBF, 0); setvbuf(stderr, NULL, _IONBF, 0);
   g_main_tid = (int)syscall(SYS_gettid);  /* p/ o sem_shim distinguir main de workers */
   if (getenv("CUP_SEMPOLL")) sh_sem_set_poll(atoi(getenv("CUP_SEMPOLL")));  /* polling do sem_wait */
+  { extern void cond_set_poll(int);  /* polling do pthread_cond_wait (lost-wakeup futex) */
+    if (getenv("CUP_CONDPOLL")) cond_set_poll(atoi(getenv("CUP_CONDPOLL"))); }
 
   /* log persistente: stderr -> debug.log (unbuffered + fsync nos marcos =
      sobrevive a hang/power-cycle do device). CUP_NOLOGFILE=1 desativa. */
@@ -801,6 +874,29 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[NOGFXWAIT] 0x8739c4 -> mov w0,#0; ret\n");
   }
 
+  /* CUP_PSPY: substitui HasPendingOperations (0x8739c4) pela réplica C que
+     captura o ponteiro do PreloadManager (diagnóstico do muro frame 111). */
+  if (getenv("CUP_PSPY")) {
+    extern void so_make_text_writable(void), so_make_text_executable(void);
+    so_make_text_writable();
+    hook_arm64((uintptr_t)text_base + UN_HASPEND, (uintptr_t)my_haspending);
+    so_make_text_executable(); so_flush_caches();
+    fprintf(stderr, "[PSPY] hook HasPendingOperations (0x%x) instalado\n", UN_HASPEND);
+  }
+  /* CUP_FORCEINTEG: dentro de IntegrateOp (0x872758), o gate (0x871844, budget
+     time-slice) é checado em 0x872774 `tbz w0,#0, 872810` → se budget recusa,
+     integração aborta retornando 0. Em WaitForAll (force-complete) o budget
+     DEVERIA ser ignorado. NOP nesse branch: o gate ainda RODA (efeitos colaterais
+     do predictor preservados), só o VEREDITO é ignorado → integração prossegue.
+     Cirúrgico (só o path de integração; não mexe no gate compartilhado). */
+  if (getenv("CUP_FORCEINTEG")) {
+    extern void so_make_text_writable(void), so_make_text_executable(void);
+    so_make_text_writable();
+    *(uint32_t *)((uintptr_t)text_base + 0x872774) = 0xd503201fu; /* NOP */
+    so_make_text_executable(); so_flush_caches();
+    fprintf(stderr, "[FORCEINTEG] 0x872774 (gate-fail branch) -> NOP\n");
+  }
+
   fprintf(stderr, "[F0] init_array...\n");
   so_execute_init_array();
   fprintf(stderr, "[F0] libunity init OK\n");
@@ -931,6 +1027,10 @@ int main(int argc, char **argv) {
   if (getenv("CUP_PRELOAD_TICK")) {
     pthread_t tt; pthread_create(&tt, NULL, preload_tick_thread, NULL);
     pthread_detach(tt);
+  }
+  if (getenv("CUP_PSPY")) {
+    pthread_t st; pthread_create(&st, NULL, preload_spy_thread, NULL);
+    pthread_detach(st);
   }
 
   void *render = jni_find_native("nativeRender");

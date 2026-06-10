@@ -62,8 +62,23 @@ int pthread_cond_destroy_fake(void **slot) {
 }
 int pthread_cond_signal_fake(void **slot) { return pthread_cond_signal(cond_get(slot)); }
 int pthread_cond_broadcast_fake(void **slot) { return pthread_cond_broadcast(cond_get(slot)); }
+/* CUP_CONDPOLL=ms: defesa contra lost-wakeup em condition variables (mesma classe
+   do fix CUP_SEMPOLL p/ semáforos). Em vez de esperar p/ sempre, faz timedwait
+   curto e RETORNA (acordada espúria, permitida pelo POSIX) → o chamador re-adquire
+   o mutex e re-checa seu predicado no while(); se não pronto, volta a esperar.
+   Isso acorda periodicamente a UnityPreload/Workers que ficam presas no futex. */
+#include <time.h>
+static long g_cond_poll_ms = 0;   /* 0 = wait infinito normal */
+void cond_set_poll(int ms) { g_cond_poll_ms = ms; }
 int pthread_cond_wait_fake(void **cslot, void **mslot) {
-  return pthread_cond_wait(cond_get(cslot), mtx_get(mslot));
+  if (g_cond_poll_ms <= 0)
+    return pthread_cond_wait(cond_get(cslot), mtx_get(mslot));
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  ts.tv_nsec += g_cond_poll_ms * 1000000L;
+  if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+  int r = pthread_cond_timedwait(cond_get(cslot), mtx_get(mslot), &ts);
+  return (r == ETIMEDOUT) ? 0 : r;   /* timeout vira wakeup espúrio */
 }
 int pthread_cond_timedwait_fake(void **cslot, void **mslot, const struct timespec *ts) {
   return pthread_cond_timedwait(cond_get(cslot), mtx_get(mslot), ts);
