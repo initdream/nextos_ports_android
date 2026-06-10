@@ -110,10 +110,12 @@ struct thr_boot { void *(*start)(void *); void *arg; };
 static void *thr_trampoline(void *p) {
   struct thr_boot b = *(struct thr_boot *)p;
   free(p);
-  void *mem = mmap(NULL, SIGSTKSZ, PROT_READ | PROT_WRITE,
+  size_t asz = 256 * 1024;   /* fixo e generoso (SIGSTKSZ pode ser minúsculo/dinâmico
+                                e o on_crash dumpa bastante → estouraria) */
+  void *mem = mmap(NULL, asz, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (mem != MAP_FAILED) {
-    stack_t ss; ss.ss_sp = mem; ss.ss_size = SIGSTKSZ; ss.ss_flags = 0;
+    stack_t ss; ss.ss_sp = mem; ss.ss_size = asz; ss.ss_flags = 0;
     sigaltstack(&ss, NULL);
   }
   return b.start(b.arg);

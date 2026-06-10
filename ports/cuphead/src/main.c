@@ -216,6 +216,30 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
   /* x20/x22/x23/x24: candidatos a 'this'/objeto pai */
   crash_classify("x20", uc->uc_mcontext.regs[20]);
   crash_classify("x22", uc->uc_mcontext.regs[22]);
+  /* SITE DA CHAMADA: lr = retorno após o `blr` que pulou p/ 0x7f10000004.
+     Classifica lr e dumpa as 4 instruções em lr-12..lr (acha o blr Xn + o ldr
+     que carregou o ponteiro lixo: revela DE ONDE vem 0x7f10000004). */
+  crash_classify("lr(call-site)", lr);
+  if (addr_readable((lr - 16) & ~0x3UL)) {
+    fprintf(stderr, "[CR] insns @lr-16..lr:\n");
+    for (uintptr_t a = (lr - 16) & ~0x3UL; a <= lr; a += 4)
+      fprintf(stderr, "[CR]   0x%lx: %08x%s\n", (unsigned long)a,
+              *(uint32_t *)a, a == lr - 4 ? "  <- blr (chamou o lixo)" : "");
+    dbg_sync();
+  }
+  /* alvo dos ponteiros da singleton (campos = 0x7f..cXX espaçados 4B): o que há lá? */
+  if (g_unity_data && addr_readable(g_unity_data + 0xd18)) {
+    uintptr_t sgl = *(uintptr_t *)(g_unity_data + 0xd18);
+    if (addr_readable(sgl)) {
+      uintptr_t tgt = *(uintptr_t *)sgl;       /* singleton[0] = 1º ponteiro */
+      crash_classify("singleton[0]_target", tgt);
+      crash_dump_qwords("sgl[0]_tgt", tgt & ~0xFUL, 8);
+    }
+  }
+  /* x3/x9/x27: ponteiros 0x7f14.. recorrentes — que região? */
+  crash_classify("x3", uc->uc_mcontext.regs[3]);
+  crash_classify("x9", uc->uc_mcontext.regs[9]);
+  crash_classify("x17", uc->uc_mcontext.regs[17]);
   fprintf(stderr, "[CR] ==== fim ====\n");
   dbg_sync();
   _exit(128 + sig);
@@ -935,7 +959,7 @@ int main(int argc, char **argv) {
   }
   /* sigaltstack: p/ o handler reportar STACK OVERFLOW (SIGSEGV na guard page →
      sem espaço na pilha normal p/ rodar o handler → morte silenciosa). */
-  { static char altstk[64 * 1024]; stack_t ss = {0};
+  { static char altstk[256 * 1024]; stack_t ss = {0};
     ss.ss_sp = altstk; ss.ss_size = sizeof altstk; ss.ss_flags = 0;
     sigaltstack(&ss, NULL); }
   struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = on_crash; sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
