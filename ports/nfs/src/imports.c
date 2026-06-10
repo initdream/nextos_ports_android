@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <malloc.h>
 #include <string.h>
 
 #include "so_util.h"
@@ -73,6 +74,19 @@ __attribute__((constructor)) static void init_ctype(void) {
   }
 }
 
+/* ---- malloc com PADDING (+64B) ----
+ * A engine NFS faz pequenos overflows que o malloc do bionic tolera (layout de
+ * chunk diferente) mas o glibc detecta ("malloc(): invalid size"). Over-alocar
+ * absorve o overflow na folga, sem corromper a metadata do glibc. free/realloc
+ * usam o mesmo ponteiro base → consistentes. */
+#define NFS_PAD 64
+static void *pad_malloc(size_t n) { return malloc(n + NFS_PAD); }
+static void *pad_calloc(size_t a, size_t b) {
+  size_t t = a * b; void *p = malloc(t + NFS_PAD); if (p) memset(p, 0, t + NFS_PAD); return p;
+}
+static void *pad_realloc(void *p, size_t n) { return realloc(p, n + NFS_PAD); }
+static void *pad_memalign(size_t al, size_t n) { return memalign(al, n + NFS_PAD); }
+
 /* ---- stubs ---- */
 static int b_dso_handle;                       /* __dso_handle = endereço dummy */
 static void *b_cxa_type_match(void *a, void *b, char c) { (void)a; (void)b; (void)c; return (void *)0; }
@@ -83,6 +97,10 @@ static int abm_lock(void *env, void *bmp, void **pix) { (void)env; (void)bmp; if
 static int abm_unlock(void *env, void *bmp) { (void)env; (void)bmp; return 0; }
 
 DynLibFunction nfs_shims[] = {
+    {"malloc", (uintptr_t)pad_malloc},
+    {"calloc", (uintptr_t)pad_calloc},
+    {"realloc", (uintptr_t)pad_realloc},
+    {"memalign", (uintptr_t)pad_memalign},
     {"__sF", (uintptr_t)bionic_sF},
     {"fprintf", (uintptr_t)w_fprintf}, {"vfprintf", (uintptr_t)w_vfprintf},
     {"fwrite", (uintptr_t)w_fwrite}, {"fputs", (uintptr_t)w_fputs},

@@ -423,10 +423,20 @@ void so_execute_init_array(void) {
     if (strcmp(sh_name, ".init_array") == 0) {
       int (**init_array)() =
           (void *)((uintptr_t)text_virtbase + sec_hdr[i].sh_addr);
+      int total = (int)(sec_hdr[i].sh_size / 4);
+      int dbg = getenv("NFS_INITDBG") != NULL;
       /* ponteiros de 4 bytes no armhf */
-      for (int j = 0; j < (int)(sec_hdr[i].sh_size / 4); j++) {
-        if (init_array[j] != 0)
+      for (int j = 0; j < total; j++) {
+        if (init_array[j] != 0) {
+          if (dbg) {
+            fprintf(stderr, "[init %d/%d] ctor=%p\n", j, total, (void *)init_array[j]);
+            fflush(stderr);
+          }
           init_array[j]();
+          if (dbg) { /* sonda: detecta corrupção logo após o construtor j */
+            void *p = malloc(128 * 1024); if (p) free(p);
+          }
+        }
       }
     }
   }

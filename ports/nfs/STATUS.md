@@ -51,3 +51,17 @@
   pra não voltar no F2+ (nativeOnCreate alocará muito). debugPrintf alternativo p/ logs sem setvbuf.
 - ⚠️ device nextos-87 caiu após ~15 runs (sem rota) — rebootar/power-cycle (lição
   [[reference]] DYSMANTLE: device degrada em sessões longas de teste).
+
+## F2 — CAUSA-RAIZ da heap corruption ACHADA: construtor 11 do libapp
+- Instrumentei so_execute_init_array (NFS_INITDBG): **construtor 11/189 do libapp (vaddr 0x68be0/
+  file 0x68bfc) corrompe o heap glibc**. Construtores 0-10 passam a sonda; o 11 falha.
+- Desmontado: o ctor 11 constrói uma std::string ("AI/Avoidance...") — chama um alocador
+  (0x3de128) e escreve ~13 bytes. **Overflow pequeno** que o malloc do bionic tolera (layout de
+  chunk diferente) mas o glibc detecta ("malloc(): invalid size (unsorted)").
+- **FIX (proven em so-loaders): malloc/calloc/realloc/memalign com PADDING (+64B)** em
+  src/imports.c (pad_malloc etc.) → absorve o overflow do engine na folga, sem corromper a
+  metadata do glibc. free/realloc usam o mesmo ponteiro base (consistentes).
+- ⚠️ NÃO TESTADO (device caiu — roteador reiniciou, possível mudança de IP DHCP). Build OK.
+  PRÓXIMO: quando o device voltar, testar NFS_INIT=1 (init_array completa sem corromper?) →
+  depois nativeOnCreate → EGL/render.
+- init_array agora DEFAULT-OFF (NFS_INIT=1 liga); com o padding, a meta é reativar por default.
