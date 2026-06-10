@@ -1186,6 +1186,7 @@ int main(int argc, char **argv) {
   fprintf(stderr, "[F0] resolvendo %zu imports...\n", dynlib_numfunctions);
   if (so_resolve(dynlib_functions, dynlib_numfunctions, 0) < 0) { fprintf(stderr, "resolve FALHOU\n"); return 1; }
   ctype_init(); ctype_resolve();   /* _ctype_/_tolower_tab_/_toupper_tab_ (bionic) p/ libunity */
+  if (so_register_eh_frame() == 0) fprintf(stderr, "[EH] .eh_frame libunity registrado (exceções C++)\n");
   /* PATCH-GOT: os imports NDK nao estao em dynlib_functions -> set_import foi
    * no-op e ficaram UNRESOLVED (GOT lixo). Sobrescreve os slots DIRETO. */
   patch_got("ANativeWindow_fromSurface", (void *)my_aw_fromSurface);
@@ -1351,6 +1352,7 @@ int main(int argc, char **argv) {
     so_relocate();
     so_resolve(dynlib_functions, dynlib_numfunctions, 0);
     ctype_resolve();   /* _ctype_/_tolower_tab_/_toupper_tab_ p/ libil2cpp tb */
+    if (so_register_eh_frame() == 0) fprintf(stderr, "[EH] .eh_frame libil2cpp registrado (exceções C++)\n");
     /* il2cpp abre o global-metadata.dat via open() -> intercepta p/ redirecionar.
        patch_got opera no modulo ATIVO (=il2cpp agora). Tb dlopen/dlsym/log. */
     patch_got("open", (void *)my_open);

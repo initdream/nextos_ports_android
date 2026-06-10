@@ -29,21 +29,16 @@ void so_free_temp(void);
 int so_load(const char *filename, void *base, size_t max_size);
 int so_relocate(void);
 int so_resolve(DynLibFunction *funcs, int num_funcs, int taint_missing_imports);
-int so_register_eh_frame(void);  /* registra .eh_frame do módulo ativo (exceções C++) */
+DynLibFunction *so_snapshot_symbols(int *out_count);
 void so_execute_init_array(void);
 uintptr_t so_find_addr(const char *symbol);
 uintptr_t so_find_addr_safe(const char *symbol);
 uintptr_t so_find_addr_rx(const char *symbol);
 uintptr_t so_find_rel_addr(const char *symbol);
 uintptr_t so_find_rel_addr_safe(const char *symbol);
-int so_patch_got(const char *symbol, uintptr_t val);
 DynLibFunction *so_find_import(DynLibFunction *funcs, int num_funcs,
                                const char *name);
 void so_finalize(void);
 int so_unload(void);
-
-typedef struct so_module so_module;
-so_module *so_save(void);
-void so_use(so_module *m);
 
 #endif

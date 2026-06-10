@@ -344,6 +344,24 @@ int so_relocate(void) {
   return 0;
 }
 
+/* registra o .eh_frame do módulo ATIVO com o runtime de exceções C++ (libgcc).
+ * Nossos módulos são MAPEADOS MANUALMENTE (não via dlopen) -> o dl_iterate_phdr
+ * do unwinder NÃO os vê -> exceção C++ não acha o landing pad -> std::terminate
+ * -> abort (visto no asset loading do il2cpp). __register_frame(.eh_frame) resolve
+ * (mesma técnica de JIT/código gerado em runtime). */
+extern void __register_frame(void *begin) __attribute__((weak));
+int so_register_eh_frame(void) {
+  if (!&__register_frame) return -1;
+  for (int i = 0; i < elf_hdr->e_shnum; i++) {
+    if (!strcmp(shstrtab + sec_hdr[i].sh_name, ".eh_frame") && sec_hdr[i].sh_size) {
+      void *eh = (void *)((uintptr_t)text_base + sec_hdr[i].sh_addr);
+      __register_frame(eh);
+      return 0;
+    }
+  }
+  return -1;
+}
+
 int so_resolve(DynLibFunction *funcs, int num_funcs,
                int taint_missing_imports) {
   for (int i = 0; i < elf_hdr->e_shnum; i++) {
