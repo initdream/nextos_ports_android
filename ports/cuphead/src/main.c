@@ -246,16 +246,28 @@ __asm__(
   "  br x17\n"
 );
 extern void onew_spy_tramp(void);
+static int g_dllog = 0;
 static void *my_dlopen(const char *nm, int flag) {
-  if (nm && strstr(nm, "libil2cpp")) { fprintf(stderr, "[DLOPEN] %s -> il2cpp module\n", nm); return &g_dl_il2cpp; }
+  if (g_dllog) fprintf(stderr, "[dlopen] \"%s\"\n", nm ? nm : "(null)");
+  /* il2cpp: nosso modulo ja' carregado (F1). Casa "il2cpp" em qualquer forma. */
+  if (nm && strstr(nm, "il2cpp")) { fprintf(stderr, "[DLOPEN] %s -> il2cpp module\n", nm); return &g_dl_il2cpp; }
   if (!nm || !nm[0] || strstr(nm, "libc") || strstr(nm, "libunity") || strstr(nm, "libmain"))
     return &g_dl_self;
   void *h = dlopen(nm, flag); return h ? h : &g_dl_self;
 }
 static void *my_dlsym(void *h, const char *nm) {
   if (!nm) return NULL;
+  if (g_dllog) fprintf(stderr, "[dlsym] h=%p \"%s\"\n", h, nm);
   if (!strcmp(nm, "glGetString")) return (void *)my_glGetString;
   if (nm[0] == 'e' && nm[1] == 'g' && nm[2] == 'l') { void *p = egl_route(nm); if (p) return p; }
+  /* qualquer simbolo il2cpp_* resolve no modulo il2cpp (qualquer handle) */
+  if (!strncmp(nm, "il2cpp", 6) && g_m_il2cpp) {
+    so_module *c = so_save(); so_use(g_m_il2cpp);
+    void *p = (void *)so_find_addr_safe(nm);
+    so_use(c); free(c);
+    fprintf(stderr, "[DLSYM:il2cpp*] %s -> %p\n", nm, p);
+    return p;
+  }
   if (h == &g_dl_il2cpp && g_m_il2cpp) {
     so_module *c = so_save(); so_use(g_m_il2cpp);
     void *p = (void *)so_find_addr_safe(nm);
@@ -343,6 +355,18 @@ static void set_import(const char *name, void *fn) {
     if (!strcmp(dynlib_functions[i].symbol, name)) { dynlib_functions[i].func = (uintptr_t)fn; return; }
 }
 
+/* patch_got: sobrescreve o slot da GOT DIRETO (apos so_resolve). Necessario p/
+ * simbolos que NAO estao em dynlib_functions (NDK: ANativeWindow_*, __android_log_*,
+ * ASensor*, ...) — p/ esses set_import e' no-op e ficam UNRESOLVED com GOT lixo. */
+static int patch_got(const char *name, void *fn) {
+  int n = so_patch_got(name, (uintptr_t)fn);
+  if (!n) fprintf(stderr, "[GOT] %s: 0 slots (nao achado)\n", name);
+  return n;
+}
+
+/* stubs NDK no-op (sensores/looper/profiler google) — devolvem 0/NULL */
+static long ndk_stub0(void) { return 0; }
+
 extern int my_sigaction();  /* bionic_shims.c (ABI sigset bionic/glibc) */
 
 int main(int argc, char **argv) {
@@ -403,8 +427,51 @@ int main(int argc, char **argv) {
 
   fprintf(stderr, "[F0] resolvendo %zu imports...\n", dynlib_numfunctions);
   if (so_resolve(dynlib_functions, dynlib_numfunctions, 0) < 0) { fprintf(stderr, "resolve FALHOU\n"); return 1; }
+  /* PATCH-GOT: os imports NDK nao estao em dynlib_functions -> set_import foi
+   * no-op e ficaram UNRESOLVED (GOT lixo). Sobrescreve os slots DIRETO. */
+  patch_got("ANativeWindow_fromSurface", (void *)my_aw_fromSurface);
+  patch_got("ANativeWindow_setBuffersGeometry", (void *)my_aw_setgeom);
+  patch_got("ANativeWindow_getWidth", (void *)my_aw_getWidth);
+  patch_got("ANativeWindow_getHeight", (void *)my_aw_getHeight);
+  patch_got("ANativeWindow_getFormat", (void *)my_aw_getFormat);
+  patch_got("ANativeWindow_acquire", (void *)my_aw_noop);
+  patch_got("ANativeWindow_release", (void *)my_aw_noop);
+  patch_got("__android_log_print", (void *)my_alog_print);
+  patch_got("__android_log_write", (void *)my_alog_write);
+  patch_got("__android_log_vprint", (void *)ndk_stub0);
+  /* dl* estavam COMENTADOS em imports.gen.c -> set_import foi no-op e o dlopen@plt
+     caiu no glibc REAL (falha ao carregar .so Android). Sem isso o il2cpp nao carrega. */
+  patch_got("dlopen", (void *)my_dlopen);
+  patch_got("dlsym", (void *)my_dlsym);
+  patch_got("dlerror", (void *)my_dlerror);
+  patch_got("dlclose", (void *)my_dlclose);
+  patch_got("dladdr", (void *)my_dladdr);
+  /* sensores/looper/profiler google: stub no-op (nao usados no path do gfx) */
+  const char *ndk_noop[] = {
+    "ALooper_forThread","ALooper_prepare","ASensorManager_getInstance",
+    "ASensorManager_createEventQueue","ASensorManager_getSensorList",
+    "ASensorManager_getDefaultSensor","ASensorManager_destroyEventQueue",
+    "ASensorEventQueue_hasEvents","ASensorEventQueue_getEvents",
+    "ASensorEventQueue_enableSensor","ASensorEventQueue_disableSensor",
+    "ASensorEventQueue_setEventRate","ASensor_getType","ASensor_getResolution",
+    "ASensor_getMinDelay","ASensor_getName","ASensor_getVendor",
+    "__google_potentially_blocking_region_begin",
+    "__google_potentially_blocking_region_end", NULL };
+  for (int i = 0; ndk_noop[i]; i++) patch_got(ndk_noop[i], (void *)ndk_stub0);
+
+  /* CUP_FORCEIL2: o helper "load library by name" do Unity (0x357938) faz o
+     System.load do il2cpp via JNI -> falha no nosso ambiente ("Failed to load
+     Il2CPP"). Mas NOS ja' carregamos libil2cpp.so no F1. Forca retorno 1 (sucesso):
+       mov w0,#1 ; ret  */
+  if (getenv("CUP_FORCEIL2")) {
+    *(uint32_t *)((uintptr_t)text_base + 0x357938) = 0x52800020u; /* mov w0,#1 */
+    *(uint32_t *)((uintptr_t)text_base + 0x35793c) = 0xd65f03c0u; /* ret */
+    fprintf(stderr, "[FORCEIL2] 0x357938 -> mov w0,#1; ret\n");
+  }
+
   so_finalize(); so_flush_caches();
   g_alloc_ub = (uintptr_t)text_base;
+  if (getenv("CUP_DLLOG")) g_dllog = 1;
 
   /* __stack_chk_fail nao esta na tabela -> patch direto no slot da GOT */
   if (getenv("CUP_NOSCF")) {
@@ -475,6 +542,17 @@ int main(int argc, char **argv) {
   }
   if ((fn = jni_find_native("nativeRecreateGfxState"))) {
     mm_probe("pre-RecreateGfxState");
+    /* TESTE: anula o instalador de signal-handlers do Unity (0x360af8) com RET.
+       Esse caminho (sigaction QUERY -> map RB-tree de old-handlers via operator-new)
+       e' onde o canario estoura. Nao precisamos dos handlers do Unity (temos on_crash). */
+    if (getenv("CUP_NOSIGINST")) {
+      extern void so_make_text_writable(void), so_make_text_executable(void);
+      so_make_text_writable();
+      *(uint32_t *)(g_alloc_ub + 0x360af8) = 0xd65f03c0u;  /* RET */
+      so_make_text_executable();
+      so_flush_caches();
+      fprintf(stderr, "[NOSIGINST] 0x360af8 (install handlers) -> RET\n");
+    }
     /* spy: hook na entrada do operator-new (0x3cbf2c) p/ capturar args da
        chamada que estoura o canario. Instala AQUI p/ pegar so' o gfx path. */
     if (getenv("CUP_ASPY")) {

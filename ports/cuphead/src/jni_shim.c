@@ -274,6 +274,20 @@ static void *jni_CallObjectMethodV(void *env, void *obj, void *methodID,
   if (nm) {
     if (strcmp(nm, "getPackageName") == 0)
       return make_jstring("com.teamcherry.hollowknight");
+    /* ClassLoader.findLibrary("il2cpp") -> path real do .so (ja' carregamos no F1,
+       mas o UnityPlayer valida via findLibrary+System.load senao "Failed to load Il2CPP") */
+    if (strcmp(nm, "findLibrary") == 0) {
+      void *libname = va_arg(ap, void *);
+      const char *ln = resolve_jstring(libname);
+      debugPrintf("jni_shim: findLibrary(%s)\n", ln);
+      if (ln && strstr(ln, "il2cpp"))
+        return make_jstring(ASSET_BASE "libil2cpp.so");
+      if (ln && strstr(ln, "main"))
+        return make_jstring(ASSET_BASE "libmain.so");
+      if (ln && strstr(ln, "unity"))
+        return make_jstring(ASSET_BASE "libunity.so");
+      return make_jstring("");
+    }
     /* AssetManager bridge */
     if (strcmp(nm, "getAssets") == 0) return &g_assetmgr;
     /* listas vazias (queryIntentActivities, etc.) + iterator vazio */

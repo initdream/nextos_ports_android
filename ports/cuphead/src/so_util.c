@@ -467,6 +467,28 @@ uintptr_t so_find_rel_addr(const char *symbol) {
   return 0;
 }
 
+/* patcheia TODOS os slots da GOT (GLOB_DAT + JUMP_SLOT) de um simbolo.
+ * so_find_rel_addr_safe so' devolve o 1o; o PLT pode usar outro. Retorna a contagem. */
+int so_patch_got(const char *symbol, uintptr_t val) {
+  int n = 0;
+  for (int i = 0; i < elf_hdr->e_shnum; i++) {
+    char *sh_name = shstrtab + sec_hdr[i].sh_name;
+    if (strcmp(sh_name, ".rela.dyn") == 0 || strcmp(sh_name, ".rela.plt") == 0) {
+      Elf64_Rela *rels = (Elf64_Rela *)((uintptr_t)text_base + sec_hdr[i].sh_addr);
+      for (int j = 0; j < (int)(sec_hdr[i].sh_size / sizeof(Elf64_Rela)); j++) {
+        Elf64_Sym *sym = &syms[ELF64_R_SYM(rels[j].r_info)];
+        int type = ELF64_R_TYPE(rels[j].r_info);
+        if ((type == R_AARCH64_GLOB_DAT || type == R_AARCH64_JUMP_SLOT) &&
+            strcmp(dynstrtab + sym->st_name, symbol) == 0) {
+          *(uintptr_t *)((uintptr_t)text_base + rels[j].r_offset) = val;
+          n++;
+        }
+      }
+    }
+  }
+  return n;
+}
+
 uintptr_t so_find_rel_addr_safe(const char *symbol) {
   for (int i = 0; i < elf_hdr->e_shnum; i++) {
     char *sh_name = shstrtab + sec_hdr[i].sh_name;
