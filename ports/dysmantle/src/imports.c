@@ -61,6 +61,32 @@ static int    b_sys_prop_get(const char *name, char *value) {
 /* __emutls_get_address vem do libgcc (linkado estático no loader). */
 extern void *__emutls_get_address(void *);
 
+/* bionic __sF[3] = stdin/out/err (libc++ usa p/ std::cerr/cout). UNRESOLVED ->
+ * std::cerr na cadeia de erro do bitmap -> PLT loop/crash. Provemos o array +
+ * wrappers que traduzem &bionic_sF[i] -> stream real. (do bully) */
+static char bionic_sF[3][512];
+static FILE *map_sF(void *fp) {
+  if (fp == (void *)&bionic_sF[0]) return stdin;
+  if (fp == (void *)&bionic_sF[1]) return stdout;
+  if (fp == (void *)&bionic_sF[2]) return stderr;
+  return (FILE *)fp;
+}
+static int w_fprintf(void *fp, const char *fmt, ...) {
+  va_list ap; va_start(ap, fmt); int r = vfprintf(map_sF(fp), fmt, ap); va_end(ap); return r;
+}
+static int w_vfprintf(void *fp, const char *fmt, va_list ap) { return vfprintf(map_sF(fp), fmt, ap); }
+static size_t w_fwrite(const void *p, size_t s, size_t n, void *fp) { return fwrite(p, s, n, map_sF(fp)); }
+static int w_fputs(const char *str, void *fp) { return fputs(str, map_sF(fp)); }
+static int w_fputc(int c, void *fp) { return fputc(c, map_sF(fp)); }
+static int w_fflush(void *fp) { return fflush(fp ? map_sF(fp) : NULL); }
+static void b_set_abort_message(const char *m) { fprintf(stderr, "[abort_msg] %s\n", m ? m : "?"); }
+
+/* setjmp/longjmp: o bionic NÃO salva a sigmask por padrão; mapeamos pros
+ * _setjmp/_longjmp do glibc (também sem sigmask) p/ casar a ABI. O jogo usa
+ * isso no error-handling do libjpeg (ImageWriterJPEG) -> sem isso, crash. */
+extern int _setjmp(void *);
+extern void _longjmp(void *, int) __attribute__((noreturn));
+
 /* ---------------- ANativeWindow (faltam no android_shim) ---------------- */
 #define DYS_W 1280
 #define DYS_H 720
@@ -329,8 +355,16 @@ DynLibFunction dysmantle_overrides[] = {
   {"__android_log_print", (uintptr_t)b_log_print},
   {"__android_log_write", (uintptr_t)b_log_write},
   {"__android_log_assert", (uintptr_t)b_log_assert},
+  /* bionic stdio __sF + wrappers (resolve UNRESOLVED do libc++ -> std::cerr) */
+  {"__sF", (uintptr_t)bionic_sF},
+  {"android_set_abort_message", (uintptr_t)b_set_abort_message},
+  {"fprintf", (uintptr_t)w_fprintf}, {"vfprintf", (uintptr_t)w_vfprintf},
+  {"fwrite", (uintptr_t)w_fwrite}, {"fputs", (uintptr_t)w_fputs},
+  {"fputc", (uintptr_t)w_fputc}, {"fflush", (uintptr_t)w_fflush},
   /* bionic libc */
   {"__errno", (uintptr_t)b_errno},
+  {"setjmp", (uintptr_t)_setjmp},
+  {"longjmp", (uintptr_t)_longjmp},
   {"__assert2", (uintptr_t)b_assert2},
   {"__strlen_chk", (uintptr_t)b_strlen_chk},
   {"__strchr_chk", (uintptr_t)b_strchr_chk},

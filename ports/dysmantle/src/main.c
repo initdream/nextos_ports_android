@@ -45,6 +45,7 @@ static void build_base_table(void) {
 
 static void resolve_addr(uintptr_t a, char *out, int outsz);
 static void brk_handler(int sig, siginfo_t *info, void *uc);
+static volatile uintptr_t g_load_base = 0; /* base do libNativeGame (vaddr 0) */
 static void crash_handler(int sig, siginfo_t *info, void *uc) {
   uintptr_t fault = (uintptr_t)info->si_addr;
   uintptr_t tb = (uintptr_t)text_base;
@@ -61,6 +62,19 @@ static void crash_handler(int sig, siginfo_t *info, void *uc) {
     resolve_addr(lr, r, sizeof(r));
     fprintf(stderr, "  #%-2d lr %p %s\n", f, (void *)lr, r);
     if (next <= fp) break; fp = next;
+  }
+  /* stack scan: acha retornos no .text do jogo (0x463000-0xd8e000) via g_load_base */
+  if (g_load_base) {
+    fprintf(stderr, "  --- stack scan (game) ---\n");
+    uintptr_t sp = u->uc_mcontext.sp, lb = g_load_base;
+    int n = 0;
+    for (uintptr_t a = sp; a < sp + 0x3000 && n < 20; a += 8) {
+      uintptr_t v = *(uintptr_t *)a;
+      uintptr_t off = v - lb;
+      if (off >= 0x463000UL && off <= 0xd8e000UL) {
+        fprintf(stderr, "    +0x%lx\n", (unsigned long)off); n++;
+      }
+    }
   }
   (void)fault;
   fflush(stderr);
@@ -300,6 +314,16 @@ int main(int argc, char *argv[]) {
    * a engine cai no fallback (sem som) e segue. Áudio via opensles_shim depois. */
   patch_func_ret0("_ZN12SoundImpOboe10InitializeEf");
 
+  /* Desabilita popups de erro: a textura grunge-scratched.jpg falha e a engine
+   * mostra um popup que crasha. nx_run_no_popups=1 + NXD_ShowPopup=no-op ->
+   * pula o popup e segue (textura faltante é só decoração de UI). */
+  { uintptr_t g = so_find_addr("nx_run_no_popups");
+    if (g) { *(int *)g = 1; fprintf(stderr, "nx_run_no_popups=1 @ %p\n", (void *)g); } }
+  patch_func_ret("_Z13NXD_ShowPopupi12NX_PopupTypePKcb");
+  /* ImageWriterJPEG::Initialize: na falha do bitmap a engine tenta cachear via
+   * JPEG-encode e crasha (libjpeg). Falha gracioso (return 0) -> pula o cache. */
+  patch_func_ret0("_ZN15ImageWriterJPEG10InitializeEv");
+
   /* GOT-hook NXI_GetProductValue: a engine lê "opengl_version" do config; se
    * pedir ES3 ela monta o APIManager ES3 (mais funções) num buffer de pilha
    * dimensionado p/ ES2 -> stack smash no nosso contexto Utgard (ES2).
@@ -307,6 +331,17 @@ int main(int argc, char *argv[]) {
   hook_getproductvalue();
   // install_brk_traps();
 
+  /* registra o .eh_frame do jogo no unwinder C++: o módulo é custom-loaded (não
+   * dlopen), então o unwinder não o conhece -> exceções (ex: falha de textura)
+   * não conseguem desenrolar a pilha -> crash. .eh_frame @ vaddr 0x349900. */
+  {
+    extern void __register_frame(void *);
+    uintptr_t lb = so_find_addr("android_main") - 0x4651a4;
+    __register_frame((void *)(lb + 0x349900));
+    fprintf(stderr, "__register_frame eh_frame @ %p\n", (void *)(lb + 0x349900));
+  }
+
+  g_load_base = so_find_addr("android_main") - 0x4651a4;
   uintptr_t am = so_find_addr("android_main");
   if (!am) { fprintf(stderr, "android_main NÃO encontrado\n"); exit(1); }
   fprintf(stderr, "android_main @ %p\n", (void *)am);
