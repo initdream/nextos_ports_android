@@ -1969,7 +1969,12 @@ int main(int argc, char **argv) {
     if (drainN && g_preload_mgr) {
       for (int k = 0; k < drainN; k++) preload_step(g_preload_mgr, 2, 0x10);
     }
-    if (drainWait && g_preload_mgr) wait_all(g_preload_mgr);
+    if (drainWait && g_preload_mgr) {
+      /* zera [mgr+0xE0] (flag GfxDevice +224) p/ WaitForAll só checar o integQ [+256]
+       * e NÃO pendurar no loop (com MT-off o flag +224 fica setado p/ sempre). */
+      if (getenv("CUP_DRAINWAIT_GFX")) *(volatile int *)((char *)g_preload_mgr + 0xE0) = 0;
+      wait_all(g_preload_mgr);
+    }
     if (f < 200) { fprintf(stderr, "[r%d>\n", f); dbg_sync(); }  /* ENTRA no render */
     if (g_skipbad) {
       /* arma o recovery: se nativeRender crashar nesta thread, volta aqui e pula o frame */
