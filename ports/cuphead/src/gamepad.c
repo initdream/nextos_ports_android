@@ -236,7 +236,10 @@ int gp_GetButtonDown(void *self, void *name) {
   int b = name_btn(nm), r = 0;
   if (b >= 0) { int j = gp_map[b]; r = (gp_btn[j] && !gp_btn_prev[j]) ? 1 : 0; }
   else { int k = name_axis(nm);
-    if (k) { int pp = (k == 2) ? vpos_prev : hpos_prev; r = (axis_cur(k) > gp_axbtn_thresh && !pp) ? 1 : 0; }
+    /* axis-as-button: se input é VIRTUAL (gv_v/gv_h), retorna SEGURADO (o menu faz seu
+       próprio edge); se físico, edge real p/ não scrollar sem parar. */
+    if (k == 2) r = gv_v ? (gv_v > gp_axbtn_thresh) : (logical_v() > gp_axbtn_thresh && !vpos_prev);
+    else if (k == 1) r = gv_h ? (gv_h > gp_axbtn_thresh) : (logical_h() > gp_axbtn_thresh && !hpos_prev);
     else { int d = name_dir(nm); if (d) r = dir_held(d) ? 1 : 0; } }
   if (gp_log && r) { fprintf(stderr, "[GP] >>> GetButtonDown(\"%s\")=1\n", nm); fflush(stderr); }
   return r;
@@ -259,7 +262,8 @@ int gp_GetNegativeButtonDown(void *self, void *name) {
   (void)self; char nm[32]; str_ascii(name, nm, sizeof nm);
   if (gv_force) return 1;
   int k = name_axis(nm), r = 0;
-  if (k) { int np = (k == 2) ? vneg_prev : hneg_prev; r = (axis_cur(k) < -gp_axbtn_thresh && !np) ? 1 : 0; }
+  if (k == 2) r = gv_v ? (gv_v < -gp_axbtn_thresh) : (logical_v() < -gp_axbtn_thresh && !vneg_prev);
+  else if (k == 1) r = gv_h ? (gv_h < -gp_axbtn_thresh) : (logical_h() < -gp_axbtn_thresh && !hneg_prev);
   if (gp_log && r) { fprintf(stderr, "[GP] >>> GetNegativeButtonDown(\"%s\")=1\n", nm); fflush(stderr); }
   return r;
 }
