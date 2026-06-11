@@ -697,8 +697,51 @@ static void ds_rectex(int w, int h, const char *what) {
   }
   if (w > 2048 || h > 2048) { fprintf(stderr, "[DS] BIG TEX %s id=%d %dx%d\n", what, t, w, h); fsync(2); }
 }
+/* CUP_TEXHALF=N: downscale 2× (nearest) das texturas nivel-0 não-comprimidas com
+ * max(w,h) >= N. Reduz RAM/VRAM e evita o limite do Utgard (textura grande pendura
+ * o GPU = "não é memória, algo quebra"). Receita Bully/Castlevania. px!=NULL só. */
+static int g_texhalf = 0;
+static int gl_bpp(unsigned fmt, unsigned type) {
+  switch (type) {
+    case 0x8033: case 0x8034: case 0x8363: return 2;  /* 4444 / 5551 / 565 */
+    case 0x1401:                                       /* UNSIGNED_BYTE */
+      switch (fmt) { case 0x1908: return 4;            /* RGBA */
+                     case 0x1907: return 3;            /* RGB */
+                     case 0x190A: return 2;            /* LUMINANCE_ALPHA */
+                     case 0x1909: case 0x1906: return 1; } /* LUMINANCE / ALPHA */
+  }
+  return 0;  /* desconhecido -> não mexe */
+}
+static unsigned char ds_halved[DS_MAXTEXID];  /* tex ids cujo nivel-0 foi reduzido */
 static void my_glTexImage2D(unsigned tgt, int lvl, int ifmt, int w, int h, int b, unsigned fmt, unsigned type, const void *px) {
   if (lvl == 0 && tgt == 0x0DE1) ds_rectex(w, h, "tex");
+  int tid = (g_texhalf && tgt == 0x0DE1) ? ds_geti(0x8069) : 0;
+  int want = 0;
+  if (g_texhalf && tgt == 0x0DE1 && px && w >= 2 && h >= 2 && !(w & 1) && !(h & 1)) {
+    if (lvl == 0 && (w >= g_texhalf || h >= g_texhalf)) want = 1;            /* nivel-0 grande */
+    else if (lvl > 0 && tid > 0 && tid < DS_MAXTEXID && ds_halved[tid]) want = 1; /* manter chain */
+  }
+  if (want) {
+    int bpp = gl_bpp(fmt, type);
+    if (bpp > 0) {
+      int nw = w >> 1, nh = h >> 1;
+      unsigned char *dst = malloc((size_t)nw * nh * bpp);
+      if (dst) {
+        const unsigned char *src = px;
+        for (int y = 0; y < nh; y++) {
+          const unsigned char *srow = src + (size_t)(y * 2) * w * bpp;
+          unsigned char *drow = dst + (size_t)y * nw * bpp;
+          for (int x = 0; x < nw; x++)
+            memcpy(drow + x * bpp, srow + (x * 2) * bpp, bpp);
+        }
+        if (lvl == 0 && tid > 0 && tid < DS_MAXTEXID) ds_halved[tid] = 1;
+        static int n; if (n++ < 40) { fprintf(stderr, "[TEXHALF] tex=%d %dx%d -> %dx%d (lvl%d fmt=%x bpp=%d)\n", tid, w, h, nw, nh, lvl, fmt, bpp); fsync(2); }
+        ds_r_TexImage2D(tgt, lvl, ifmt, nw, nh, b, fmt, type, dst);
+        free(dst);
+        return;
+      }
+    }
+  }
   ds_r_TexImage2D(tgt, lvl, ifmt, w, h, b, fmt, type, px);
 }
 static void my_glCompTexImage2D(unsigned tgt, int lvl, unsigned ifmt, int w, int h, int b, int sz, const void *px) {
@@ -746,8 +789,9 @@ static void *ds_route(const char *nm, void *real) {
   return w;
 }
 static void ds_init(void) {
-  if (!getenv("CUP_DRAWSPY")) return;
-  g_drawspy = 1;
+  if (getenv("CUP_TEXHALF")) { g_texhalf = atoi(getenv("CUP_TEXHALF")); if (g_texhalf < 2) g_texhalf = 1024; }
+  if (!getenv("CUP_DRAWSPY") && !g_texhalf) return;
+  g_drawspy = 1;  /* liga roteamento de gl* (DRAWSPY e/ou TEXHALF precisam de glTexImage2D) */
   g_skipfbo = getenv("CUP_SKIPFBO") ? 1 : 0;
   const char *sp = getenv("CUP_SKIPPROG");
   if (sp) {
@@ -1906,8 +1950,18 @@ int main(int argc, char **argv) {
   void *inject = jni_find_native("nativeInjectEvent");
   int tapkey = getenv("CUP_AUTOTAP") ? atoi(getenv("CUP_AUTOTAP")) : 0;
   if (tapkey && inject) fprintf(stderr, "[AUTOTAP] keycode=%d via nativeInjectEvent=%p\n", tapkey, inject);
+  /* CUP_DRAINPRELOAD=N: os ops de preload do título completam o background (jobmgr=0)
+   * mas ficam presos na fila de INTEGRAÇÃO (integQ) pq a integração per-frame não roda
+   * fora do WaitForAll. Dirigimos nós: N× UpdatePreloadingSingleStep(mgr,2,0x10) por frame
+   * (limitado=não pendura; +FORCEINTEG p/ passar o gate de budget). mgr vem do PSPY. */
+  int drainN = getenv("CUP_DRAINPRELOAD") ? atoi(getenv("CUP_DRAINPRELOAD")) : 0;
+  void (*preload_step)(void *, int, int) = drainN ? (void (*)(void *, int, int))(g_unity_base + 0x8733a8) : NULL;
+  if (drainN) fprintf(stderr, "[DRAINPRELOAD] %d steps/frame (UpdatePreloadingSingleStep=0x8733a8)\n", drainN);
   for (int f = 0; render && (max_f <= 0 || f < max_f); f++) {
     g_render_frame = f;  /* CUP_DRAWSPY: amarra os draws ao frame */
+    if (drainN && g_preload_mgr) {
+      for (int k = 0; k < drainN; k++) preload_step(g_preload_mgr, 2, 0x10);
+    }
     if (f < 200) { fprintf(stderr, "[r%d>\n", f); dbg_sync(); }  /* ENTRA no render */
     if (g_skipbad) {
       /* arma o recovery: se nativeRender crashar nesta thread, volta aqui e pula o frame */
