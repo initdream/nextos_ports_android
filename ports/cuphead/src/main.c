@@ -940,6 +940,180 @@ long my_signal(void *sem, long count) {
   return signal_orig_tramp(sem, count);
 }
 
+/* ===== CUP_CRSPY: espião das coroutines de boot do CupheadStartScene =====
+ * O boot (disclaimer) é dirigido por start_cr (RVA il2cpp 0x9A58D0, iterator $PC
+ * em +0xBC) que encadeia: settings load → fonts → preload atlases/music →
+ * WaitForUserInputBeforeContinue (RVA 0x9A619C, $PC em +0x1C) → load do título.
+ * Logamos transições de $PC p/ ver exatamente em qual passo o boot estaciona. */
+uintptr_t g_cr1_cont = 0, g_cr2_cont = 0;
+__asm__(
+  ".text\n"
+  ".global cr1_tramp\n"
+  "cr1_tramp:\n"
+  "  stp x24, x23, [sp, #-64]!\n"    /* 0x9A58D0 */
+  "  stp x22, x21, [sp, #16]\n"
+  "  stp x20, x19, [sp, #32]\n"
+  "  stp x29, x30, [sp, #48]\n"
+  "  adrp x17, g_cr1_cont\n"
+  "  add x17, x17, :lo12:g_cr1_cont\n"
+  "  ldr x17, [x17]\n"
+  "  br x17\n"
+  ".global cr2_tramp\n"
+  "cr2_tramp:\n"
+  "  stp x22, x21, [sp, #-48]!\n"    /* 0x9A619C */
+  "  stp x20, x19, [sp, #16]\n"
+  "  stp x29, x30, [sp, #32]\n"
+  "  add x29, sp, #0x20\n"
+  "  adrp x17, g_cr2_cont\n"
+  "  add x17, x17, :lo12:g_cr2_cont\n"
+  "  ldr x17, [x17]\n"
+  "  br x17\n"
+);
+extern long cr1_tramp(void *it);
+extern long cr2_tramp(void *it);
+long my_start_cr(void *it);
+long my_start_cr(void *it) {
+  static int lastpc = -99; static unsigned n;
+  int pc = *(int *)((char *)it + 0xBC);
+  if (pc != lastpc)
+    { fprintf(stderr, "[CRSPY] start_cr tick#%u $PC=%d f=%d\n", n, pc, g_render_frame); fsync(2); }
+  lastpc = pc; n++;
+  long r = cr1_tramp(it);
+  int pc2 = *(int *)((char *)it + 0xBC);
+  if (pc2 != pc) {
+    fprintf(stderr, "[CRSPY] start_cr $PC %d -> %d (ret=%ld f=%d)\n", pc, pc2, r, g_render_frame);
+    fsync(2); lastpc = pc2;
+  }
+  return r;
+}
+long my_inputwait_cr(void *it);
+long my_inputwait_cr(void *it) {
+  static int lastpc = -99; static unsigned n;
+  int pc = *(int *)((char *)it + 0x1C);
+  if (pc != lastpc)
+    { fprintf(stderr, "[CRSPY] inputwait tick#%u $PC=%d f=%d\n", n, pc, g_render_frame); fsync(2); }
+  lastpc = pc; n++;
+  long r = cr2_tramp(it);
+  int pc2 = *(int *)((char *)it + 0x1C);
+  if (pc2 != pc) {
+    fprintf(stderr, "[CRSPY] inputwait $PC %d -> %d (ret=%ld f=%d)\n", pc, pc2, r, g_render_frame);
+    fsync(2); lastpc = pc2;
+  }
+  return r;
+}
+
+/* ===== CUP_BOOTSPY: log de entrada nas funções da cadeia de boot (il2cpp) =====
+ * Hooks de log genéricos: trampolim runtime copia as 4 insns clobberadas pelo
+ * hook_arm64; stp/add/mov copiam direto, adrp é recomputado (ldr-literal com o
+ * endereço absoluto da página). Mostra qual elo da cadeia
+ * Start→LoadFromCloud→LoadCloudData→OnLoaded→OnSettingsDataLoaded→start_cr morre. */
+static uint32_t *bs_page = NULL; static int bs_used = 0;
+static void *mk_tramp(uintptr_t target, const char *name) {
+  if (!bs_page) {
+    bs_page = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (bs_page == MAP_FAILED) { bs_page = NULL; return NULL; }
+  }
+  uint32_t *st = bs_page + bs_used;
+  uint32_t *p = st;
+  const uint32_t *src = (const uint32_t *)target;
+  for (int i = 0; i < 4; i++) {
+    uint32_t in = src[i];
+    if ((in & 0x9F000000u) == 0x90000000u) {            /* adrp rd, page */
+      int rd = in & 31;
+      long immlo = (in >> 29) & 3, immhi = (in >> 5) & 0x7FFFF;
+      long imm = (immhi << 2) | immlo;
+      if (imm & (1L << 20)) imm -= (1L << 21);          /* sign extend 21 bits */
+      uint64_t page = ((target + i * 4) & ~0xFFFUL) + (imm << 12);
+      *p++ = 0x58000040u | rd;                          /* ldr rd, +8 */
+      *p++ = 0x14000003u;                               /* b +12 */
+      *(uint64_t *)p = page; p += 2;
+    } else if ((in & 0x7C000000u) == 0x14000000u || (in & 0xFF000000u) == 0x58000000u ||
+               (in & 0x7C000000u) == 0x94000000u || (in & 0xFE000000u) == 0x54000000u) {
+      fprintf(stderr, "[BOOTSPY] %s: insn %d não-relocável (%08x) — hook ABORTADO\n", name, i, in);
+      return NULL;
+    } else {
+      *p++ = in;                                        /* stp/add/mov etc: PI, copia */
+    }
+  }
+  *p++ = 0x58000051u;                                   /* ldr x17, #8 */
+  *p++ = 0xd61f0220u;                                   /* br x17 */
+  *(uint64_t *)p = target + 16; p += 2;
+  bs_used += (int)(p - st) + (4 - ((p - st) & 3));      /* avança alinhado */
+  __builtin___clear_cache((char *)st, (char *)p);
+  return st;
+}
+#define BS_WRAP(idx, label) \
+  static long (*bs_orig_##idx)(long, long, long, long, long, long, long, long); \
+  static long bs_hook_##idx(long a, long b, long c, long d, long e, long f, long g, long h) { \
+    static unsigned n; \
+    if (n++ < 24) { fprintf(stderr, "[BOOTSPY] %s (#%u) x0=%lx x1=%lx f=%d\n", label, n, a, b, g_render_frame); fsync(2); } \
+    return bs_orig_##idx(a, b, c, d, e, f, g, h); \
+  }
+BS_WRAP(0, "CupheadStartScene.Start")
+BS_WRAP(1, "CupheadStartScene.OnSettingsDataLoaded")
+BS_WRAP(2, "SettingsData.LoadFromCloud")
+BS_WRAP(3, "OnlineInterfaceSteam.LoadCloudData")
+BS_WRAP(4, "OnlineManager.Init")
+BS_WRAP(5, "SettingsData.Save")
+BS_WRAP(6, "CupheadStartScene.start_cr(factory)")
+BS_WRAP(7, "SettingsData.OnLoadedCloudData")
+static void bootspy_install(uintptr_t base) {
+  struct { uintptr_t rva; void *hook; void **orig; const char *nm; } T[] = {
+    {0x9A55CC, (void *)bs_hook_0, (void **)&bs_orig_0, "Start"},
+    {0x9A5828, (void *)bs_hook_1, (void **)&bs_orig_1, "OnSettingsDataLoaded"},
+    {0xB73C60, (void *)bs_hook_2, (void **)&bs_orig_2, "LoadFromCloud"},
+    {0xB2398C, (void *)bs_hook_3, (void **)&bs_orig_3, "LoadCloudData"},
+    {0xB23EF0, (void *)bs_hook_4, (void **)&bs_orig_4, "OnlineMgr.Init"},
+    {0xB73798, (void *)bs_hook_5, (void **)&bs_orig_5, "Settings.Save"},
+    {0x9A5750, (void *)bs_hook_6, (void **)&bs_orig_6, "start_cr fac"},
+    {0xB7422C, (void *)bs_hook_7, (void **)&bs_orig_7, "OnLoadedCloud"},
+  };
+  for (unsigned i = 0; i < sizeof T / sizeof T[0]; i++) {
+    void *tr = mk_tramp(base + T[i].rva, T[i].nm);
+    if (!tr) continue;
+    *T[i].orig = tr;
+    hook_arm64(base + T[i].rva, (uintptr_t)T[i].hook);
+  }
+  fprintf(stderr, "[BOOTSPY] %u hooks de boot instalados\n", (unsigned)(sizeof T / sizeof T[0]));
+}
+
+/* ===== CUP_TAPINPUT: pulsa AnyPlayerInput.GetAnyButtonDown (il2cpp 0xCC2854) =====
+ * A coroutine WaitForUserInputBeforeContinue do disclaimer espera
+ * WaitUntil(() => AnyPlayerInput.GetAnyButtonDown()). Sem plumbing real de input,
+ * fica preso. Hookamos o método: retorna TRUE em janelas periódicas (~3 frames a
+ * cada CUP_TAPPERIOD frames) — equivale a um "toque" que destrava o disclaimer e
+ * confirma menus, mas sem ficar true p/ sempre (evita auto-navegar descontrolado).
+ * CUP_TAPSTART=frame inicial (default 200, dá tempo do disclaimer subir). */
+static int g_tap_period = 240, g_tap_start = 200, g_tap_width = 3;
+uintptr_t g_tapinput_cont = 0;
+__asm__(
+  ".text\n"
+  ".global tapinput_tramp\n"
+  "tapinput_tramp:\n"
+  "  stp x28, x27, [sp, #-96]!\n"    /* 0xCC2854 */
+  "  stp x26, x25, [sp, #16]\n"      /* 0xCC2858 */
+  "  stp x24, x23, [sp, #32]\n"      /* 0xCC285C */
+  "  stp x22, x21, [sp, #48]\n"      /* 0xCC2860 */
+  "  adrp x17, g_tapinput_cont\n"
+  "  add x17, x17, :lo12:g_tapinput_cont\n"
+  "  ldr x17, [x17]\n"
+  "  br x17\n"
+);
+extern int tapinput_tramp(void *self);
+int my_getanybuttondown(void *self);
+int my_getanybuttondown(void *self) {
+  int f = g_render_frame;
+  if (f >= g_tap_start) {
+    int ph = (f - g_tap_start) % g_tap_period;
+    if (ph < g_tap_width) {
+      static int lastf = -1;
+      if (f != lastf) { fprintf(stderr, "[TAPINPUT] pulse f=%d\n", f); fsync(2); lastf = f; }
+      return 1;
+    }
+  }
+  return tapinput_tramp(self);
+}
+
 static char g_dl_sl; /* sentinela do handle de libOpenSLES (FMOD → opensles_shim) */
 static void *my_dlopen(const char *nm, int flag) {
   if (g_dllog) fprintf(stderr, "[dlopen] \"%s\"\n", nm ? nm : "(null)");
@@ -1545,6 +1719,36 @@ int main(int argc, char **argv) {
     patch_got("__android_log_write", (void *)my_alog_write);
     patch_got("__android_log_vprint", (void *)my_alog_vprint);
     patch_sem_shim();  /* sem_* nos slots GOT do libil2cpp */
+    /* CUP_CRSPY: hooks nos MoveNext das coroutines de boot (antes do flush de caches) */
+    if (getenv("CUP_CRSPY")) {
+      g_cr1_cont = g_il2cpp_base + 0x9A58D0 + 16;
+      g_cr2_cont = g_il2cpp_base + 0x9A619C + 16;
+      hook_arm64(g_il2cpp_base + 0x9A58D0, (uintptr_t)my_start_cr);
+      hook_arm64(g_il2cpp_base + 0x9A619C, (uintptr_t)my_inputwait_cr);
+      fprintf(stderr, "[CRSPY] hooks start_cr(0x9A58D0 $PC+0xBC) + inputwait(0x9A619C $PC+0x1C)\n");
+    }
+    if (getenv("CUP_BOOTSPY")) bootspy_install(g_il2cpp_base);
+    /* CUP_FORCESTARTCR: CupheadStartScene.Start (0x9A55CC) faz 3 checks
+     * op_Inequality em Application.version/productName/identifier e DÁ EARLY-RETURN
+     * (0x9A56F8) antes de StartCoroutine(start_cr) se algum não bate. No so-loader
+     * esses getters não retornam o esperado -> start_cr NUNCA roda -> disclaimer
+     * congela. Forçamos o caminho de prosseguir: NOP nos 2 tbnz-return + B p/ o
+     * bloco-proceed no 3º branch. (start_cr dirige disclaimer->preload->título.) */
+    if (getenv("CUP_FORCESTARTCR")) {
+      uint32_t *t = (uint32_t *)(g_il2cpp_base + 0x9A567C);
+      t[0] = 0xd503201fu;                              /* 0x9A567C tbnz -> NOP (cai = prossegue) */
+      *(uint32_t *)(g_il2cpp_base + 0x9A56B8) = 0xd503201fu; /* 0x9A56B8 tbnz -> NOP */
+      *(uint32_t *)(g_il2cpp_base + 0x9A56F4) = 0x14000006u; /* 0x9A56F4 tbz -> B 0x9A570C (proceed) */
+      __builtin___clear_cache((char *)(g_il2cpp_base + 0x9A567C), (char *)(g_il2cpp_base + 0x9A56F8));
+      fprintf(stderr, "[FORCESTARTCR] Start() early-returns NOPados -> StartCoroutine(start_cr) forçado\n");
+    }
+    if (getenv("CUP_TAPINPUT")) {
+      if (getenv("CUP_TAPSTART")) g_tap_start = atoi(getenv("CUP_TAPSTART"));
+      if (getenv("CUP_TAPPERIOD")) g_tap_period = atoi(getenv("CUP_TAPPERIOD"));
+      g_tapinput_cont = g_il2cpp_base + 0xCC2854 + 16;
+      hook_arm64(g_il2cpp_base + 0xCC2854, (uintptr_t)my_getanybuttondown);
+      fprintf(stderr, "[TAPINPUT] hook GetAnyButtonDown(0xCC2854) start=%d period=%d\n", g_tap_start, g_tap_period);
+    }
     so_finalize(); so_flush_caches();
     fprintf(stderr, "[F1] libil2cpp init_array...\n");
     so_execute_init_array();
