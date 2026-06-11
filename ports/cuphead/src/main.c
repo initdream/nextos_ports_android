@@ -15,6 +15,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <unistd.h>
+#include <sched.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <dlfcn.h>
@@ -923,11 +924,16 @@ static int jobs_pending(void) {
   if (!mgr) return 0;
   return ((int (*)(void *))(g_unity_base + 0x6cdad0))(mgr);
 }
+int g_gatewait = 0;   /* CUP_GATEWAIT: gate sempre bypassa budget + spin-wait nos jobs */
 int my_gate(void *op) {
+  if (g_gatewait) {
+    /* SEMPRE ignora budget (time-slice quebrado no so-loader), mas ESPERA os jobs
+       do worker terminarem — spin com sched_yield (dá CPU aos workers) até jobmgr
+       limpar. Mata a race da integração forçada (objeto malformado -> crash $PC=9). */
+    for (int i = 0; i < 200000 && jobs_pending(); i++) sched_yield();
+    return 1;
+  }
   if (g_in_waitall) {
-    /* force-complete: ignora o BUDGET (time-slice), mas — se CUP_GATEJOBS — ainda
-       espera os JOBS terminarem (não integra op cujos sub-jobs não rodaram → objeto
-       malformado/vtable na arena). Sem o flag = comportamento antigo (bypass total). */
     if (getenv("CUP_GATEJOBS")) return jobs_pending() ? 0 : 1;
     return 1;
   }
@@ -1044,6 +1050,29 @@ static const char *il2cpp_classname(void *obj) {
   return (nm && ((uintptr_t)nm >> 40) == 0) ? nm : "(?)";
 }
 void *volatile g_startcr_it = NULL;  /* iterator do start_cr capturado (CUP_DRIVECR) */
+/* CUP_GATERESTORE: FORCEINTEG (NOP no gate budget 0x871854/0x872774) só é necessário
+ * p/ o FontLoader ($PC 7->8). Forçar integração GLOBAL integra ops cujo worker job não
+ * rodou -> objeto malformado (vtable/offset uninit) que crasha depois (Cuphead.Init $PC=9
+ * na desserialização do CupheadCore: fault = fragmento de string = heap uninit). Restaura
+ * o gate ORIGINAL assim que o $PC passa de 8, ANTES do Cuphead.Init. */
+static void restore_gate_once(void) {
+  static int done = 0;
+  if (done) return;
+  done = 1;
+  uintptr_t a1 = g_unity_base + 0x871854, a2 = g_unity_base + 0x872774;
+  long pg = sysconf(_SC_PAGESIZE);
+  uintptr_t p1 = a1 & ~(uintptr_t)(pg - 1), p2 = a2 & ~(uintptr_t)(pg - 1);
+  mprotect((void *)p1, pg, PROT_READ | PROT_WRITE | PROT_EXEC);
+  if (p2 != p1) mprotect((void *)p2, pg, PROT_READ | PROT_WRITE | PROT_EXEC);
+  *(uint32_t *)a1 = 0x360000c0u;  /* tbz w0,#0,0x87186c (original) */
+  *(uint32_t *)a2 = 0x360004e0u;  /* tbz w0,#0,0x872810 (original) */
+  __builtin___clear_cache((char *)a1, (char *)a1 + 4);
+  __builtin___clear_cache((char *)a2, (char *)a2 + 4);
+  mprotect((void *)p1, pg, PROT_READ | PROT_EXEC);
+  if (p2 != p1) mprotect((void *)p2, pg, PROT_READ | PROT_EXEC);
+  fprintf(stderr, "[GATERESTORE] gate budget restaurado (0x871854/0x872774) apos FontLoader\n");
+  fsync(2);
+}
 long my_start_cr(void *it) {
   static int lastpc = -99; static unsigned n, samepc;
   g_startcr_it = it;
@@ -1068,6 +1097,7 @@ long my_start_cr(void *it) {
     fprintf(stderr, "[CRSPY] start_cr $PC %d -> %d (ret=%ld $cur=%p cls=%s f=%d)\n",
             pc, pc2, r, cur, il2cpp_classname(cur), g_render_frame);
     fsync(2); lastpc = pc2;
+    if (pc2 >= 9 && getenv("CUP_GATERESTORE")) restore_gate_once();
   } else if (samepc <= 4) {
     fprintf(stderr, "[CRSPY] start_cr POST $PC=%d ret=%ld $cur=%p cls=%s f=%d\n",
             pc, r, cur, il2cpp_classname(cur), g_render_frame); fsync(2);
@@ -1753,7 +1783,12 @@ int main(int argc, char **argv) {
   if (getenv("CUP_FORCEINTEG")) {
     extern void so_make_text_writable(void), so_make_text_executable(void);
     so_make_text_writable();
-    *(uint32_t *)((uintptr_t)text_base + 0x872774) = 0xd503201fu; /* NOP (IntegrateOp 0x872758) */
+    /* ⚠️ 0x872774 (IntegrateOp) bypassa o VEREDITO INTEIRO do gate, incl. jobs-pending
+       -> integra com job do worker pendente = RACE = objeto malformado (crash $PC=9 na
+       desserializacao do CupheadCore). CUP_NO872774 pula este (mantem so o 0x871854 que
+       bypassa SO o budget e PRESERVA a espera do job). */
+    if (!getenv("CUP_NO872774"))
+      *(uint32_t *)((uintptr_t)text_base + 0x872774) = 0xd503201fu; /* NOP (IntegrateOp 0x872758) */
     /* + ops cujo integrate É o gate 0x871844 DIRETO (materiais/shaders): NOP no branch
        0x871854 `tbz w0,#0, 87186c` que aborta no veredito do budget -> cai no check de
        jobs (passa qdo jobmgr=0). Cobre as 52 ops de shader/material presas (sessão 8). */
@@ -1774,6 +1809,18 @@ int main(int argc, char **argv) {
     so_make_text_executable(); so_flush_caches();
     fprintf(stderr, "[WAITGATE] hook WaitForAll(0x873a90)+gate(0x871844); cont=0x%lx\n",
             (unsigned long)g_waitall_cont);
+  }
+  /* CUP_GATEWAIT: hook do gate (0x871844) SEMPRE-ativo — bypassa o budget (quebrado no
+     so-loader) MAS faz spin-wait nos jobs do worker (sched_yield) antes de liberar a
+     integração. Mata a race da integração forçada SEM os NOPs (0x872774/0x871854).
+     NÃO combinar com CUP_FORCEINTEG. */
+  if (getenv("CUP_GATEWAIT")) {
+    extern void so_make_text_writable(void), so_make_text_executable(void);
+    g_gatewait = 1;
+    so_make_text_writable();
+    hook_arm64((uintptr_t)text_base + 0x871844, (uintptr_t)my_gate);
+    so_make_text_executable(); so_flush_caches();
+    fprintf(stderr, "[GATEWAIT] hook gate(0x871844) sempre: bypass budget + spin-wait jobs\n");
   }
   /* CUP_CLAMPSIG: clampa o count de Semaphore::Signal (0x65850c) p/ matar o storm
      (count deriva p/ enorme ~frame 110 → posta bilhões de vezes = livelock). */
@@ -1884,6 +1931,12 @@ int main(int argc, char **argv) {
       g_tapinput_cont = g_il2cpp_base + 0xCC2854 + 16;
       hook_arm64(g_il2cpp_base + 0xCC2854, (uintptr_t)my_getanybuttondown);
       fprintf(stderr, "[TAPINPUT] hook GetAnyButtonDown(0xCC2854) start=%d period=%d\n", g_tap_start, g_tap_period);
+    }
+    /* CUP_GAMEPAD: controle REAL via USB Gamepad (js0). Substitui Rewired.Player
+       .GetButton/Down/Up/GetAxis(string) lendo o estado do js0. (gamepad.c) */
+    if (getenv("CUP_GAMEPAD")) {
+      extern void gp_init(uintptr_t);
+      gp_init(g_il2cpp_base);
     }
     so_finalize(); so_flush_caches();
     fprintf(stderr, "[F1] libil2cpp init_array...\n");
@@ -2018,8 +2071,28 @@ int main(int argc, char **argv) {
   int drivecr = getenv("CUP_DRIVECR") ? 1 : 0;
   int drivecr_from = getenv("CUP_DRIVECR_FROM") ? atoi(getenv("CUP_DRIVECR_FROM")) : 200;
   if (drivecr) fprintf(stderr, "[DRIVECR] dirige start_cr MoveNext a partir do frame %d\n", drivecr_from);
+  /* CUP_GCOFF: desabilita o GC do il2cpp durante o boot. Hipótese: o crash flaky do
+     $PC=9 é use-after-free — o Boehm GC coleta um objeto que a desserialização do
+     CupheadCore ainda referencia (a integração forçada cria objeto que o GC não
+     rastreia). Sem GC no boot, nada é coletado -> sem UAF. (heap cresce; re-habilitar
+     depois do título se preciso.) */
+  if (getenv("CUP_GCOFF") && g_il2cpp_base) {
+    ((void (*)(void))(g_il2cpp_base + 0x1b62acc))();  /* il2cpp_gc_disable */
+    fprintf(stderr, "[GCOFF] il2cpp_gc_disable() - GC desligado no boot\n");
+  }
+  int gamepad_on = getenv("CUP_GAMEPAD") ? 1 : 0;
+  extern void gp_poll(void); extern void gp_frame_end(void);
+  /* CUP_LOADYIELD=us: durante o boot/load, cede CPU aos WORKER threads (sched_yield+usleep)
+     ANTES de cada frame integrar, p/ os jobs async COMPLETAREM antes da integração forçada
+     (o check jobs-pending 0x6cdad0 é não-confiável aqui -> race -> objeto malformado ->
+     crash $PC=9). Só nos primeiros LOADYIELD_F frames (fase de load). */
+  int loadyield = getenv("CUP_LOADYIELD") ? atoi(getenv("CUP_LOADYIELD")) : 0;
+  int loadyield_f = getenv("CUP_LOADYIELD_F") ? atoi(getenv("CUP_LOADYIELD_F")) : 350;
+  if (loadyield) fprintf(stderr, "[LOADYIELD] %dus/frame nos 1ºs %d frames (CPU p/ workers)\n", loadyield, loadyield_f);
   for (int f = 0; render && (max_f <= 0 || f < max_f); f++) {
     g_render_frame = f;  /* CUP_DRAWSPY: amarra os draws ao frame */
+    if (loadyield && f < loadyield_f) { for (int y = 0; y < 4; y++) sched_yield(); usleep(loadyield); }
+    if (gamepad_on) gp_poll();   /* drena eventos do js0 ANTES do frame ler input */
     if (drivecr && f >= drivecr_from && g_startcr_it) cr1_tramp(g_startcr_it);
     if (drainN && g_preload_mgr) {
       for (int k = 0; k < drainN; k++) preload_step(g_preload_mgr, 2, 0x10);
@@ -2061,6 +2134,7 @@ int main(int argc, char **argv) {
         if (f < 600) fprintf(stderr, "[AUTOTAP] %s key=%d (f=%d)\n", phase ? "UP" : "DOWN", tapkey, f);
       }
     }
+    if (gamepad_on) gp_frame_end();  /* snapshot p/ edge-detect do GetButtonDown/Up */
     if (f % 60 == 0) { fprintf(stderr, "[render %d]\n", f); dbg_sync(); }
   }
   fprintf(stderr, "[F2] === render loop terminou ===\n");
