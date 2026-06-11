@@ -972,16 +972,34 @@ __asm__(
 extern long cr1_tramp(void *it);
 extern long cr2_tramp(void *it);
 long my_start_cr(void *it);
+static const char *il2cpp_classname(void *obj) {
+  /* obj->klass (off 0) -> klass->name (off 0x10 nesta versão il2cpp 2017) */
+  if (!obj) return "(null)";
+  void *klass = *(void **)obj;
+  if (!klass || ((uintptr_t)klass >> 40)) return "(?)";
+  const char *nm = *(const char **)((char *)klass + 0x10);
+  return (nm && ((uintptr_t)nm >> 40) == 0) ? nm : "(?)";
+}
 long my_start_cr(void *it) {
-  static int lastpc = -99; static unsigned n;
+  static int lastpc = -99; static unsigned n, samepc;
   int pc = *(int *)((char *)it + 0xBC);
   if (pc != lastpc)
-    { fprintf(stderr, "[CRSPY] start_cr tick#%u $PC=%d f=%d\n", n, pc, g_render_frame); fsync(2); }
+    { fprintf(stderr, "[CRSPY] start_cr tick#%u $PC=%d f=%d\n", n, pc, g_render_frame); fsync(2); samepc = 0; }
+  else if (++samepc <= 3) {
+    fprintf(stderr, "[CRSPY] start_cr RE-ENTER $PC=%d (samepc=%u) f=%d\n", pc, samepc, g_render_frame); fsync(2);
+  }
+  else if (samepc % 180 == 0) {
+    void *cur = *(void **)((char *)it + 0xB0);  /* $current (objeto yieldado) */
+    fprintf(stderr, "[CRSPY] start_cr SPIN $PC=%d x%u $current=%p cls=%s f=%d\n",
+            pc, samepc, cur, il2cpp_classname(cur), g_render_frame); fsync(2);
+  }
   lastpc = pc; n++;
   long r = cr1_tramp(it);
   int pc2 = *(int *)((char *)it + 0xBC);
   if (pc2 != pc) {
-    fprintf(stderr, "[CRSPY] start_cr $PC %d -> %d (ret=%ld f=%d)\n", pc, pc2, r, g_render_frame);
+    void *cur = *(void **)((char *)it + 0xB0);
+    fprintf(stderr, "[CRSPY] start_cr $PC %d -> %d (ret=%ld $cur=%p cls=%s f=%d)\n",
+            pc, pc2, r, cur, il2cpp_classname(cur), g_render_frame);
     fsync(2); lastpc = pc2;
   }
   return r;
