@@ -27,6 +27,49 @@ static void stub_glGetInternalformativ(unsigned t, unsigned f, unsigned pn, int 
   (void)t; (void)f; (void)pn;
   if (p) for (int i = 0; i < n; i++) p[i] = 0;  /* 0 samples = sem MSAA -> quebra o loop */
 }
+/* relogio monotonico em segundos desde o 1o uso (timestamps de log) */
+#include <time.h>
+static long hk_secs(void) {
+  static long t0 = -1;
+  struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+  if (t0 < 0) t0 = ts.tv_sec;
+  return ts.tv_sec - t0;
+}
+/* ---- ANTI-WEDGE Utgard (Bully: glFinish satura/wedge; Cuphead: tex 2048² trava) ----
+   glFinish vira no-op (religa: HK_ALLOWFINISH=1). HK_TEXCAP=N limita textura a NxN:
+   aloca reduzida (shift) + downsample point-sample no TexSubImage. */
+static void noop_glFinish(void) {}
+static int g_texcap = -1;
+static int texcap(void) {
+  if (g_texcap < 0) { const char *e = getenv("HK_TEXCAP"); g_texcap = e ? atoi(e) : 0; }
+  return g_texcap;
+}
+static unsigned g_bound_tex = 0;                 /* textura GL_TEXTURE_2D bound */
+#define TEXSHIFT_SLOTS 8192
+static unsigned char g_tex_shift[TEXSHIFT_SLOTS]; /* halvings por texture id */
+static void (*real_glBindTexture)(unsigned, unsigned) = 0;
+static void my_glBindTexture(unsigned target, unsigned tex) {
+  if (!real_glBindTexture)
+    real_glBindTexture = (void (*)(unsigned, unsigned))dlsym(RTLD_DEFAULT, "glBindTexture");
+  if (target == 0x0DE1) g_bound_tex = tex;        /* GL_TEXTURE_2D */
+  if (real_glBindTexture) real_glBindTexture(target, tex);
+}
+static int tex_shift_for(int w, int h) {
+  int cap = texcap(), sh = 0;
+  if (cap <= 0) return 0;
+  if (w != h) return 0;  /* so atlases QUADRADOS; render targets (1280x720 etc.) ficam intactos */
+  while (((w >> sh) > cap || (h >> sh) > cap) && sh < 6) sh++;
+  return sh;
+}
+static int fmt_bpp(unsigned fmt) {
+  switch (fmt) {
+    case 0x1908: case 0x80E1: return 4;  /* RGBA / BGRA */
+    case 0x1907: return 3;               /* RGB */
+    case 0x190A: return 2;               /* LUMINANCE_ALPHA */
+    case 0x1909: case 0x1906: return 1;  /* LUMINANCE / ALPHA */
+    default: return 0;
+  }
+}
 /* glTexStorage2D (GLES3, storage imutavel) -> aloca via glTexImage2D (GLES2). SEM isso a
    textura nao existe -> glTexSubImage2D falha -> UI amostra vazio -> TELA PRETA. */
 static void (*real_glTexImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *) = 0;
@@ -44,12 +87,15 @@ static void stub_glTexStorage2D(unsigned target, int levels, unsigned ifmt, int 
     case 0x822B: fmt = 0x190A; break;                          /* RG8 -> GL_LUMINANCE_ALPHA */
     default: break;                                            /* RGBA8/RGBA -> GL_RGBA */
   }
+  int sh = tex_shift_for(w, h);                  /* HK_TEXCAP: aloca reduzida */
+  if (sh && g_bound_tex < TEXSHIFT_SLOTS) g_tex_shift[g_bound_tex] = (unsigned char)sh;
+  int aw = w >> sh, ah = h >> sh; if (aw < 1) aw = 1; if (ah < 1) ah = 1;
   static int tn = 0;
-  if (tn < 25) { fprintf(stderr, "[TEXSTOR] %dx%d ifmt=0x%x -> fmt=0x%x lv=%d\n", w, h, ifmt, fmt, levels); tn++; }
+  if (tn < 25) { fprintf(stderr, "[TEXSTOR] %dx%d ifmt=0x%x -> fmt=0x%x lv=%d shift=%d\n", w, h, ifmt, fmt, levels, sh); tn++; }
   if (levels < 1) levels = 1;
   if (!real_glTexImage2D) return;
   for (int i = 0; i < levels; i++) {
-    int lw = w >> i, lh = h >> i; if (lw < 1) lw = 1; if (lh < 1) lh = 1;
+    int lw = aw >> i, lh = ah >> i; if (lw < 1) lw = 1; if (lh < 1) lh = 1;
     real_glTexImage2D(target, i, (int)fmt, lw, lh, 0, fmt, type, 0);
   }
 }
@@ -71,6 +117,47 @@ static void diag_glTexSubImage2D(unsigned t, int lv, int xo, int yo, int w, int 
                                  unsigned fmt, unsigned type, const void *px) {
   if (!real_glTexSubImage2D) real_glTexSubImage2D = (void (*)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *))dlsym(RTLD_DEFAULT, "glTexSubImage2D");
   if (!real_glGetError) real_glGetError = (int (*)(void))dlsym(RTLD_DEFAULT, "glGetError");
+  /* HK_TEXCAP: textura alocada reduzida -> downsample point-sample do upload */
+  int sh = (g_bound_tex < TEXSHIFT_SLOTS) ? g_tex_shift[g_bound_tex] : 0;
+  if (sh && px && type == 0x1401 /*UNSIGNED_BYTE*/) {
+    int bpp = fmt_bpp(fmt);
+    int dw = w >> sh, dh = h >> sh;
+    if (bpp && dw >= 1 && dh >= 1) {
+      unsigned char *out = (unsigned char *)malloc((size_t)dw * dh * bpp);
+      int step = 1 << sh;
+      if (bpp == 4) {            /* caminho rapido: copia por palavra (RGBA) */
+        unsigned *o32 = (unsigned *)out;
+        for (int y = 0; y < dh; y++) {
+          const unsigned *row = (const unsigned *)((const unsigned char *)px + (size_t)(y * step) * w * 4);
+          for (int x = 0; x < dw; x++) o32[(size_t)y * dw + x] = row[(size_t)x << sh];
+        }
+      } else {
+        const unsigned char *in = (const unsigned char *)px;
+        for (int y = 0; y < dh; y++)
+          for (int x = 0; x < dw; x++)
+            memcpy(out + ((size_t)y * dw + x) * bpp,
+                   in + ((size_t)(y * step) * w + (x * step)) * bpp, bpp);
+      }
+      if (real_glTexSubImage2D)
+        real_glTexSubImage2D(t, lv, xo >> sh, yo >> sh, dw, dh, fmt, type, out);
+      /* Utgard pode ADIAR a leitura da textura -> free imediato = risco UAF no driver.
+         Anel de 8 buffers adia o free. glFlush por upload TESTADO E REPROVADO (run8:
+         wedge ainda mais cedo). Pacing usleep da um respiro pra fila da GPU. */
+      static void *ring[8]; static int ri = 0;
+      if (ring[ri]) free(ring[ri]);
+      ring[ri] = out; ri = (ri + 1) & 7;
+      static int ts = -1;
+      if (ts < 0) { const char *e = getenv("HK_TEXSLEEP_MS"); ts = e ? atoi(e) : 10; }
+      if (ts > 0) usleep((unsigned)ts * 1000);
+    } /* sub-regiao menor que o fator: pula (1 texel de borda, inofensivo) */
+    static int dn = 0; static long long capb = 0;
+    capb += (long long)w * h * (fmt_bpp(fmt) ? fmt_bpp(fmt) : 4);
+    if (dn < 10 || (dn % 25) == 0)
+      fprintf(stderr, "[TEXSUB-CAP] #%d t=%lds %dx%d>>%d fmt=0x%x total=%lldMB\n",
+              dn, hk_secs(), w, h, sh, fmt, capb >> 20);
+    dn++;
+    return;
+  }
   if (real_glTexSubImage2D) real_glTexSubImage2D(t, lv, xo, yo, w, h, fmt, type, px);
   static int n = 0;
   if (n < 25) { int e = real_glGetError ? real_glGetError() : 0;
@@ -97,8 +184,15 @@ static unsigned diag_glCheckFramebufferStatus(unsigned target) {
 static struct { unsigned target; long offset; long length; void *ptr; } g_mapbuf[16];
 static void (*real_glBufferSubData)(unsigned, long, long, const void *) = 0;
 static void (*real_glBufferData)(unsigned, long, const void *, unsigned) = 0;
+static unsigned char *ubo_shadow(unsigned id, long need);  /* fwd (emulacao UBO) */
+static unsigned g_bound_ubo_fwd(void);
 static void *emul_glMapBufferRange(unsigned target, long offset, long length, unsigned access) {
   (void)access;
+  if (target == 0x8A11) {  /* GL_UNIFORM_BUFFER: escreve DIRETO no shadow CPU */
+    unsigned char *d = ubo_shadow(g_bound_ubo_fwd(), offset + length);
+    static int un = 0; if (un < 6) { fprintf(stderr, "[MAPBUF] UBO map off=%ld len=%ld\n", offset, length); un++; }
+    return d ? d + offset : 0;
+  }
   void *p = malloc(length > 0 ? (size_t)length : 1);
   for (int i = 0; i < 16; i++)
     if (!g_mapbuf[i].ptr) { g_mapbuf[i].target = target; g_mapbuf[i].offset = offset;
@@ -136,6 +230,83 @@ static unsigned char emul_glUnmapBuffer(unsigned target) {
     }
   return 1;
 }
+/* ---- EMULACAO UBO (GL_UNIFORM_BUFFER 0x8A11) + INSTANCING GLES3->GLES2 ----
+   Os sprites do HK usam instancing: matrizes por-instancia vao num UBO
+   (UnityInstancing_PerDraw0/PerDrawSprite) + glDrawElementsInstanced. Em GLES2
+   nada disso existe -> shadow CPU do UBO + uniforms planos (tradutor desliga
+   HLSLCC_ENABLE_UNIFORM_BUFFERS) + loop de draws com u_hk_instID. */
+static unsigned g_cur_program = 0;
+static unsigned g_cur_fbo = 0;  /* 0 = tela (default framebuffer) */
+static void (*real_glBindFramebuffer)(unsigned, unsigned) = 0;
+static void my_glBindFramebuffer(unsigned target, unsigned fb) {
+  if (!real_glBindFramebuffer) real_glBindFramebuffer = (void (*)(unsigned, unsigned))dlsym(RTLD_DEFAULT, "glBindFramebuffer");
+  if (target == 0x8D40 || target == 0x8CA9) g_cur_fbo = fb;  /* FRAMEBUFFER / DRAW_FRAMEBUFFER */
+  if (real_glBindFramebuffer) real_glBindFramebuffer(target == 0x8CA9 ? 0x8D40 : target, fb);
+}
+static void (*real_glUseProgram)(unsigned) = 0;
+static void my_glUseProgram(unsigned p) {
+  if (!real_glUseProgram) real_glUseProgram = (void (*)(unsigned))dlsym(RTLD_DEFAULT, "glUseProgram");
+  g_cur_program = p;
+  if (real_glUseProgram) real_glUseProgram(p);
+}
+#define UBON 256
+static struct { unsigned id; unsigned char *data; long size; } g_ubostore[UBON];
+static unsigned g_bound_ubo = 0;
+static unsigned g_bound_ubo_fwd(void) { return g_bound_ubo; }
+static struct { unsigned buf; long offset; } g_ubo_bindpt[8];
+static unsigned char *ubo_shadow(unsigned id, long need) {
+  if (!id) return 0;
+  int free_i = -1;
+  for (int i = 0; i < UBON; i++) {
+    if (g_ubostore[i].id == id) {
+      if (need > g_ubostore[i].size) {
+        g_ubostore[i].data = (unsigned char *)realloc(g_ubostore[i].data, (size_t)need);
+        memset(g_ubostore[i].data + g_ubostore[i].size, 0, (size_t)(need - g_ubostore[i].size));
+        g_ubostore[i].size = need;
+      }
+      return g_ubostore[i].data;
+    }
+    if (free_i < 0 && !g_ubostore[i].id) free_i = i;
+  }
+  if (free_i < 0) return 0;
+  g_ubostore[free_i].id = id;
+  g_ubostore[free_i].size = need > 0 ? need : 16384;
+  g_ubostore[free_i].data = (unsigned char *)calloc(1, (size_t)g_ubostore[free_i].size);
+  return g_ubostore[free_i].data;
+}
+static void (*real_glBindBuffer)(unsigned, unsigned) = 0;
+static void my_glBindBuffer(unsigned target, unsigned buf) {
+  if (target == 0x8A11) { g_bound_ubo = buf; return; } /* driver GLES2 nao conhece */
+  if (!real_glBindBuffer) real_glBindBuffer = (void (*)(unsigned, unsigned))dlsym(RTLD_DEFAULT, "glBindBuffer");
+  if (real_glBindBuffer) real_glBindBuffer(target, buf);
+}
+static void (*real_glBufferData2)(unsigned, long, const void *, unsigned) = 0;
+static void my_glBufferData(unsigned target, long size, const void *data, unsigned usage) {
+  if (target == 0x8A11) {
+    unsigned char *d = ubo_shadow(g_bound_ubo, size);
+    if (d && data) memcpy(d, data, (size_t)size);
+    return;
+  }
+  if (!real_glBufferData2) real_glBufferData2 = (void (*)(unsigned, long, const void *, unsigned))dlsym(RTLD_DEFAULT, "glBufferData");
+  if (real_glBufferData2) real_glBufferData2(target, size, data, usage);
+}
+static void (*real_glBufferSubData2)(unsigned, long, long, const void *) = 0;
+static void my_glBufferSubData(unsigned target, long off, long size, const void *data) {
+  if (target == 0x8A11) {
+    unsigned char *d = ubo_shadow(g_bound_ubo, off + size);
+    if (d && data) memcpy(d + off, data, (size_t)size);
+    return;
+  }
+  if (!real_glBufferSubData2) real_glBufferSubData2 = (void (*)(unsigned, long, long, const void *))dlsym(RTLD_DEFAULT, "glBufferSubData");
+  if (real_glBufferSubData2) real_glBufferSubData2(target, off, size, data);
+}
+static void emul_glBindBufferRange(unsigned target, unsigned index, unsigned buf, long offset, long size) {
+  (void)size;
+  if (target == 0x8A11 && index < 8) { g_ubo_bindpt[index].buf = buf; g_ubo_bindpt[index].offset = offset; }
+}
+static void emul_glBindBufferBase(unsigned target, unsigned index, unsigned buf) {
+  emul_glBindBufferRange(target, index, buf, 0, 0);
+}
 /* DIAG: os draws acontecem e passam? (render preto = ou nao desenha ou erra) */
 static void (*real_glDrawElements)(unsigned, int, unsigned, const void *) = 0;
 static void diag_glDrawElements(unsigned mode, int count, unsigned type, const void *idx) {
@@ -144,21 +315,96 @@ static void diag_glDrawElements(unsigned mode, int count, unsigned type, const v
   unsigned pre = real_glGetError ? (unsigned)real_glGetError() : 0; /* limpa + captura acumulado */
   if (real_glDrawElements) real_glDrawElements(mode, count, type, idx);
   static int n = 0;
-  if (n < 25) { unsigned post = real_glGetError ? (unsigned)real_glGetError() : 0;
-    fprintf(stderr, "[DRAW] mode=0x%x count=%d type=0x%x pre=0x%x draw_err=0x%x\n", mode, count, type, pre, post); n++; }
+  /* periodico: 25 no inicio + rajadas de 8 a cada 5000 draws (ver o ESTADO ESTAVEL) */
+  if (n < 25 || (n % 5000) < 8) { unsigned post = real_glGetError ? (unsigned)real_glGetError() : 0;
+    fprintf(stderr, "[DRAW] #%d t=%lds mode=0x%x count=%d type=0x%x pre=0x%x draw_err=0x%x prog=%u fbo=%u\n",
+            n, hk_secs(), mode, count, type, pre, post, g_cur_program, g_cur_fbo); }
+  n++;
+}
+/* INSTANCING: sobe o shadow dos UBOs como uniforms planos + loop de draws */
+static int (*real_glGetUniformLocation)(unsigned, const char *) = 0;
+static void (*real_glUniform1i)(int, int) = 0;
+static void (*real_glUniform4fvI)(int, int, const float *) = 0;
+static void (*real_glUniform2fvI)(int, int, const float *) = 0;
+static void (*real_glDrawArrays)(unsigned, int, int) = 0;
+static void inst_resolve(void) {
+  if (!real_glGetUniformLocation) real_glGetUniformLocation = (int (*)(unsigned, const char *))dlsym(RTLD_DEFAULT, "glGetUniformLocation");
+  if (!real_glUniform1i) real_glUniform1i = (void (*)(int, int))dlsym(RTLD_DEFAULT, "glUniform1i");
+  if (!real_glUniform4fvI) real_glUniform4fvI = (void (*)(int, int, const float *))dlsym(RTLD_DEFAULT, "glUniform4fv");
+  if (!real_glUniform2fvI) real_glUniform2fvI = (void (*)(int, int, const float *))dlsym(RTLD_DEFAULT, "glUniform2fv");
+  if (!real_glDrawElements) real_glDrawElements = (void (*)(unsigned, int, unsigned, const void *))dlsym(RTLD_DEFAULT, "glDrawElements");
+  if (!real_glDrawArrays) real_glDrawArrays = (void (*)(unsigned, int, int))dlsym(RTLD_DEFAULT, "glDrawArrays");
+}
+/* layout std140 dos blocos hlslcc do HK:
+   binding 0 UnityInstancing_PerDraw0: unity_Builtins0Array[i] = ObjectToWorld(64B)+WorldToObject(64B)
+   binding 1 UnityInstancing_PerDrawSprite: PerDrawSpriteArray[i] = vec4 color(16B)+vec2 flip(+pad=16B) */
+static void upload_hk_instancing(void) {
+  inst_resolve();
+  if (!real_glGetUniformLocation || !real_glUniform4fvI) return;
+  unsigned char *d0 = g_ubo_bindpt[0].buf ? ubo_shadow(g_ubo_bindpt[0].buf, 0) : 0;
+  if (d0) {
+    d0 += g_ubo_bindpt[0].offset;
+    for (int i = 0; i < 8; i++) {
+      char nm[96]; int loc;
+      snprintf(nm, sizeof nm, "unity_Builtins0Array[%d].hlslcc_mtx4x4unity_ObjectToWorldArray", i);
+      loc = real_glGetUniformLocation(g_cur_program, nm);
+      if (loc < 0 && i > 0) break;
+      if (loc >= 0) real_glUniform4fvI(loc, 4, (const float *)(d0 + (size_t)i * 128));
+      snprintf(nm, sizeof nm, "unity_Builtins0Array[%d].hlslcc_mtx4x4unity_WorldToObjectArray", i);
+      loc = real_glGetUniformLocation(g_cur_program, nm);
+      if (loc >= 0) real_glUniform4fvI(loc, 4, (const float *)(d0 + (size_t)i * 128 + 64));
+    }
+  }
+  unsigned char *d1 = g_ubo_bindpt[1].buf ? ubo_shadow(g_ubo_bindpt[1].buf, 0) : 0;
+  if (d1) {
+    d1 += g_ubo_bindpt[1].offset;
+    for (int i = 0; i < 8; i++) {
+      char nm[96]; int loc;
+      snprintf(nm, sizeof nm, "PerDrawSpriteArray[%d].unity_SpriteRendererColorArray", i);
+      loc = real_glGetUniformLocation(g_cur_program, nm);
+      if (loc < 0 && i > 0) break;
+      if (loc >= 0) real_glUniform4fvI(loc, 1, (const float *)(d1 + (size_t)i * 32));
+      snprintf(nm, sizeof nm, "PerDrawSpriteArray[%d].unity_SpriteFlipArray", i);
+      loc = real_glGetUniformLocation(g_cur_program, nm);
+      if (loc >= 0 && real_glUniform2fvI) real_glUniform2fvI(loc, 1, (const float *)(d1 + (size_t)i * 32 + 16));
+    }
+  }
+}
+static void emul_glDrawElementsInstanced(unsigned mode, int count, unsigned type, const void *idx, int n) {
+  inst_resolve();
+  upload_hk_instancing();
+  int loc = real_glGetUniformLocation ? real_glGetUniformLocation(g_cur_program, "u_hk_instID") : -1;
+  static int iln = 0;
+  if (iln < 12) { fprintf(stderr, "[INST] DrawElementsInstanced n=%d count=%d prog=%u instloc=%d\n", n, count, g_cur_program, loc); iln++; }
+  for (int i = 0; i < n; i++) {
+    if (loc >= 0 && real_glUniform1i) real_glUniform1i(loc, i);
+    if (real_glDrawElements) real_glDrawElements(mode, count, type, idx);
+  }
+}
+static void emul_glDrawArraysInstanced(unsigned mode, int first, int count, int n) {
+  inst_resolve();
+  upload_hk_instancing();
+  int loc = real_glGetUniformLocation ? real_glGetUniformLocation(g_cur_program, "u_hk_instID") : -1;
+  static int iln = 0;
+  if (iln < 12) { fprintf(stderr, "[INST] DrawArraysInstanced n=%d count=%d prog=%u instloc=%d\n", n, count, g_cur_program, loc); iln++; }
+  for (int i = 0; i < n; i++) {
+    if (loc >= 0 && real_glUniform1i) real_glUniform1i(loc, i);
+    if (real_glDrawArrays) real_glDrawArrays(mode, first, count);
+  }
 }
 /* DIAG: as matrizes (projecao/modelview) sao setadas? (nao setadas -> gl_Position degenerado) */
 static void (*real_glUniform4fv)(int, int, const float *) = 0;
 static void diag_glUniform4fv(int loc, int count, const float *v) {
   if (!real_glUniform4fv) real_glUniform4fv = (void (*)(int, int, const float *))dlsym(RTLD_DEFAULT, "glUniform4fv");
   static int n = 0;
-  if (n < 20 && v) {
+  /* periodico: 20 no inicio + rajadas de 10 a cada 8000 (matrizes no estado estavel) */
+  if ((n < 20 || (n % 8000) < 10) && v) {
     if (count == 4)
-      fprintf(stderr, "[U4FV] loc=%d MAT [%.2f %.2f %.2f %.2f][%.2f %.2f %.2f %.2f][%.2f %.2f %.2f %.2f][%.2f %.2f %.2f %.2f]\n",
-              loc, v[0],v[1],v[2],v[3], v[4],v[5],v[6],v[7], v[8],v[9],v[10],v[11], v[12],v[13],v[14],v[15]);
-    else fprintf(stderr, "[U4FV] loc=%d count=%d v=%.2f %.2f %.2f %.2f\n", loc, count, v[0], v[1], v[2], v[3]);
-    n++;
+      fprintf(stderr, "[U4FV] #%d t=%lds loc=%d MAT [%.2f %.2f %.2f %.2f][%.2f %.2f %.2f %.2f][%.2f %.2f %.2f %.2f][%.2f %.2f %.2f %.2f]\n",
+              n, hk_secs(), loc, v[0],v[1],v[2],v[3], v[4],v[5],v[6],v[7], v[8],v[9],v[10],v[11], v[12],v[13],v[14],v[15]);
+    else fprintf(stderr, "[U4FV] #%d t=%lds loc=%d count=%d v=%.2f %.2f %.2f %.2f\n", n, hk_secs(), loc, count, v[0], v[1], v[2], v[3]);
   }
+  n++;
   if (real_glUniform4fv) real_glUniform4fv(loc, count, v);
 }
 static void (*real_glUniformMatrix4fv)(int, int, unsigned char, const float *) = 0;
@@ -221,6 +467,15 @@ static void *my_dlsym(void *h, const char *sym) {
     if (strcmp(sym, "glUniformMatrix4fv") == 0)                      return (void *)diag_glUniformMatrix4fv;
     if (strcmp(sym, "glViewport") == 0)                              return (void *)diag_glViewport;
     if (strcmp(sym, "glScissor") == 0)                               return (void *)diag_glScissor;
+    /* ANTI-WEDGE: glFinish satura o Utgard (Bully) -> no-op (religa: HK_ALLOWFINISH=1) */
+    if (!getenv("HK_ALLOWFINISH") && strcmp(sym, "glFinish") == 0)   return (void *)noop_glFinish;
+    if (texcap() && strcmp(sym, "glBindTexture") == 0)               return (void *)my_glBindTexture;
+    /* UBO shadow + instancing (sprites): rastreia program/buffers */
+    if (strcmp(sym, "glBindFramebuffer") == 0)                       return (void *)my_glBindFramebuffer;
+    if (strcmp(sym, "glUseProgram") == 0)                            return (void *)my_glUseProgram;
+    if (strcmp(sym, "glBindBuffer") == 0)                            return (void *)my_glBindBuffer;
+    if (strcmp(sym, "glBufferData") == 0)                            return (void *)my_glBufferData;
+    if (strcmp(sym, "glBufferSubData") == 0)                         return (void *)my_glBufferSubData;
   }
   void *r = dlsym(h, sym);
   /* HK Mali-450: funcao GLES3 ausente -> devolve STUB (nao NULL) p/ evitar crash/loop.
@@ -233,6 +488,10 @@ static void *my_dlsym(void *h, const char *sym) {
     else if (strcmp(sym, "glGetSynciv") == 0)        r = (void *)stub_glGetSynciv;
     else if (strcmp(sym, "glMapBufferRange") == 0)   r = (void *)emul_glMapBufferRange;
     else if (strcmp(sym, "glUnmapBuffer") == 0)      r = (void *)emul_glUnmapBuffer;
+    else if (strcmp(sym, "glBindBufferRange") == 0)  r = (void *)emul_glBindBufferRange;
+    else if (strcmp(sym, "glBindBufferBase") == 0)   r = (void *)emul_glBindBufferBase;
+    else if (strcmp(sym, "glDrawElementsInstanced") == 0) r = (void *)emul_glDrawElementsInstanced;
+    else if (strcmp(sym, "glDrawArraysInstanced") == 0)   r = (void *)emul_glDrawArraysInstanced;
     else                                             r = (void *)stub_gl_noop;
     static int n = 0;
     if (n++ < 60) fprintf(stderr, "[gl stub] %s\n", sym);
@@ -400,6 +659,22 @@ static char *translate_gles3_gles2(const char *src) {
   int is_frag = (strstr(src, "gl_Position") == NULL); /* sem gl_Position = fragment */
   char *s = str_rep(src, "#version 300 es", "#version 100");
   char *t = str_rep(s, "texture(", "texture2D("); free(s); s = t;
+  /* INSTANCING (sprites do HK): o boilerplate hlslcc tem #if HLSLCC_ENABLE_UNIFORM_BUFFERS
+     em volta dos blocos UBO -> flag 0 = membros viram uniforms PLANOS (struct array, ES2 ok).
+     gl_InstanceID nao existe em ES2 -> uniform u_hk_instID setado pelo emul_DrawInstanced.
+     Shifts << sao proibidos em GLSL ES 100 -> multiplicacao. */
+  if (strstr(s, "HLSLCC_ENABLE_UNIFORM_BUFFERS 1")) {
+    t = str_rep(s, "#define HLSLCC_ENABLE_UNIFORM_BUFFERS 1",
+                   "#define HLSLCC_ENABLE_UNIFORM_BUFFERS 0"); free(s); s = t;
+  }
+  if (strstr(s, "gl_InstanceID")) {
+    t = str_rep(s, "gl_InstanceID", "u_hk_instID"); free(s); s = t;
+    t = str_rep(s, "#version 100", "#version 100\nuniform int u_hk_instID;"); free(s); s = t;
+  }
+  t = str_rep(s, "<< int(1)", "* 2"); free(s); s = t;
+  t = str_rep(s, "<< int(2)", "* 4"); free(s); s = t;
+  t = str_rep(s, "<< int(3)", "* 8"); free(s); s = t;
+  t = str_rep(s, "<< int(4)", "* 16"); free(s); s = t;
   if (is_frag) {
     /* GLES2 nao tem `out` de fragment: SV_Target0 -> gl_FragColor (built-in) */
     t = str_rep(s, "layout(location = 0) out mediump vec4 SV_Target0;", ""); free(s); s = t;
@@ -420,6 +695,8 @@ static char *translate_gles3_gles2(const char *src) {
     t = str_rep(s, "\nout ", "\nvarying "); free(s); s = t;   /* saidas de vertex */
     if (getenv("HK_VTXRAW")) { /* DEBUG: bypassa as matrizes -> gl_Position = posicao crua */
       t = str_rep(s, "return;", "gl_Position = in_POSITION0; return;"); free(s); s = t;
+    } else if (getenv("HK_VTXZOOM")) { /* DEBUG: zoom-out 2x -> conteudo "logo fora da tela" aparece */
+      t = str_rep(s, "return;", "gl_Position.xy *= 0.5; return;"); free(s); s = t;
     }
   }
   return s;

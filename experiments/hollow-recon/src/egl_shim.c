@@ -294,9 +294,17 @@ EGLBoolean egl_shim_SwapBuffers(EGLDisplay dpy, EGLSurface surface) {
       glClear(0x4000);                       /* GL_COLOR_BUFFER_BIT */
     }
     SDL_GL_SwapWindow(egl_window);
+    /* ANTI-WEDGE: HK_SWAPMS=N dorme N ms por frame -> fila de comando da GPU
+       (1GB, Utgard) nao acumula/satura */
+    static int swapms = -1;
+    if (swapms < 0) { const char *e = getenv("HK_SWAPMS"); swapms = e ? atoi(e) : 0; }
+    if (swapms > 0) usleep((unsigned)swapms * 1000);
     int fc = ++frame_count;
-    if (fc <= 10 || fc % 30 == 0)
-      fprintf(stderr, "[SWAP] #%d\n", fc);
+    if (fc <= 10 || fc % 30 == 0) {
+      struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+      static long t0 = -1; if (t0 < 0) t0 = ts.tv_sec;
+      fprintf(stderr, "[SWAP] #%d t=%lds\n", fc, (long)(ts.tv_sec - t0));
+    }
   } else {
     static int noswap_log = 0;
     if (noswap_log < 3) {
@@ -380,6 +388,9 @@ void *egl_shim_GetProcAddress(const char *procname) {
     if (!strcmp(procname, "eglSwapInterval"))       return (void *)egl_shim_SwapInterval;
     if (!strcmp(procname, "eglMakeCurrent"))        return (void *)egl_shim_MakeCurrent;
   }
+  /* ANTI-WEDGE: glFinish satura o Utgard (Bully) -> no-op (religa: HK_ALLOWFINISH=1) */
+  if (procname && !getenv("HK_ALLOWFINISH") && !strcmp(procname, "glFinish"))
+    return (void *)gl_noop_stub;
   void *ptr = SDL_GL_GetProcAddress(procname);
   if (ptr) return ptr;
 

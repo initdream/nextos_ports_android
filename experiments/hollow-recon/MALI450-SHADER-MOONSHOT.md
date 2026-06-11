@@ -288,3 +288,124 @@ progride MENOS -> menos objetos posicionados -> render esparso.
    (virtual-call em x2). Achar/forjar esse objeto -> dirigir o vsync -> coroutines/async avancam.
 2. Emular o Looper Java no jni_shim (HandlerThread/getLooper/postFrameCallback + disparar doFrame).
 3. Tracear o que o jogo espera no estado parcial (qual yield/await nao resolve).
+
+## Atualização 2026-06-11 (parte 10) — retomada pós-Bogodroid: HK_PTHREAD_SHIM=1 é OBRIGATÓRIO
+- Voltamos pro nosso loader (decisão do Felipe: controle total > Bogodroid fechado, que confirmou
+  a parede do GfxDevice mas não dava pra patchar). Binário+assets ainda em /storage/hollow-recon/ (.87).
+- 🔑 **CRASH REPRODUZIDO + DIAGNOSTICADO:** rodar SEM `HK_PTHREAD_SHIM=1` → SEGV `lr=libil2cpp+0x68014c`.
+  Desmontagem (apkextract): `libil2cpp+0x680148 = bl pthread_cond_wait@plt` (x0=cond x24, x1=mutex x19;
+  incrementa contador [x21+96] antes). = **ABI bionic↔glibc**: libil2cpp passa pthread_cond_t BIONIC
+  (4B) p/ o pthread_cond_wait do glibc (48B) → lê lixo → fault. **FIX = HK_PTHREAD_SHIM=1** (traduz
+  bionic→glibc, já implementado em pthread_shim.c). As vitórias das partes 3-9 usavam o shim.
+- ⚠️ Run COM o shim **wedgou o device** (GPU/kernel travou, SSH inacessível, precisou power-cycle do
+  Felipe) ANTES de eu confirmar se passou do crash. Confirmar no próximo run pós-reboot.
+- ENV CORRETO p/ rodar: `HK_GLES2=1 HK_PTHREAD_SHIM=1 SDL_VIDEODRIVER=mali NODRIVER=1 GC_DONT_GC=1 sh saferun.sh 70`.
+- Insight do Bogodroid (FakeJni VM completa) p/ o muro de INPUT da tela de idioma — explorar depois.
+- Desmontagens cacheadas: ~/hollow-port/apkextract/lib/arm64-v8a/{libunity.so,libil2cpp.so} + /tmp/unity.dis.
+
+## Atualização 2026-06-11 (parte 11) — ANTI-WEDGE implementado (build local, aguardando device)
+- Run com HK_PTHREAD_SHIM=1 wedgou o device de novo (2o power-cycle do dia) ANTES de lermos o log.
+- MITIGAÇÕES novas (recon_egl.c + egl_shim.c), todas baseadas em wedges já resolvidos em outros ports:
+  - **glFinish → no-op** nos DOIS caminhos (my_dlsym + eglGetProcAddress). Religa: HK_ALLOWFINISH=1.
+    (Bully: "glFinish satura/wedge" o Utgard.)
+  - **HK_SWAPMS=N**: usleep N ms após SDL_GL_SwapWindow → fila de comando da GPU não acumula.
+  - **HK_TEXCAP=N**: textura > NxN é alocada reduzida (shift) no stub_glTexStorage2D + upload
+    downsampled point-sample no diag_glTexSubImage2D (rastreia bound tex via my_glBindTexture).
+    (Cuphead: texturas 2048² travavam o Utgard → CUP_TEXHALF=512.)
+- ⚠️ DESCOBERTA operacional: ~/.ssh/config mapeia 192.168.31.87 → HostName **192.168.31.89**.
+  O device REAL é .89; ping em .87 não diz nada. Pingar/scriptar SEMPRE .89.
+- ENV do próximo run (curto, 40s): HK_GLES2=1 HK_PTHREAD_SHIM=1 HK_SWAPMS=20 HK_TEXCAP=1024
+  SDL_VIDEODRIVER=mali NODRIVER=1 GC_DONT_GC=1 sh saferun.sh 40
+- 1o passo pós-reboot: LER run.log do wedge (sync 1s flushou) → onde travou decide o resto.
+
+## Atualização 2026-06-11 (parte 12) — 🔑 INSTANCING descoberto (provável causa do render esparso) + emulação implementada
+ANÁLISE DOS DUMPS (shdump/*.glsl): 4 dos 18 shaders (sh_006/010/014/016) são variantes de
+**INSTANCING de sprite** com UBO REAL: `UNITY_BINDING(0) uniform UnityInstancing_PerDraw0
+{ unity_Builtins0Array[2] }` (ObjectToWorld+WorldToObject por instância!) + `UnityInstancing_PerDrawSprite`
+(cor+flip) + `gl_InstanceID`. **Com o spoof GLES3, a Unity desenha sprites por glDrawElementsInstanced
+(era stub no-op SILENCIOSO = draws descartados!) com matrizes via UBO (stub = nunca chegam).**
+=> explica o render esparso E possivelmente as ObjectToWorld=0 (sprites instanciados sumiam).
+IMPLEMENTADO (recon_egl.c):
+1. Tradutor: `#define HLSLCC_ENABLE_UNIFORM_BUFFERS 1→0` (o próprio boilerplate hlslcc remove os
+   blocos UBO e os membros viram uniforms PLANOS struct-array, válido ES2); `gl_InstanceID`→
+   `uniform int u_hk_instID` (injetado pós-#version); `<< int(N)`→multiplicação (shift é proibido
+   em GLSL ES 100 — esses 4 shaders NUNCA compilaram antes, silenciosamente).
+2. UBO shadow CPU: my_glBindBuffer/my_glBufferData/my_glBufferSubData/emul_glMapBufferRange
+   desviam target 0x8A11 pra cópia CPU (não toca o driver GLES2 = sem INVALID_ENUM; o pre=0x500
+   misterioso dos draws provavelmente era isso). glBindBufferRange/Base registram binding→buffer.
+3. emul_glDrawElementsInstanced/ArraysInstanced: sobe o shadow dos 2 blocos como uniforms planos
+   (layout std140 hardcoded: Builtins0=128B/inst, Sprite=32B/inst) + loop u_hk_instID=i + draw.
+4. jni_shim: **NewObject/V/A implementados (slots 28-30)** capturando o COOKIE (jlong this C++)
+   do ChoreographerCallback → g_hk_choreo_cookie → main_recon HK_CHOREO agora chama
+   nOnChoreographer(env,clazz,cookie,frameTime) com o objeto REAL (antes crashava com lixo).
+Build OK. tools/next-run.sh automatiza: resgata log do wedge → deploya → roda 40s anti-wedge → coleta.
+
+## Atualização 2026-06-11 (parte 13) — 🏆 RODA CONTÍNUO 30fps no .89 + lições de memória
+- **RUN5 (360s, TEXCAP=512 estilo Cuphead, SEM zram) = MELHOR RUN DA HISTÓRIA no Mali-450:**
+  loading completo t≈67s (464MB de atlases downsampled), depois **7650 frames contínuos ~30fps**,
+  watchdog drain limpo (rc=70), device saudável (load 1.62), ES religou. Tela de IDIOMA alcançada
+  ("Restored language code EN" + draws de 42/48 índices = glifos de texto).
+- **pre=0x500 (INVALID_ENUM) SUMIU** — era o glBindBuffer(GL_UNIFORM_BUFFER) no driver GLES2;
+  o shadow de UBO comeu o bind. Draws agora pre=0x0 limpos.
+- **fb: 6 pixels verdes** em (639-641, 240) e (639-641, 720) — 2 pontinhos de 3px, x=centro.
+  Matrizes estado estável: loc3 ora ortho saudável [0.02,0.04] (=orthoSize 25, aspect 2.0 ≠ 1.78
+  real — screen 2:1 em algum lugar?), ora DEGENERADA (colunas x/y zeradas, translação -1,-1).
+  loc5/7 (MatrixVP) = identidade (Unity premultiplica). INST=0 (tela de idioma não usa instancing).
+  Cookie do Choreographer NUNCA criado (NewObject(ChoreographerCallback) não acontece — a thread
+  Java do Looper não roda; criação depende dela?).
+- **zram REPROVADO**: run6 com zram 768MB estagnou t=19s no pico do loading (compressão rouba RAM
+  da Unity em device de 832MB). saferun agora FORÇA zram OFF. Swap vfat-loop (run5) funciona.
+- **GC_INITIAL_HEAP_SIZE 512MB→128MB** (HK_GCHEAP override) — 512MB pré-alocado afogava o .89.
+- Watchdog gracioso (drain 2s pós-loop) FUNCIONA: rc=70 limpo em run5; o "_exit duro" do run6
+  (preso dentro do nativeRender) também NÃO wedgou.
+- PRÓXIMO: run7 = run5 + diags periódicos (matrizes/draws no estado estável); depois HK_FORCERED
+  p/ discriminar geometria-fora-da-tela vs fragment invisível na tela de idioma.
+
+## Atualização 2026-06-11 (parte 14) — runs 6/7 estagnam t=19s (NÃO era zram) + 2 fixes novos
+- run7 (zram OFF) estagnou IGUAL ao run6: t=19s, pós TEXSUB-CAP #9, sistema INTEIRO congela
+  (até o `echo >> mem.log` do shell para) com **338MB disponíveis** = NÃO é OOM. Destrava quando
+  o processo morre (_exit duro) → família WEDGE do driver Mali (fila/lock), reversível.
+  run5 idêntico passou = não-determinístico; run5 era o 1º run pós-boot (device fresco).
+- **FIX 1 (UAF de upload)**: nosso downsample fazia free() imediato pós glTexSubImage2D; Utgard
+  pode adiar a leitura pro flush → use-after-free no driver. Agora glFlush pós-upload + anel
+  de 8 buffers antes do free.
+- **FIX 2 (DisplayMetrics)**: GetIntField/GetFloatField NÃO EXISTIAM (stub 0) → widthPixels/
+  heightPixels/density = 0 via JNI → suspeita raiz das matrizes ortho DEGENERADAS (escala 0 =
+  ortho com largura infinita/lixo). Implementados (GetFieldID agora usa o registry de nomes;
+  width/height vêm do egl_shim; density 1.5/240dpi; vtable 100/101/102).
+- run8 = run5 env + os 2 fixes. Se as matrizes sararem → tela de idioma VISÍVEL?
+
+## Atualização 2026-06-11 (parte 15) — 🔥 MATRIZES SARARAM (DisplayMetrics!) + receita Cuphead completa
+- run9 (boot fresco, fix DisplayMetrics FIELDS): loading no ritmo do run5, 7410 swaps contínuos,
+  e a partir de t=94s **matrizes REAIS**: perspectiva [2.65/4.70] (aspect 1.77 ✓ curado!), objetos
+  com transform de verdade. ANTES: identidade/degenerada. **CAUSA-RAIZ era widthPixels=0 via JNI.**
+- glFlush por upload (run8) REPROVADO: wedge mais cedo (t=4s). Substituído por anel de 8 buffers +
+  usleep 10ms entre uploads grandes (HK_TEXSLEEP_MS).
+- **fb0 do .89 DECODIFICADO: 1280x720 stride 1280, DUPLA PÁGINA** (não 1920x1080!). Reinterpretado:
+  o conteúdo visível real é um pontinho no CENTRO (639-641, 358-360). Objetos calculados ~350px
+  não chegam ao screen → suspeita: cena renderiza num RT (TEXSTOR 1280x720 RGB565 0x8d62 existe)
+  e o composite final é o elo quebrado. FBO CheckStatus nunca é chamado pelo jogo.
+- **RECEITA CUPHEAD portada 100%** (o port Unity que RENDERIZA neste hardware): Display.getWidth/
+  getHeight/getRotation/getDisplayId no CallIntMethod (0 = "Unable to initialize Unity Engine") +
+  CallFloatMethod getRefreshRate→60Hz (0 quebra o engine) + DisplayMetrics fields (já tinha).
+- run10 = build com a receita completa. Plano B sem rebuild: HK_FORCERED discrimina geometria vs
+  fragment; plano C: investigar o composite RT→screen (RGB565 + GLES2).
+
+## Atualização 2026-06-11 (parte 16) — VEREDITO FORCERED + ponto de retomada EXATO
+- run10 (receita Cuphead completa: Display.getWidth/getHeight/getRotation/getDisplayId +
+  getRefreshRate 60Hz + DisplayMetrics): estável 7260 frames, respostas consumidas (9x), mas
+  ainda ~6 px no fb (cores variando = conteúdo vivo).
+- **run11 HK_FORCERED=1: 1 PIXEL VERMELHO PURO no centro** → NÃO é cor/textura/blend; a
+  geometria do passe de TELA colapsa num ponto. (Run wedgou em t=55s no loading — 3º run
+  pós-boot; padrão: 1º-2º runs pós-boot são os seguros.)
+- **MATEMÁTICA-CHAVE (run9 matrizes saudáveis):** objeto típico projeta em NDC (1.19, -1.07) =
+  POR UM FIO fora da tela (|1.0|=borda). Conteúdo existe e renderiza, mas ~20% "zoom-in demais".
+  Suspeitos: FOV/safe-area/insets via JNI, ou View matrix deslocada.
+- **PRÓXIMO PASSO PRONTO (build ok, NÃO testado):** run12 com `HK_VTXZOOM=1` (novo: vertex
+  shader ganha gl_Position.xy *= 0.5 = zoom-out 2x) + rastreio de FBO nos DRAWs (fbo= no log,
+  glBindFramebuffer interceptado). Se a cena aparecer em miniatura → confirmado "logo ali fora",
+  caçar o fator na fonte (getSafeInsets? Camera.fov? View). Se nada → investigar composite RT
+  (TEXSTOR 1280x720 RGB565) → tela.
+- ENV run12: HK_VTXZOOM=1 HK_GLES2=1 HK_PTHREAD_SHIM=1 HK_TEXCAP=512 HK_SWAPMS=20
+  SDL_VIDEODRIVER=mali NODRIVER=1 GC_DONT_GC=1 sh saferun.sh 300 (rodar como 1º run pós-boot!)
+- fb0 do .89: 1280x720 BGRA stride 1280 DUPLA página; tools/fb2png.py decodifica certo.

@@ -421,11 +421,18 @@ void recon_bp(void *utb) { g_recon_utb = (unsigned long)utb; __asm__ __volatile_
 #include <pthread.h>
 /* WATCHDOG: thread independente que auto-encerra o processo apos N segundos, p/ NUNCA
    deixar o device travado num bloqueio/spin de userspace. (GPU-hang D-state nao salva.) */
+volatile int g_hk_quit = 0;  /* watchdog -> render loop para LIMPO (teardown no meio de
+                                upload de textura wedga o driver Mali kernel 3.14) */
 static void *hk_watchdog(void *arg) {
   int secs = (int)(long)arg;
   for (int i = 0; i < secs; i++) { struct timespec ts = {1, 0}; nanosleep(&ts, NULL); }
-  static const char m[] = "[WATCHDOG] tempo esgotado -> _exit\n";
+  static const char m[] = "[WATCHDOG] tempo esgotado -> quit flag (drain)\n";
   if (write(2, m, sizeof(m) - 1) < 0) {}
+  g_hk_quit = 1;
+  /* fallback duro: se o loop nao parar em 6s (preso DENTRO do nativeRender), _exit */
+  for (int i = 0; i < 6; i++) { struct timespec ts = {1, 0}; nanosleep(&ts, NULL); }
+  static const char m2[] = "[WATCHDOG] drain nao terminou -> _exit duro\n";
+  if (write(2, m2, sizeof(m2) - 1) < 0) {}
   _exit(70);
   return NULL;
 }
@@ -447,7 +454,9 @@ int main(int argc, char **argv) {
      e estavel (usa +RAM, sobra nos 3.6GB do device). GC_KEEP=1 reativa o GC. */
   if (!getenv("GC_KEEP")) {
     setenv("GC_DONT_GC", "1", 1);
-    setenv("GC_INITIAL_HEAP_SIZE", "536870912", 1);
+    /* 128MB no .89 (832MB RAM): 512MB pre-alocado afogava o device em swap.
+       Override: HK_GCHEAP=<bytes>. */
+    setenv("GC_INITIAL_HEAP_SIZE", getenv("HK_GCHEAP") ? getenv("HK_GCHEAP") : "134217728", 1);
   }
 
   static char altstack[64 * 1024];
@@ -765,17 +774,24 @@ int main(int argc, char **argv) {
     long pace = getenv("HK_PACE_US") ? atol(getenv("HK_PACE_US")) : 14000;
     /* CHOREOGRAPHER nativo: chamar nOnChoreographer a cada frame = dirige o vsync do Swappy
        SEM Looper Java. Sem isso o jogo TRAVA no init esperando o frame-callback. HK_NOCHOREO desliga. */
-    /* nOnChoreographer(env,thiz,x2) e um thunk que faz virtual-call em x2 (objeto Swappy),
-       nao aceita frametime cru -> crasha. Precisa do objeto de contexto real. Gated HK_CHOREO. */
+    /* nOnChoreographer(env,thiz,cookie,frameTime) e um thunk que faz virtual-call em x2
+       (cookie = OBJETO C++ Swappy que a Unity passa ao criar o ChoreographerCallback JAVA
+       via NewObject — agora CAPTURADO no jni_shim em g_hk_choreo_cookie). Gated HK_CHOREO. */
+    extern long long g_hk_choreo_cookie;
     void *choreo = 0;
     if (getenv("HK_CHOREO")) {
       so_module *sv = so_save(); so_use(g_m_unity);
       choreo = (void *)so_find_addr("Java_com_google_androidgamesdk_ChoreographerCallback_nOnChoreographer");
       so_use(sv); free(sv);
-      fprintf(stderr, "[CHOREO] nOnChoreographer @ %p\n", choreo);
+      fprintf(stderr, "[CHOREO] nOnChoreographer @ %p cookie=0x%llx\n", choreo, g_hk_choreo_cookie);
     }
-    for (long frame = 0; cap == 0 || frame < cap; frame++) {
-      if (choreo) ((void (*)(void *, void *, long long))choreo)(fake_env, &t, (long long)frame * 16666666LL);
+    for (long frame = 0; (cap == 0 || frame < cap) && !g_hk_quit; frame++) {
+      if (choreo && g_hk_choreo_cookie) {
+        static int clog = 0;
+        if (clog < 3) { fprintf(stderr, "[CHOREO] doFrame #%ld cookie=0x%llx\n", frame, g_hk_choreo_cookie); clog++; }
+        ((void (*)(void *, void *, long long, long long))choreo)(
+            fake_env, &t, g_hk_choreo_cookie, (long long)frame * 16666666LL);
+      }
       unsigned char r = rf(fake_env, &t);
       /* TESTE sem teclado fisico: HK_AUTOKEY=<keycode> aperta a tecla a cada ~3s
          (depois do frame 240) p/ validar a injecao por SSH (66=ENTER, 23=DPAD_CENTER) */
@@ -808,7 +824,12 @@ int main(int argc, char **argv) {
       else if (frame % 120 == 0) fprintf(stderr, "---- render frame %ld (vivo) ----\n", frame);
       if (pace > 0) usleep(pace); /* pacing manual ~60fps (sem vsync real) */
     }
-    fprintf(stderr, "[16] render loop terminou (cap=%ld)\n", cap);
+    fprintf(stderr, "[16] render loop terminou (cap=%ld quit=%d)\n", cap, g_hk_quit);
+    if (g_hk_quit) {  /* drain: GPU termina os jobs pendentes ANTES do teardown */
+      struct timespec ts = {2, 0}; nanosleep(&ts, NULL);
+      fprintf(stderr, "[16b] drain ok -> _exit limpo\n");
+      _exit(70);
+    }
   }
   return 0;
 }

@@ -230,10 +230,62 @@ static void *class_for(const char *name) {
   g_classreg[i].name = name;
   return &g_classreg[i].tag;
 }
+static const char *class_name_of(void *clazz) {
+  for (int i = 0; i < g_classreg_n; i++)
+    if (clazz == &g_classreg[i].tag) return g_classreg[i].name;
+  return NULL;
+}
 static void *jni_FindClass(void *env, const char *name) {
   (void)env;
   debugPrintf("jni_shim: FindClass(%s)\n", name);
   return class_for(name);
+}
+
+/* ===== NewObject (28/29/30) =====
+   O Swappy do Unity cria o ChoreographerCallback JAVA via NewObject passando
+   (jlong)this = o OBJETO C++ que o nOnChoreographer (thunk virtual-call em x2)
+   PRECISA. Capturamos o cookie aqui -> main_recon dirige o vsync de verdade. */
+long long g_hk_choreo_cookie = 0;  /* exportado p/ main_recon */
+static int g_obj_newobject;
+static void *jni_NewObjectV(void *env, void *clazz, void *methodID, va_list ap) {
+  (void)env;
+  const char *cn = class_name_of(clazz);
+  const char *sig = NULL;
+  if ((char *)methodID >= (char *)g_midreg && (char *)methodID < (char *)(g_midreg + 1024))
+    sig = ((struct mid_entry *)methodID)->sig;
+  debugPrintf("jni_shim: NewObject(%s, ctor %s)\n", cn ? cn : "?", sig ? sig : "?");
+  /* ctor com 1o arg long (J...) -> provavel cookie de objeto nativo */
+  if (sig && sig[0] == '(' && sig[1] == 'J') {
+    long long cookie = va_arg(ap, long long);
+    debugPrintf("jni_shim: NewObject cookie=0x%llx\n", cookie);
+    if (cn && strstr(cn, "ChoreographerCallback")) {
+      g_hk_choreo_cookie = cookie;
+      debugPrintf("jni_shim: 🔑 CHOREO cookie CAPTURADO = 0x%llx\n", cookie);
+    }
+  }
+  return &g_obj_newobject;
+}
+static void *jni_NewObject(void *env, void *clazz, void *methodID, ...) {
+  va_list ap; va_start(ap, methodID);
+  void *r = jni_NewObjectV(env, clazz, methodID, ap);
+  va_end(ap);
+  return r;
+}
+static void *jni_NewObjectA(void *env, void *clazz, void *methodID, const long long *args) {
+  (void)env;
+  const char *cn = class_name_of(clazz);
+  const char *sig = NULL;
+  if ((char *)methodID >= (char *)g_midreg && (char *)methodID < (char *)(g_midreg + 1024))
+    sig = ((struct mid_entry *)methodID)->sig;
+  debugPrintf("jni_shim: NewObjectA(%s, ctor %s)\n", cn ? cn : "?", sig ? sig : "?");
+  if (sig && sig[0] == '(' && sig[1] == 'J' && args) {
+    debugPrintf("jni_shim: NewObjectA cookie=0x%llx\n", args[0]);
+    if (cn && strstr(cn, "ChoreographerCallback")) {
+      g_hk_choreo_cookie = args[0];
+      debugPrintf("jni_shim: 🔑 CHOREO cookie CAPTURADO (A) = 0x%llx\n", args[0]);
+    }
+  }
+  return &g_obj_newobject;
 }
 
 static void *jni_GetMethodID(void *env, void *clazz, const char *name,
@@ -257,7 +309,38 @@ static void *jni_GetFieldID(void *env, void *clazz, const char *name,
   (void)env;
   (void)clazz;
   debugPrintf("jni_shim: GetFieldID(%s, %s)\n", name, sig);
-  return &g_method_tags[FID_GENERIC];
+  return reg_mid(name, sig);  /* registry com NOME -> GetIntField/FloatField respondem certo */
+}
+
+/* ===== Get<Type>Field (100/102/...) =====
+   DisplayMetrics & cia: campos lidos via JNI. Stub generico devolvia 0 ->
+   widthPixels/heightPixels/density = 0 -> ortho do canvas DEGENERADA (escala 0). */
+extern int egl_shim_width(void), egl_shim_height(void);
+static jint jni_GetIntField(void *env, void *obj, void *fieldID) {
+  (void)env; (void)obj;
+  const char *nm = mid_name(fieldID);
+  if (nm) {
+    if (strcmp(nm, "widthPixels") == 0)  { debugPrintf("[METRICS] widthPixels=%d\n", egl_shim_width()); return egl_shim_width(); }
+    if (strcmp(nm, "heightPixels") == 0) { debugPrintf("[METRICS] heightPixels=%d\n", egl_shim_height()); return egl_shim_height(); }
+    if (strcmp(nm, "densityDpi") == 0)   return 240;
+  }
+  debugPrintf("jni_shim: GetIntField(%s) -> 0\n", nm ? nm : "?");
+  return 0;
+}
+static float jni_GetFloatField(void *env, void *obj, void *fieldID) {
+  (void)env; (void)obj;
+  const char *nm = mid_name(fieldID);
+  if (nm) {
+    if (strcmp(nm, "density") == 0 || strcmp(nm, "scaledDensity") == 0) return 1.5f;
+    if (strcmp(nm, "xdpi") == 0 || strcmp(nm, "ydpi") == 0) return 240.0f;
+    if (strcmp(nm, "refreshRate") == 0) return 60.0f;
+  }
+  debugPrintf("jni_shim: GetFloatField(%s) -> 0\n", nm ? nm : "?");
+  return 0.0f;
+}
+static long long jni_GetLongField(void *env, void *obj, void *fieldID) {
+  (void)env; (void)obj; (void)fieldID;
+  return 0;
 }
 
 static void *jni_GetStaticFieldID(void *env, void *clazz, const char *name,
@@ -358,6 +441,14 @@ static jint jni_CallIntMethodV(void *env, void *obj, void *methodID,
     if (strcmp(nm, "getFlags") == 0) return g_hk_inject.flags;
     if (strcmp(nm, "getUnicodeChar") == 0) return g_hk_inject.unicode;
     if (strcmp(nm, "size") == 0) return 0; /* List/Collection vazia */
+    /* ---- Display (receita do CUPHEAD que renderiza no Mali-450): a Unity pergunta
+       a resolucao TAMBEM por metodos; 0 -> camera/ortho degenerada -> tela preta. */
+    if (strcmp(nm, "getWidth") == 0 || strcmp(nm, "getRawWidth") == 0) {
+      debugPrintf("[DISPLAY] getWidth->%d\n", egl_shim_width()); return egl_shim_width(); }
+    if (strcmp(nm, "getHeight") == 0 || strcmp(nm, "getRawHeight") == 0) {
+      debugPrintf("[DISPLAY] getHeight->%d\n", egl_shim_height()); return egl_shim_height(); }
+    if (strcmp(nm, "getRotation") == 0) return 0;
+    if (strcmp(nm, "getDisplayId") == 0) return 0;
   }
   struct astream *s = astream_find(obj);
   if (s && nm) {
@@ -383,6 +474,21 @@ static jint jni_CallIntMethodV(void *env, void *obj, void *methodID,
 static jint jni_CallIntMethod(void *env, void *obj, void *methodID, ...) {
   va_list ap; va_start(ap, methodID);
   jint r = jni_CallIntMethodV(env, obj, methodID, ap);
+  va_end(ap);
+  return r;
+}
+
+/* CallFloatMethod (55/56) — receita do Cuphead: Display.getRefreshRate() -> 60Hz
+   (0 quebra o engine/frame pacing). */
+static float jni_CallFloatMethodV(void *env, void *obj, void *methodID, va_list ap) {
+  (void)env; (void)obj; (void)ap;
+  const char *nm = mid_name(methodID);
+  if (nm && strcmp(nm, "getRefreshRate") == 0) { debugPrintf("[DISPLAY] getRefreshRate->60\n"); return 60.0f; }
+  return 0.0f;
+}
+static float jni_CallFloatMethod(void *env, void *obj, void *methodID, ...) {
+  va_list ap; va_start(ap, methodID);
+  float r = jni_CallFloatMethodV(env, obj, methodID, ap);
   va_end(ap);
   return r;
 }
@@ -700,6 +806,9 @@ void jni_shim_init(void **out_vm, void **out_env) {
   jni_env_vtable[23] = (uintptr_t)jni_DeleteLocalRef;
   jni_env_vtable[25] = (uintptr_t)jni_NewLocalRef;
   jni_env_vtable[24] = (uintptr_t)jni_IsSameObject;
+  jni_env_vtable[28] = (uintptr_t)jni_NewObject;
+  jni_env_vtable[29] = (uintptr_t)jni_NewObjectV;
+  jni_env_vtable[30] = (uintptr_t)jni_NewObjectA;
   jni_env_vtable[31] = (uintptr_t)jni_GetObjectClass;
   jni_env_vtable[32] = (uintptr_t)jni_IsInstanceOf;
   jni_env_vtable[33] = (uintptr_t)jni_GetMethodID;
@@ -714,6 +823,11 @@ void jni_shim_init(void **out_vm, void **out_env) {
   jni_env_vtable[61] = (uintptr_t)jni_CallVoidMethod;
   jni_env_vtable[62] = (uintptr_t)jni_CallVoidMethod;      /* V */
   jni_env_vtable[94] = (uintptr_t)jni_GetFieldID;
+  jni_env_vtable[100] = (uintptr_t)jni_GetIntField;
+  jni_env_vtable[101] = (uintptr_t)jni_GetLongField;
+  jni_env_vtable[102] = (uintptr_t)jni_GetFloatField;
+  jni_env_vtable[55] = (uintptr_t)jni_CallFloatMethod;     /* getRefreshRate (Cuphead) */
+  jni_env_vtable[56] = (uintptr_t)jni_CallFloatMethodV;    /* V */
   jni_env_vtable[113] = (uintptr_t)jni_GetStaticMethodID;
   jni_env_vtable[114] = (uintptr_t)jni_CallStaticObjectMethod;
   jni_env_vtable[115] = (uintptr_t)jni_CallStaticObjectMethod; /* V */
