@@ -2149,8 +2149,40 @@ int main(int argc, char **argv) {
   int loadyield = getenv("CUP_LOADYIELD") ? atoi(getenv("CUP_LOADYIELD")) : 0;
   int loadyield_f = getenv("CUP_LOADYIELD_F") ? atoi(getenv("CUP_LOADYIELD_F")) : 350;
   if (loadyield) fprintf(stderr, "[LOADYIELD] %dus/frame nos 1ºs %d frames (CPU p/ workers)\n", loadyield, loadyield_f);
+  /* CUP_MEMLOG: telemetria de memória a cada ~10s (600 frames) — p/ achar a curva
+     do vazamento que mata o device ~6-7min de render (thrash->sshd starved->freeze) */
+  int memlog = getenv("CUP_MEMLOG") ? 1 : 0;
+  /* CUP_GCEVERY=N: força il2cpp_gc_collect a cada N frames (contém heap Boehm) */
+  int gcevery = getenv("CUP_GCEVERY") ? atoi(getenv("CUP_GCEVERY")) : 0;
   for (int f = 0; render && (max_f <= 0 || f < max_f); f++) {
     g_render_frame = f;  /* CUP_DRAWSPY: amarra os draws ao frame */
+    if (memlog && f % 150 == 0) {
+      static long last_swfree = -1; static int verbose_until = 0;
+      long avail = -1, swfree = -1, rss = -1; char ln[128];
+      FILE *mi = fopen("/proc/meminfo", "r");
+      if (mi) { while (fgets(ln, sizeof ln, mi)) {
+          sscanf(ln, "MemAvailable: %ld", &avail); sscanf(ln, "SwapFree: %ld", &swfree); }
+        fclose(mi); }
+      /* burst de swap (>8MB desde a última amostra) -> amostragem densa por 1200f */
+      if (last_swfree >= 0 && last_swfree - swfree > 8192) verbose_until = f + 1200;
+      last_swfree = swfree;
+      if (f % 600 == 0 || f < verbose_until) {
+        FILE *st = fopen("/proc/self/status", "r");
+        if (st) { while (fgets(ln, sizeof ln, st)) sscanf(ln, "VmRSS: %ld", &rss); fclose(st); }
+        long gch = ((long (*)(void))(g_il2cpp_base + 0x1b62ad4))();  /* il2cpp_gc_get_heap_size */
+        long gcu = ((long (*)(void))(g_il2cpp_base + 0x1b62ad0))();  /* il2cpp_gc_get_used_size */
+        fprintf(stderr, "[MEM] f=%d avail=%ldMB swfree=%ldMB rss=%ldMB gcheap=%ldMB gcused=%ldMB\n",
+                f, avail / 1024, swfree / 1024, rss / 1024, gch >> 20, gcu >> 20);
+        fsync(2);
+      }
+    }
+    if (gcevery && f > gcon_f && f % gcevery == 0) {
+      /* limpeza de transição (ideia do usuário): solta assets da cena anterior +
+         coleta o heap — sem isso o load da cena nova SOMA com a velha -> burst
+         de ~150MB -> swap storm no vfat lento -> device asfixia */
+      ((void *(*)(void))(g_il2cpp_base + 0x178BAAC))(); /* Resources.UnloadUnusedAssets */
+      ((void (*)(void))(g_il2cpp_base + 0x1b62ac0))();  /* il2cpp_gc_collect */
+    }
     if (gcoff && gcon_f > 0 && f == gcon_f) {
       ((void (*)(void))(g_il2cpp_base + 0x1b62ac8))();  /* il2cpp_gc_enable */
       ((void (*)(void))(g_il2cpp_base + 0x1b62ac0))();  /* il2cpp_gc_collect */
