@@ -1,18 +1,15 @@
 #!/bin/bash
 # Bully: Anniversary Edition -- Android so-loader -> NextOS / PortMaster
-# Porter: felc18-blip. INEDITO em aarch64/Linux/PortMaster (Mali-450 testado).
-# BYO-DATA: voce precisa do APK do Bully 1.4.311 (sua copia legal). Veja README.md.
+# Porter: felc18-blip. Backend-agnostico (fbdev Mali-450 + KMSDRM/wayland Mali novo).
+# BYO-DATA: requer o APK do Bully 1.4.311 (sua copia legal). Veja README.md.
 XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
 
-if [ -d "/opt/system/Tools/PortMaster/" ]; then
-  controlfolder="/opt/system/Tools/PortMaster"
-elif [ -d "/opt/tools/PortMaster/" ]; then
-  controlfolder="/opt/tools/PortMaster"
-elif [ -d "$XDG_DATA_HOME/PortMaster/" ]; then
-  controlfolder="$XDG_DATA_HOME/PortMaster"
-else
-  controlfolder="/roms/ports/PortMaster"
-fi
+# Acha a instalacao do PortMaster que REALMENTE tem control.txt (alguns devices tem
+# uma pasta /storage/.config/PortMaster incompleta + a completa em /roms/ports/PortMaster).
+controlfolder="/roms/ports/PortMaster"
+for d in /opt/system/Tools/PortMaster /opt/tools/PortMaster "$XDG_DATA_HOME/PortMaster" /roms/ports/PortMaster /storage/.config/PortMaster; do
+  [ -f "$d/control.txt" ] && controlfolder="$d" && break
+done
 
 source $controlfolder/control.txt
 [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
@@ -53,19 +50,33 @@ fi
 # ---------- ambiente ----------
 export LD_LIBRARY_PATH="/usr/lib:$GAMEDIR:$LD_LIBRARY_PATH"
 export SDL_GAMECONTROLLERCONFIG="$sdl_controllerconfig"
-export SDL_VIDEODRIVER=mali               # EGL fbdev correto -> render na TV
 export SDL2COMPAT_FORCE_FULLSCREEN_DESKTOP=1
 export SDL_VIDEO_FULLSCREEN_DESKTOP=1
-export BULLY_TEX_LIGHT=1                   # Mali-450: pula mapas _n/_s
-export BULLY_TEX_HALF=1                    # Mali-450: pula mipmaps + tex>=512 pela metade
+# Backend de display ADAPTATIVO (compat fbdev + kmsdrm/wayland). Em devices KMSDRM
+# o pm_platform_helper ja forca SDL_VIDEODRIVER=kmsdrm; aqui garante o fbdev (Mali-450).
+if [ -e /dev/dri/card0 ]; then
+  export SDL_VIDEODRIVER=kmsdrm            # device com DRM/KMS (Mali-G310 Valhall, kernel mainline)
+else
+  export SDL_VIDEODRIVER=mali              # EGL fbdev (Amlogic-old Mali-450, kernel 3.14)
+  export BULLY_TEX_LIGHT=1                 # Mali-450: pula mapas _n/_s
+  export BULLY_TEX_HALF=1                  # Mali-450: pula mipmaps + tex>=512 pela metade
+fi
 
 $ESUDO chmod +x "$GAMEDIR/bully"
 
-# gptokeyb2 SO p/ o hotkey de SAIR (o jogo le o controle NATIVO via SDL; sem .gptk
-# = nao mapeia/conflita). SELECT+START (segurado) mata o jogo.
-$GPTOKEYB2 "bully" &
+# Padrao PortMaster: gptokeyb2 p/ o hotkey de SAIR (SELECT+START). O jogo le o
+# controle NATIVO via SDL. Prefere gptokeyb2 (PortMaster completo, ex: Amlogic-old);
+# cai no gptokeyb, e por fim no gptokeyb do sistema (PortMaster parcial, ex: X5M).
+if [ -n "$GPTOKEYB2" ] && [ -x "$controlfolder/gptokeyb2" ]; then
+  $GPTOKEYB2 "bully" &
+elif [ -n "$GPTOKEYB" ] && { set -- $GPTOKEYB; [ -x "$1" ]; }; then
+  $GPTOKEYB "bully" &
+elif command -v gptokeyb >/dev/null 2>&1; then
+  gptokeyb -1 "bully" &
+fi
 
-pm_platform_helper "$GAMEDIR/bully"
+command -v pm_platform_helper >/dev/null 2>&1 && pm_platform_helper "$GAMEDIR/bully"
 ./bully
 
-pm_finish
+pkill -f gptokeyb 2>/dev/null
+command -v pm_finish >/dev/null 2>&1 && pm_finish

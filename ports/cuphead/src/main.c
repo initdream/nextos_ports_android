@@ -1598,15 +1598,51 @@ static volatile int g_fmod_run = 1;
 #define UN_HASPEND   0x8739c4
 #define UN_MTX_LOCK  0x8f5d0c
 #define UN_MTX_UNLK  0x8f5d14
+static volatile unsigned long g_haspend_calls;   /* quantas vezes a loading-screen consultou */
 static int my_haspending(void *mgr) {
   g_preload_mgr = mgr;
+  g_haspend_calls++;
   void (*lk)(void *) = (void (*)(void *))(g_unity_base + UN_MTX_LOCK);
   void (*ul)(void *) = (void (*)(void *))(g_unity_base + UN_MTX_UNLK);
   lk((char *)mgr + 0x78);
   uintptr_t pq = *(uintptr_t *)((char *)mgr + 224);
   uintptr_t iq = *(uintptr_t *)((char *)mgr + 256);
+  uintptr_t pq_a = *(uintptr_t *)((char *)mgr + 208);
+  uintptr_t iq_a = *(uintptr_t *)((char *)mgr + 240);
+  uintptr_t pop = (pq && pq_a) ? ((uintptr_t *)pq_a)[0] : 0;
+  uintptr_t iop = (iq && iq_a) ? ((uintptr_t *)iq_a)[0] : 0;
   ul((char *)mgr + 0x78);
-  return (pq || iq) ? 1 : 0;
+  int pending = (pq || iq) ? 1 : 0;
+  /* CUP_HASPEND_STALE=N: se as filas ficam IDÊNTICAS (mesmas ops, mesma contagem)
+   * por N consultas seguidas, a(s) op(s) estão PRESAS — done72 nunca vira 1 (a thread
+   * UnityPreload não processa a op no so-loader; ver 0x873900). O BOOT tolera essa op
+   * persistente (não espera HasPendingOperations==0), mas a tela de loading do MAPA
+   * espera -> trava eterna. Reportamos "sem pendências" p/ destravar a loading.
+   * Só dispara em fila ESTÁVEL (sem progresso): se as ops mudam, é load real -> verdade. */
+  static long stale_thr = -1;
+  if (stale_thr == -1)
+    stale_thr = getenv("CUP_HASPEND_STALE") ? atol(getenv("CUP_HASPEND_STALE")) : 0;
+  if (pending && stale_thr > 0) {
+    static uintptr_t last_pq, last_iq, last_pop, last_iop;
+    static long stall;
+    static int logged;
+    if (pq == last_pq && iq == last_iq && pop == last_pop && iop == last_iop) {
+      if (++stall >= stale_thr) {
+        if (!logged) {
+          logged = 1;
+          fprintf(stderr, "[HASPEND] filas PRESAS %ld consultas (pq=%lu iq=%lu "
+                  "pop=%lx iop=%lx) -> reportando SEM pendencias (destrava loading)\n",
+                  stall, pq, iq, pop, iop);
+          dbg_sync();
+        }
+        return 0;
+      }
+    } else {
+      stall = 0; logged = 0;
+      last_pq = pq; last_iq = iq; last_pop = pop; last_iop = iop;
+    }
+  }
+  return pending;
 }
 static void pspy_dump_op(const char *qn, unsigned i, uintptr_t op) {
   uintptr_t vt = *(uintptr_t *)op;

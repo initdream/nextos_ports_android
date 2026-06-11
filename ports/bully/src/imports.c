@@ -139,6 +139,7 @@ static char *str_replace_all(const char *src, const char *find, const char *repl
   strcpy(o, p);
   return out;
 }
+extern int bully_is_kmsdrm(void);
 static void (*real_glShaderSource)(unsigned, int, const char *const *, const int *) = NULL;
 static void my_glShaderSource(unsigned sh, int count, const char *const *str, const int *len) {
   (void)len;
@@ -154,7 +155,8 @@ static void my_glShaderSource(unsigned sh, int count, const char *const *str, co
    * highp->mediump nos shaders de FRAGMENTO (mantém highp no vertex). */
   /* só fragment: highp->mediump (Utgard PP não tem highp). Vertex mantém highp (skinning). */
   int is_vertex = strstr(cat, "gl_Position") != NULL;
-  char *s0 = is_vertex ? strdup(cat) : str_replace_all(cat, "highp", "mediump");
+  /* G310/kmsdrm: MANTEM highp em TUDO (qualidade). Mali-450/fbdev: fragment->mediump (PP sem highp). */
+  char *s0 = (is_vertex || bully_is_kmsdrm()) ? strdup(cat) : str_replace_all(cat, "highp", "mediump");
   free(cat);
   /* alpha-test SÓ nos shaders de PERSONAGEM (têm `fadeandcolor`, exclusivo de
    * peds/Jimmy): a roupa do Jimmy é composta numa textura (RTT, 163 draws OK),
@@ -174,8 +176,10 @@ static void (*real_glTexParameteri)(unsigned, unsigned, int) = NULL;
 static void my_glTexParameteri(unsigned target, unsigned pname, int param) {
   if (!real_glTexParameteri) real_glTexParameteri = dlsym(RTLD_DEFAULT, "glTexParameteri");
   if (pname == 0x813D) return;                                  /* GL_TEXTURE_MAX_LEVEL: inexistente em GLES2 */
-  if ((pname == 0x2801 || pname == 0x2800) && param >= 0x2700 && param <= 0x2703)
-    param = 0x2601;                                             /* *_MIPMAP_* -> GL_LINEAR (sem mipmap completo = preto) */
+  /* fbdev (Mali-450): mipmap filter -> GL_LINEAR (Utgard sem mipmap = preto).
+   * kmsdrm (G310): deixa o trilinear do jogo passar (mipmaps gerados no glTexImage2D). */
+  if (!bully_is_kmsdrm() && (pname == 0x2801 || pname == 0x2800) && param >= 0x2700 && param <= 0x2703)
+    param = 0x2601;
   if (real_glTexParameteri) real_glTexParameteri(target, pname, param);
 }
 /* log de erros de compile/link de shader (achar o shader do Jimmy que falha) */
@@ -333,6 +337,7 @@ static int bpp_of(unsigned fmt, unsigned type) {
 }
 static int g_tex_half = -1;
 static void (*real_glTexImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *) = NULL;
+static void (*real_glGenerateMipmap)(unsigned) = NULL;
 static void my_glTexImage2D(unsigned tgt, int lvl, int ifmt, int w, int h, int bord, unsigned fmt, unsigned type, const void *px) {
   if (!real_glTexImage2D) real_glTexImage2D = dlsym(RTLD_DEFAULT, "glTexImage2D");
   if (g_tex_half < 0) g_tex_half = getenv("BULLY_TEX_HALF") ? 1 : 0;
@@ -379,6 +384,12 @@ static void my_glTexImage2D(unsigned tgt, int lvl, int ifmt, int w, int h, int b
     }
   }
   if (real_glTexImage2D) real_glTexImage2D(tgt, lvl, ifmt, w, h, bord, ufmt, utype, data);
+  /* kmsdrm (G310): gera a cadeia de mipmap completa p/ o trilinear funcionar (sem
+   * isso, MIN_FILTER mipmap -> textura preta). So no nivel 0 com dados reais. */
+  if (lvl == 0 && data && bully_is_kmsdrm()) {
+    if (!real_glGenerateMipmap) real_glGenerateMipmap = dlsym(RTLD_DEFAULT, "glGenerateMipmap");
+    if (real_glGenerateMipmap) real_glGenerateMipmap(tgt);
+  }
   free(conv);
 }
 
@@ -401,7 +412,20 @@ static void my_glDrawArrays(unsigned mode, int first, int count) {
 void bully_imports_init(void) { ctype_init(); }
 
 /* tabela de overrides (resolvida ANTES do fallback dlsym do so_resolve) */
+
+/* KMSDRM: o eglSwapBuffers cru nao faz page-flip (so SDL_GL_SwapWindow faz).
+ * fbdev (mali): mantem o raw (Amlogic-old intacto). */
+extern void bully_swap_buffers(void);
+extern int  bully_is_kmsdrm(void);
+static unsigned (*real_eglSwapBuffers)(void*, void*) = NULL;
+static unsigned my_eglSwapBuffers(void *dpy, void *surf) {
+  if (bully_is_kmsdrm()) { bully_swap_buffers(); return 1; }
+  if (!real_eglSwapBuffers) real_eglSwapBuffers = dlsym(RTLD_DEFAULT, "eglSwapBuffers");
+  return real_eglSwapBuffers ? real_eglSwapBuffers(dpy, surf) : 1;
+}
+
 DynLibFunction bully_stub_table[] = {
+  {"eglSwapBuffers", (uintptr_t)my_eglSwapBuffers},
   {"__errno", (uintptr_t)bionic___errno}, {"__assert2", (uintptr_t)b_assert2},
   {"__strlen_chk", (uintptr_t)b_strlen_chk}, {"__strrchr_chk", (uintptr_t)b_strrchr_chk},
   {"__strchr_chk", (uintptr_t)b_strchr_chk}, {"__strncpy_chk2", (uintptr_t)b_strncpy_chk2},

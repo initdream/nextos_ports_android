@@ -19,6 +19,8 @@
 
 extern Module mod_game;
 extern void bully_swap_buffers(void);  /* egl_shim */
+extern int bully_screen_w(void);
+extern int bully_screen_h(void);
 extern int  bully_init_gl(void);       /* egl_shim */
 extern int  bully_make_current(void);
 extern void bully_release_current(void);
@@ -74,6 +76,15 @@ static int GetGamepadType(int port) { return port == 0 ? 8 : -1; } /* PS3 */
 static int GetGamepadButtons(int port) {
   if (port != 0 || !g_pad) return 0;
   SDL_GameControllerUpdate();
+  /* Hotkey universal de SAIR (SELECT+START) — funciona em qualquer device, sem
+   * depender de gptokeyb/set_kill. _exit imediato evita o deadlock do blob Mali
+   * (Valhall/Utgard) ao liberar o contexto GL no encerramento. */
+  if (g_pad &&
+      SDL_GameControllerGetButton(g_pad, SDL_CONTROLLER_BUTTON_BACK) &&
+      SDL_GameControllerGetButton(g_pad, SDL_CONTROLLER_BUTTON_START)) {
+    fprintf(stderr, "[pad] SELECT+START -> saindo do jogo\n");
+    _exit(0);
+  }
   int m = 0;
   struct { int b; int mask; } map[] = {
     {SDL_CONTROLLER_BUTTON_A,0x1},{SDL_CONTROLLER_BUTTON_B,0x2},
@@ -370,8 +381,8 @@ static void hook_egl(void) {
 /* ---- hooks de tela/render como FUNÇÃO (bully-NX hooka; nós só setávamos flags
  * srp). GameRenderer::Setup pode dimensionar a textura/fbo pela tela -> se
  * Width/Height retornam 0, a whitetexture sai 0x0 e falha (NULL). ---- */
-static int os_screen_w(void) { return 1280; }
-static int os_screen_h(void) { return 720; }
+static int os_screen_w(void) { return bully_screen_w(); }
+static int os_screen_h(void) { return bully_screen_h(); }
 static int os_can_render(void) { return 1; }
 static int os_is_suspended(void) { return 0; }
 static void hook_screen(void) {
@@ -602,7 +613,7 @@ void jni_load(void) {
   bully_release_current();
 
   if (OnSurfaceCreated) { fprintf(stderr, "[drv] implOnSurfaceCreated...\n"); OnSurfaceCreated(fake_env, NULL); }
-  if (OnSurfaceChanged) { fprintf(stderr, "[drv] implOnSurfaceChanged 1280x720...\n"); OnSurfaceChanged(fake_env, NULL, NULL, 1280, 720); }
+  if (OnSurfaceChanged) { fprintf(stderr, "[drv] implOnSurfaceChanged %dx%d (real)...\n", bully_screen_w(), bully_screen_h()); OnSurfaceChanged(fake_env, NULL, NULL, bully_screen_w(), bully_screen_h()); }
   /* RE-SEED dos EGL globals após surface-changed (o engine reseta OS_EGLSurface
    * aqui; sem re-seed a render thread fica sem contexto -> whitetexture NULL).
    * Igual bully-NX sync_engine_egl_globals("post-surface-changed"). */
