@@ -8,6 +8,7 @@
 #include <SDL2/SDL.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -711,6 +712,7 @@ static SLresult volume_GetMaxVolumeLevel(void *self, SLmillibel *pMaxLevel) {
 /* SLBufferQueueItf methods */
 static SLresult bq_Enqueue(void *self, const void *pBuffer, SLuint32 size) {
   void **itf_ptr = (void **)self;
+  { static int n; if (n++ < 2) fprintf(stderr, "[SL] bq_Enqueue #%d size=%u (PCM fluindo!)\n", n, (unsigned)size); }
   for (int i = 0; i < MAX_PLAYERS; i++) {
     if (&g_players[i].bq_ptr == itf_ptr) {
       AudioPlayer *p = &g_players[i];
@@ -816,6 +818,15 @@ static SLresult bq_GetState_or_RegisterCallback(void *self, void *arg1, void *ar
 /* Stub for unused interfaces */
 static SLresult stub_success(void) { return SL_RESULT_SUCCESS; }
 
+/* GetState (SLObjectItf vtable[2]): FMOD confere o estado pós-Realize; o
+ * stub_success não escrevia *pState -> lixo -> init abortava ("FMOD failed to
+ * initialize the output device"). Sempre REALIZED(2). */
+static SLresult obj_GetState(void *self, SLuint32 *pState) {
+  (void)self;
+  if (pState) *pState = 2 /* SL_OBJECT_STATE_REALIZED */;
+  return SL_RESULT_SUCCESS;
+}
+
 /* Player object methods */
 static SLresult player_Realize(void *self, SLBoolean async) {
   (void)self; (void)async;
@@ -867,6 +878,7 @@ static void player_Destroy(void *self) {
 static void setup_player_vtables(AudioPlayer *p) {
   for (int i = 0; i < 8; i++) p->obj_vtable[i] = (void *)stub_success;
   p->obj_vtable[0] = (void *)player_Realize;
+  p->obj_vtable[2] = (void *)obj_GetState;
   p->obj_vtable[3] = (void *)player_GetInterface;
   p->obj_vtable[6] = (void *)player_Destroy;
   p->obj_ptr = p->obj_vtable;
@@ -925,6 +937,7 @@ static void init_outmix(void) {
   inited = 1;
   for (int i = 0; i < 8; i++) g_outmix_vtable[i] = (void *)stub_success;
   g_outmix_vtable[0] = (void *)outmix_Realize;
+  g_outmix_vtable[2] = (void *)obj_GetState;
   g_outmix_vtable[3] = (void *)outmix_GetInterface;
   g_outmix_vtable[6] = (void *)outmix_Destroy;
   g_outmix_ptr = g_outmix_vtable;
@@ -936,7 +949,7 @@ static SLresult engine_CreateOutputMix(void *self, void **pMix,
                                         const SLInterfaceID *pInterfaceIds,
                                         const SLBoolean *pInterfaceRequired) {
   (void)self; (void)numInterfaces; (void)pInterfaceIds; (void)pInterfaceRequired;
-  /* debugPrintf("opensles_shim: CreateOutputMix\n"); */
+  fprintf(stderr, "[SL] CreateOutputMix\n");
   init_outmix();
   if (pMix) *pMix = &g_outmix_ptr;
   return SL_RESULT_SUCCESS;
@@ -950,7 +963,7 @@ static SLresult engine_CreateAudioPlayer(void *self, void **pPlayer,
   (void)self; (void)pAudioSnk; (void)numInterfaces;
   (void)pInterfaceIds; (void)pInterfaceRequired;
 
-  /* debugPrintf("opensles_shim: CreateAudioPlayer\n"); */
+  fprintf(stderr, "[SL] CreateAudioPlayer\n");
   ensure_audio_initialized();
 
   AudioPlayer *p = alloc_player();
@@ -974,8 +987,11 @@ static SLresult engine_CreateAudioPlayer(void *self, void **pPlayer,
         p->num_channels = fmt->numChannels;
         p->sample_rate = fmt->samplesPerSec / 1000;
         p->bits_per_sample = fmt->bitsPerSample;
-        /* debugPrintf("opensles_shim: format: %u ch, %u Hz, %u bit\n",
-                    p->num_channels, p->sample_rate, p->bits_per_sample); */
+        fprintf(stderr, "[SL] player fmt: %u ch %u Hz %u bit (q=%u)\n",
+                p->num_channels, p->sample_rate, p->bits_per_sample, p->queue_capacity);
+      } else {
+        fprintf(stderr, "[SL] player formatType=0x%x NAO-PCM (PCM_EX? converter!)\n",
+                (unsigned)fmt->formatType);
       }
     }
   }
@@ -1033,6 +1049,7 @@ static void init_engine(void) {
 
   for (int i = 0; i < 8; i++) g_engine_obj_vtable[i] = (void *)stub_success;
   g_engine_obj_vtable[0] = (void *)engine_obj_Realize;
+  g_engine_obj_vtable[2] = (void *)obj_GetState;
   g_engine_obj_vtable[3] = (void *)engine_obj_GetInterface;
   g_engine_obj_vtable[6] = (void *)engine_obj_Destroy;
   g_engine_obj_ptr = g_engine_obj_vtable;
@@ -1112,7 +1129,7 @@ SLresult slCreateEngine_shim(void **pEngine, SLuint32 numOptions,
   (void)numOptions; (void)pEngineOptions; (void)numInterfaces;
   (void)pInterfaceIds; (void)pInterfaceRequired;
 
-  /* debugPrintf("opensles_shim: slCreateEngine\n"); */
+  fprintf(stderr, "[SL] slCreateEngine (FMOD entrou no caminho OpenSL)\n");
   init_engine();
   if (pEngine) *pEngine = &g_engine_obj_ptr;
   return SL_RESULT_SUCCESS;

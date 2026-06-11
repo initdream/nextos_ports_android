@@ -1177,6 +1177,62 @@ BS_WRAP(4, "OnlineManager.Init")
 BS_WRAP(5, "SettingsData.Save")
 BS_WRAP(6, "CupheadStartScene.start_cr(factory)")
 BS_WRAP(7, "SettingsData.OnLoadedCloudData")
+/* ===== CUP_MASKGUARD (s12): 2º crash do load do mapa =====
+ * libunity 0x8f9914 monta arrays de índice (SpriteMask/Tilemap mesh): recebe a
+ * CONTAGEM em w0 e escreve em [obj+128][w0-1]. Na cena do mapa, w0 vem LIXO
+ * (~0x10000000) -> escrita fora dos limites -> SIGSEGV em 0x8f9b1c. Mesma raiz do
+ * SCENEGUARD (objeto da cena do mapa mal-inicializado no so-loader). Clampa a
+ * contagem insana p/ 0 (mask vazia) em vez de estourar. */
+/* ===== CUP_SCENESKIP (s12): RAIZ da cadeia de crashes do mapa =====
+ * A função 0x541c9c processa o tilemap/mesh de um GameObject; resolve a scene via
+ * helper 0x8f7c48 = ldp x8,x1,[arg0,#56] (scene = *(void**)(arg0+56)). No mapa, vários
+ * GameObjects têm scene NULL (não registrados na cena pelo so-loader) -> a função
+ * deref nulls em cascata (0x541cdc, 0x8f9b1c via 0x8f9914, 0x8f9b88, 0x541e54...).
+ * Em vez de remendar cada deref (whack-a-mole), PULA a função inteira quando a scene
+ * é NULL: o GameObject não monta o mesh (não renderiza), mas nada crasha. Epílogo é
+ * void (caller 0x541c2c ignora o retorno). Substitui a abordagem fake-scene do island. */
+static long (*scene541_orig)(long, long, long, long, long, long, long, long);
+static volatile uint32_t g_sceneskip_hits;
+static long scene541_hook(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7) {
+  void *scene = a0 ? *(void **)((char *)a0 + 56) : NULL;
+  if (!scene) {
+    if (g_sceneskip_hits < 8) fprintf(stderr, "[SCENESKIP] 0x541c9c scene=NULL -> skip GO (f=%d)\n", g_render_frame);
+    g_sceneskip_hits++;
+    return 0;
+  }
+  return scene541_orig(a0, a1, a2, a3, a4, a5, a6, a7);
+}
+/* ===== CUP_NULLGUARD (s12): 3º crash do load do mapa =====
+ * libunity 0x8f9b88 (função de tilemap/mesh, chamada de 0x541dcc) faz
+ * `ldr x14,[x0,#24]` SEM null-check; no mapa x0 (arg0) vem NULL (deriva da
+ * fake-scene do SCENEGUARD) -> SIGSEGV fault=0x18. Skip quando arg0==NULL. */
+static long (*nullfn_orig)(long, long, long, long, long, long, long, long);
+static volatile uint32_t g_nullguard_hits;
+static long nullfn_hook(long a, long b, long c, long d, long e, long f, long g, long h) {
+  if (a == 0) {
+    if (g_nullguard_hits < 8) fprintf(stderr, "[NULLGUARD] 0x8f9b88 arg0=NULL -> skip (f=%d)\n", g_render_frame);
+    g_nullguard_hits++;
+    return 0;
+  }
+  return nullfn_orig(a, b, c, d, e, f, g, h);
+}
+static long (*maskfn_orig)(long, long, long, long, long, long, long, long);
+static volatile uint32_t g_maskguard_hits;
+static long maskfn_hook(long a, long b, long c, long d, long e, long f, long g, long h) {
+  uint32_t n = (uint32_t)a;
+  /* A função faz `w10 = count-1` e escreve array[count-1] SEM checar count>0:
+   *   count==0 -> w10 = 0xffffffff -> store OOB gigante -> SIGSEGV em 0x8f9b1c.
+   *   count enorme (lixo) -> idem. No mapa do Cuphead aparece count==0 (mesh/tilemap
+   *   vazio no so-loader). Clampa p/ [1, 0x40000]: count=1 -> w10=0 -> array[0]
+   *   (slot que a função JÁ escreve incondicionalmente em 0x8f9b14, logo existe). */
+  if (n == 0 || n > 0x40000u) {
+    if (g_maskguard_hits < 8)
+      fprintf(stderr, "[MASKGUARD] count=%u (0x%x) -> 1 (f=%d)\n", n, n, g_render_frame);
+    g_maskguard_hits++;
+    a = 1;
+  }
+  return maskfn_orig(a, b, c, d, e, f, g, h);
+}
 static void bootspy_install(uintptr_t base) {
   struct { uintptr_t rva; void *hook; void **orig; const char *nm; } T[] = {
     {0x9A55CC, (void *)bs_hook_0, (void **)&bs_orig_0, "Start"},
@@ -1346,6 +1402,7 @@ static void *my_dlsym(void *h, const char *nm) {
   /* AUDIO: dlsym do handle de libOpenSLES -> opensles_shim (slCreateEngine + SL_IID_*
      com as identidades DO SHIM — ele compara ponteiro, receita re4/Dysmantle) */
   if (h == &g_dl_sl) {
+    fprintf(stderr, "[DLSYM:SL] pede \"%s\"\n", nm);
     if (!strcmp(nm, "slCreateEngine")) return (void *)slCreateEngine_shim;
     if (!strcmp(nm, "SL_IID_ENGINE")) return (void *)&sl_IID_ENGINE;
     if (!strcmp(nm, "SL_IID_PLAY")) return (void *)&sl_IID_PLAY;
@@ -1500,6 +1557,16 @@ static int patch_got(const char *name, void *fn) {
 }
 
 static void *volatile g_preload_mgr;  /* PreloadManager capturado pelo spy (CUP_PSPY) */
+
+/* ===== CUP_SCENEGUARD (s12): crash casa→mapa =====
+ * Instantiate na cena do mapa chega em libunity 0x541c9c (resolve {scene,idx}
+ * do GameObject via helper 0x8f7c48 = ldp x8,x1,[GO+0x38]) e deref [scene+24]
+ * SEM null-check. GO destruído/fora-de-cena tem scene NULL → SIGSEGV fault=0x18
+ * (dump s11: x0=0 x1=0xffffffffff). Guard = ilha de código substituindo o bl;
+ * hits contados aqui e logados no render loop. */
+static volatile uint32_t g_sceneguard_hits;
+static uint64_t sg_fake_scene[8];   /* [3] (+24) -> sg_fake_arr (handle w27=0) */
+static uint32_t sg_fake_arr[16];
 
 /* stubs NDK no-op (sensores/looper/profiler google) — devolvem 0/NULL */
 static long ndk_stub0(void) { return 0; }
@@ -1821,8 +1888,9 @@ int main(int argc, char **argv) {
   }
 
   /* CUP_PSPY: substitui HasPendingOperations (0x8739c4) pela réplica C que
-     captura o ponteiro do PreloadManager (diagnóstico do muro frame 111). */
-  if (getenv("CUP_PSPY")) {
+     captura o ponteiro do PreloadManager (diagnóstico do muro frame 111).
+     CUP_GCEVERY também precisa do mgr (gate de ociosidade da limpeza). */
+  if (getenv("CUP_PSPY") || getenv("CUP_GCEVERY")) {
     extern void so_make_text_writable(void), so_make_text_executable(void);
     so_make_text_writable();
     hook_arm64((uintptr_t)text_base + UN_HASPEND, (uintptr_t)my_haspending);
@@ -1851,6 +1919,48 @@ int main(int argc, char **argv) {
       *(uint32_t *)((uintptr_t)text_base + 0x871854) = 0xd503201fu; /* NOP */
     so_make_text_executable(); so_flush_caches();
     fprintf(stderr, "[FORCEINTEG] 0x872774 + 0x871854 (gate budget-fail branches) -> NOP\n");
+  }
+  /* ===== CUP_SCENESKIP (default ON; CUP_NOSCENESKIP desliga) — RAIZ =====
+   * Hook na ENTRADA de 0x541c9c: se a scene do GameObject ([arg0+56]) for NULL,
+   * pula a função INTEIRA (não monta o mesh) em vez de cascatear nulls. Substitui
+   * o antigo island fake-scene (que vazava e crashava downstream em 0x8f9b1c/b88/541e54). */
+  if (!getenv("CUP_NOSCENESKIP")) {
+    void *trs = mk_tramp((uintptr_t)text_base + 0x541c9c, "scene541");
+    if (trs) {
+      scene541_orig = (long (*)(long, long, long, long, long, long, long, long))trs;
+      extern void so_make_text_writable(void), so_make_text_executable(void);
+      so_make_text_writable();
+      hook_arm64((uintptr_t)text_base + 0x541c9c, (uintptr_t)scene541_hook);
+      so_make_text_executable(); so_flush_caches();
+      fprintf(stderr, "[SCENESKIP] hook 0x541c9c (skip GO se scene[arg0+56]==NULL)\n");
+    } else {
+      fprintf(stderr, "[SCENESKIP] mk_tramp falhou — guard OFF\n");
+    }
+  }
+  /* CUP_MASKGUARD (default ON): clampa contagem insana em 0x8f9914 (mesh de
+     SpriteMask/Tilemap do mapa) — 2º crash do load do mapa (0x8f9b1c). */
+  if (!getenv("CUP_NOMASKGUARD")) {
+    void *tr = mk_tramp((uintptr_t)text_base + 0x8f9914, "maskfn");
+    if (tr) {
+      maskfn_orig = (long (*)(long, long, long, long, long, long, long, long))tr;
+      extern void so_make_text_writable(void), so_make_text_executable(void);
+      so_make_text_writable();
+      hook_arm64((uintptr_t)text_base + 0x8f9914, (uintptr_t)maskfn_hook);
+      so_make_text_executable(); so_flush_caches();
+      fprintf(stderr, "[MASKGUARD] hook 0x8f9914 (clamp count [1,0x40000])\n");
+    } else {
+      fprintf(stderr, "[MASKGUARD] mk_tramp falhou — guard OFF\n");
+    }
+    /* NULLGUARD: 0x8f9b88 (tilemap, arg0 NULL no mapa) */
+    void *trn = mk_tramp((uintptr_t)text_base + 0x8f9b88, "nullfn");
+    if (trn) {
+      nullfn_orig = (long (*)(long, long, long, long, long, long, long, long))trn;
+      extern void so_make_text_writable(void), so_make_text_executable(void);
+      so_make_text_writable();
+      hook_arm64((uintptr_t)text_base + 0x8f9b88, (uintptr_t)nullfn_hook);
+      so_make_text_executable(); so_flush_caches();
+      fprintf(stderr, "[NULLGUARD] hook 0x8f9b88 (skip se arg0==NULL)\n");
+    }
   }
   /* CUP_WAITGATE: FORCEINTEG cirúrgico — ignora o gate de budget SÓ dentro do
      WaitForAll (0x873a90). Hook do WaitForAll (flag in_waitall) + hook do gate
@@ -2154,6 +2264,7 @@ int main(int argc, char **argv) {
   int memlog = getenv("CUP_MEMLOG") ? 1 : 0;
   /* CUP_GCEVERY=N: força il2cpp_gc_collect a cada N frames (contém heap Boehm) */
   int gcevery = getenv("CUP_GCEVERY") ? atoi(getenv("CUP_GCEVERY")) : 0;
+  int gc_pending = 0, gc_idle = 0;
   for (int f = 0; render && (max_f <= 0 || f < max_f); f++) {
     g_render_frame = f;  /* CUP_DRAWSPY: amarra os draws ao frame */
     if (memlog && f % 150 == 0) {
@@ -2176,12 +2287,44 @@ int main(int argc, char **argv) {
         fsync(2);
       }
     }
-    if (gcevery && f > gcon_f && f % gcevery == 0) {
+    if (gcevery && f > gcon_f && f % gcevery == 0) gc_pending = 1;
+    if (gc_pending) {
       /* limpeza de transição (ideia do usuário): solta assets da cena anterior +
          coleta o heap — sem isso o load da cena nova SOMA com a velha -> burst
-         de ~150MB -> swap storm no vfat lento -> device asfixia */
-      ((void *(*)(void))(g_il2cpp_base + 0x178BAAC))(); /* Resources.UnloadUnusedAssets */
-      ((void (*)(void))(g_il2cpp_base + 0x1b62ac0))();  /* il2cpp_gc_collect */
+         de ~150MB -> swap storm -> device asfixia.
+         ⚠️ s12: SÓ com o PreloadManager OCIOSO (preloadQ[+224]==0 e integQ[+256]==0
+         por 90 frames seguidos). O tick cego da s11 caiu NO MEIO do load assíncrono
+         da cena do mapa (f=10800, rss subindo) e varreu objetos ainda não
+         enraizados -> GameObject com scene NULL -> crash 0x541cdc. */
+      char *m = (char *)g_preload_mgr;
+      int idle = !m || (*(volatile uintptr_t *)(m + 224) == 0 &&
+                        *(volatile uintptr_t *)(m + 256) == 0);
+      gc_idle = idle ? gc_idle + 1 : 0;
+      if (gc_idle >= (m ? 90 : 1200)) {   /* sem mgr capturado: espera ~20s */
+        gc_pending = 0; gc_idle = 0;
+        fprintf(stderr, "[GCEVERY] limpeza f=%d (mgr %s)\n", f, m ? "ocioso" : "n/d");
+        ((void *(*)(void))(g_il2cpp_base + 0x178BAAC))(); /* Resources.UnloadUnusedAssets */
+        ((void (*)(void))(g_il2cpp_base + 0x1b62ac0))();  /* il2cpp_gc_collect */
+      }
+    }
+    { /* log de hits do SCENESKIP + MASKGUARD + NULLGUARD */
+      static uint32_t sg_last, mg_last;
+      if (g_sceneskip_hits != sg_last) {
+        fprintf(stderr, "[SCENESKIP] GO sem scene pulado (%u hits, f=%d) — sobrevivido\n",
+                g_sceneskip_hits, f); fsync(2);
+        sg_last = g_sceneskip_hits;
+      }
+      if (g_maskguard_hits != mg_last) {
+        fprintf(stderr, "[MASKGUARD] count insana clampada (%u hits, f=%d) — sobrevivido\n",
+                g_maskguard_hits, f); fsync(2);
+        mg_last = g_maskguard_hits;
+      }
+      static uint32_t ng_last;
+      if (g_nullguard_hits != ng_last) {
+        fprintf(stderr, "[NULLGUARD] arg0 NULL skipado (%u hits, f=%d) — sobrevivido\n",
+                g_nullguard_hits, f); fsync(2);
+        ng_last = g_nullguard_hits;
+      }
     }
     if (gcoff && gcon_f > 0 && f == gcon_f) {
       ((void (*)(void))(g_il2cpp_base + 0x1b62ac8))();  /* il2cpp_gc_enable */

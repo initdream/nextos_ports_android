@@ -34,9 +34,17 @@ static int     gp_log = 0;
    switch/pause/lock) -> pulso virtual por ~6 frames. Permite testar/calibrar sozinho. */
 static int gp_virt = 0, gv_frames = 0, gv_btn = -1, gv_h = 0, gv_v = 0, gv_force = 0;
 static int gp_map_lookup(const char *cmd);  /* fwd */
+static int gv_btn_held = -1;   /* botão físico atualmente forçado pelo overlay virtual */
 static void gp_virt_poll(void) {
   if (gv_force > 0) gv_force--;
-  if (gv_frames > 0) gv_frames--; else { gv_btn = -1; gv_h = 0; gv_v = 0; }
+  if (gv_frames > 0) gv_frames--;
+  else {
+    /* SOLTA o botão virtual ao expirar: sem isso gp_btn[j] fica 1 p/ sempre
+       (joydev nunca manda button-up de um botão virtual) -> gp_btn_prev trava
+       em 1 -> nenhum edge GetButtonDown novo dispara -> menu não navega. */
+    if (gv_btn_held >= 0 && gv_btn_held < GP_NBTN) gp_btn[gv_btn_held] = 0;
+    gv_btn_held = -1; gv_btn = -1; gv_h = 0; gv_v = 0;
+  }
   FILE *f = fopen("/tmp/gpcmd", "r");
   if (!f) return;
   char cmd[32] = {0};
@@ -45,10 +53,14 @@ static void gp_virt_poll(void) {
   if (got) {
     f = fopen("/tmp/gpcmd", "w"); if (f) fclose(f);   /* consome */
     gv_btn = -1; gv_h = 0; gv_v = 0; gv_frames = 6;
-    if (!strcasecmp(cmd, "up")) gv_v = -32767;
-    else if (!strcasecmp(cmd, "down")) gv_v = 32767;
-    else if (!strcasecmp(cmd, "left")) gv_h = -32767;
-    else if (!strcasecmp(cmd, "right")) gv_h = 32767;
+    /* DIREÇÕES no menu: hold CURTO (2 frames). O menu repete o movimento enquanto
+     * o eixo fica passado do limiar; com 6 frames (~0.4s) ele movia 2x por comando
+     * (impossível parar em item ímpar). 2 frames = 1 passo exato. CUP_GPV_DIRF override. */
+    int dirf = getenv("CUP_GPV_DIRF") ? atoi(getenv("CUP_GPV_DIRF")) : 2;
+    if (!strcasecmp(cmd, "up")) { gv_v = -32767; gv_frames = dirf; }
+    else if (!strcasecmp(cmd, "down")) { gv_v = 32767; gv_frames = dirf; }
+    else if (!strcasecmp(cmd, "left")) { gv_h = -32767; gv_frames = dirf; }
+    else if (!strcasecmp(cmd, "right")) { gv_h = 32767; gv_frames = dirf; }
     else if (!strcasecmp(cmd, "any") || !strcasecmp(cmd, "go")) gv_force = 10;  /* força TODO botão true */
     else gv_btn = gp_map_lookup(cmd);
     fprintf(stderr, "[GPV] cmd=%s -> btn=%d h=%d v=%d\n", cmd, gv_btn, gv_h, gv_v); fflush(stderr);
@@ -112,7 +124,7 @@ void gp_poll(void) {
   }
   if (gp_virt) {
     gp_virt_poll();
-    if (gv_btn >= 0 && gv_btn < GP_NBTN) gp_btn[gv_btn] = 1;  /* overlay botão virtual */
+    if (gv_btn >= 0 && gv_btn < GP_NBTN) { gp_btn[gv_btn] = 1; gv_btn_held = gv_btn; }  /* overlay botão virtual */
   }
   /* calibração: após ~40 polls (init+settle), snapshot do repouso de cada eixo */
   if (!gp_calib && ++gp_pollcnt >= 40) {
@@ -283,29 +295,49 @@ static float core_GetAxis(const char *nm) {
   return f;
 }
 
+/* ---- gating por PLAYER (anti Player-2-fantasma) ----
+ * Os hooks ignoravam o `self` (objeto Rewired.Player) e devolviam o MESMO input
+ * p/ TODOS os players. Resultado: quando o jogo pergunta o input do Player 2,
+ * recebia o nosso -> P2 "entra" sozinho e joga com o mesmo controle -> e a
+ * PlayerManager.Update() estoura NullReferenceException (P2 meio-inicializado) ao
+ * sair da casa -> tela trava. Rewired.Player.get_id = ldr w0,[self,#0x1C] (P1=0,
+ * P2=1...). Bloqueia (input neutro) p/ qualquer Player com id>=1. CUP_GP_P2 libera. */
+static int g_allow_p2 = -1;
+static int player_blocked(void *self) {
+  if (g_allow_p2 < 0) g_allow_p2 = getenv("CUP_GP_P2") ? 1 : 0;
+  if (g_allow_p2 || !self) return 0;
+  int id = *(int *)((char *)self + 0x1C);
+  return (id >= 1) ? 1 : 0;   /* id 0 = P1, id<0 = System/menu -> liberados */
+}
 /* ---- hooks string-overload (Rewired.Player.*(string actionName)) ---- */
 int gp_GetButton(void *self, void *name) {
-  (void)self; char nm[32]; str_ascii(name, nm, sizeof nm); log_action("GetButton", nm);
+  if (player_blocked(self)) return 0;
+  char nm[32]; str_ascii(name, nm, sizeof nm); log_action("GetButton", nm);
   return core_GetButton(nm);
 }
 int gp_GetButtonDown(void *self, void *name) {
-  (void)self; char nm[32]; str_ascii(name, nm, sizeof nm); log_action("GetButtonDown", nm);
+  if (player_blocked(self)) return 0;
+  char nm[32]; str_ascii(name, nm, sizeof nm); log_action("GetButtonDown", nm);
   return core_GetButtonDown(nm);
 }
 int gp_GetButtonUp(void *self, void *name) {
-  (void)self; char nm[32]; str_ascii(name, nm, sizeof nm);
+  if (player_blocked(self)) return 0;
+  char nm[32]; str_ascii(name, nm, sizeof nm);
   return core_GetButtonUp(nm);
 }
 int gp_GetNegativeButton(void *self, void *name) {
-  (void)self; char nm[32]; str_ascii(name, nm, sizeof nm);
+  if (player_blocked(self)) return 0;
+  char nm[32]; str_ascii(name, nm, sizeof nm);
   return core_GetNegativeButton(nm);
 }
 int gp_GetNegativeButtonDown(void *self, void *name) {
-  (void)self; char nm[32]; str_ascii(name, nm, sizeof nm);
+  if (player_blocked(self)) return 0;
+  char nm[32]; str_ascii(name, nm, sizeof nm);
   return core_GetNegativeButtonDown(nm);
 }
 float gp_GetAxis(void *self, void *name) {
-  (void)self; char nm[32]; str_ascii(name, nm, sizeof nm); log_action("GetAxis", nm);
+  if (player_blocked(self)) return 0.0f;
+  char nm[32]; str_ascii(name, nm, sizeof nm); log_action("GetAxis", nm);
   return core_GetAxis(nm);
 }
 
@@ -343,25 +375,31 @@ static void log_action_i(const char *kind, int id, const char *nm) {
   fprintf(stderr, "[GP] action %s(id=%d \"%s\")\n", kind, id, nm); fflush(stderr);
 }
 int gp_GetButton_i(void *self, int id) {
-  (void)self; const char *nm = aid_name(id); log_action_i("GetButton", id, nm);
+  if (player_blocked(self)) return 0;
+  const char *nm = aid_name(id); log_action_i("GetButton", id, nm);
   return core_GetButton(nm);
 }
 int gp_GetButtonDown_i(void *self, int id) {
-  (void)self; const char *nm = aid_name(id); log_action_i("GetButtonDown", id, nm);
+  if (player_blocked(self)) return 0;
+  const char *nm = aid_name(id); log_action_i("GetButtonDown", id, nm);
   return core_GetButtonDown(nm);
 }
 int gp_GetButtonUp_i(void *self, int id) {
-  (void)self; return core_GetButtonUp(aid_name(id));
+  if (player_blocked(self)) return 0;
+  return core_GetButtonUp(aid_name(id));
 }
 int gp_GetNegativeButton_i(void *self, int id) {
-  (void)self; return core_GetNegativeButton(aid_name(id));
+  if (player_blocked(self)) return 0;
+  return core_GetNegativeButton(aid_name(id));
 }
 int gp_GetNegativeButtonDown_i(void *self, int id) {
-  (void)self; const char *nm = aid_name(id); log_action_i("GetNegButtonDown", id, nm);
+  if (player_blocked(self)) return 0;
+  const char *nm = aid_name(id); log_action_i("GetNegButtonDown", id, nm);
   return core_GetNegativeButtonDown(nm);
 }
 float gp_GetAxis_i(void *self, int id) {
-  (void)self; const char *nm = aid_name(id); log_action_i("GetAxis", id, nm);
+  if (player_blocked(self)) return 0.0f;
+  const char *nm = aid_name(id); log_action_i("GetAxis", id, nm);
   return core_GetAxis(nm);
 }
 
@@ -381,6 +419,19 @@ int gp_GetAnyButtonDown(void *self) {
     return 1;
   }
   return 0;
+}
+/* Versões de Rewired.Player.GetAnyButton/Down (self = Player): GATEADAS por player.
+ * O JOIN do Player 2 é detectado quando o Player 2 (não-juntado) vê "qualquer botão"
+ * -> player_blocked(self) corta isso (id>=1) -> P2 nunca junta -> sem NullRef em
+ * PlayerManager.Update. NÃO usar no AnyPlayerInput global (0xCC2854): lá self NÃO é
+ * um Player (ler [self+0x1C] seria lixo) — esse fica no gp_GetAnyButton(Down) cru. */
+int gp_GetAnyButton_player(void *self) {
+  if (player_blocked(self)) return 0;
+  return gp_GetAnyButton(self);
+}
+int gp_GetAnyButtonDown_player(void *self) {
+  if (player_blocked(self)) return 0;
+  return gp_GetAnyButtonDown(self);
 }
 
 /* CUP_GPJOIN: o menu do Cuphead ignora input se o Rewired acha que não há controle
@@ -408,9 +459,9 @@ void gp_install_hooks(uintptr_t base) {
   hook_arm64(base + 0x11a7f90, (uintptr_t)gp_GetAxis);       /* GetAxis(string)       */
   hook_arm64(base + 0x11a807c, (uintptr_t)gp_GetAxis);       /* GetAxisRaw(string)    */
   /* "any button" — disclaimer skip + Rewired.Player.GetAnyButton/Down */
-  hook_arm64(base + 0xCC2854,  (uintptr_t)gp_GetAnyButtonDown); /* CupheadInput.AnyPlayerInput.GetAnyButtonDown */
-  hook_arm64(base + 0x11a66f8, (uintptr_t)gp_GetAnyButton);     /* Rewired.Player.GetAnyButton     */
-  hook_arm64(base + 0x11a672c, (uintptr_t)gp_GetAnyButtonDown); /* Rewired.Player.GetAnyButtonDown */
+  hook_arm64(base + 0xCC2854,  (uintptr_t)gp_GetAnyButtonDown); /* AnyPlayerInput (GLOBAL, NÃO gatear) */
+  hook_arm64(base + 0x11a66f8, (uintptr_t)gp_GetAnyButton_player);     /* Rewired.Player.GetAnyButton (gateado)     */
+  hook_arm64(base + 0x11a672c, (uintptr_t)gp_GetAnyButtonDown_player); /* Rewired.Player.GetAnyButtonDown (gateado) */
   hook_arm64(base + 0x11a6968, (uintptr_t)gp_GetNegativeButton);     /* GetNegativeButton(string)     */
   hook_arm64(base + 0x11a6a38, (uintptr_t)gp_GetNegativeButtonDown); /* GetNegativeButtonDown(string) */
   /* int-overloads — o caminho REAL do menu (CupheadButton -> actionId) */
