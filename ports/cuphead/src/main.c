@@ -605,19 +605,21 @@ static void my_glCompileShader(unsigned sh) {
   if (!r_glGetShaderInfoLog) r_glGetShaderInfoLog = dlsym(RTLD_DEFAULT, "glGetShaderInfoLog");
   r_glCompileShader(sh);
   int st = -1; if (r_glGetShaderiv) r_glGetShaderiv(sh, 0x8B81, &st); /* COMPILE_STATUS */
-  if (st != 1 && g_shN < 20) {
-    char log[512] = {0}; if (r_glGetShaderInfoLog) r_glGetShaderInfoLog(sh, sizeof log - 1, NULL, log);
-    fprintf(stderr, "[SHADER] compile sh=%u status=%d LOG=%s\n", sh, st, log); dbg_sync();
+  if (st != 1 && g_shN < 100) {
+    char log[768] = {0}; if (r_glGetShaderInfoLog) r_glGetShaderInfoLog(sh, sizeof log - 1, NULL, log);
+    fprintf(stderr, "[SHADER] compile FALHOU sh=%u status=%d LOG=%s\n", sh, st, log); dbg_sync();
+    g_shN++;
   }
-  g_shN++;
 }
 static void my_glLinkProgram(unsigned pr) {
   if (!r_glLinkProgram) r_glLinkProgram = dlsym(RTLD_DEFAULT, "glLinkProgram");
   if (!r_glGetProgramiv) r_glGetProgramiv = dlsym(RTLD_DEFAULT, "glGetProgramiv");
   r_glLinkProgram(pr);
   int st = -1; if (r_glGetProgramiv) r_glGetProgramiv(pr, 0x8B82, &st); /* LINK_STATUS */
-  if (st != 1 && g_prN < 20) { fprintf(stderr, "[SHADER] link pr=%u status=%d\n", pr, st); dbg_sync(); }
-  g_prN++;
+  if (st != 1 && g_prN < 100) {
+    char log[768] = {0}; if (r_glGetShaderInfoLog) { void (*gpil)(unsigned,int,int*,char*) = dlsym(RTLD_DEFAULT,"glGetProgramInfoLog"); if (gpil) gpil(pr, sizeof log-1, NULL, log); }
+    fprintf(stderr, "[SHADER] link FALHOU pr=%u status=%d LOG=%s\n", pr, st, log); dbg_sync(); g_prN++;
+  }
 }
 
 /* ===== CUP_DRAWSPY: ring dos últimos draws p/ achar o que wedga o Utgard =====
@@ -785,6 +787,8 @@ static void *ds_route(const char *nm, void *real) {
   else if (!strcmp(nm, "glDrawArrays"))   { ds_r_DrawArrays = real;   w = (void *)my_glDrawArrays; }
   else if (!strcmp(nm, "glTexImage2D"))   { ds_r_TexImage2D = real;   w = (void *)my_glTexImage2D; }
   else if (!strcmp(nm, "glCompressedTexImage2D")) { ds_r_CompTexImage2D = real; w = (void *)my_glCompTexImage2D; }
+  else if (!strcmp(nm, "glCompileShader")) { r_glCompileShader = real; w = (void *)my_glCompileShader; }
+  else if (!strcmp(nm, "glLinkProgram"))   { r_glLinkProgram = real;   w = (void *)my_glLinkProgram; }
   if (w != real) { fprintf(stderr, "[DS] route %s (real=%p)\n", nm, real); fsync(2); }
   return w;
 }
@@ -1723,9 +1727,14 @@ int main(int argc, char **argv) {
   if (getenv("CUP_FORCEINTEG")) {
     extern void so_make_text_writable(void), so_make_text_executable(void);
     so_make_text_writable();
-    *(uint32_t *)((uintptr_t)text_base + 0x872774) = 0xd503201fu; /* NOP */
+    *(uint32_t *)((uintptr_t)text_base + 0x872774) = 0xd503201fu; /* NOP (IntegrateOp 0x872758) */
+    /* + ops cujo integrate É o gate 0x871844 DIRETO (materiais/shaders): NOP no branch
+       0x871854 `tbz w0,#0, 87186c` que aborta no veredito do budget -> cai no check de
+       jobs (passa qdo jobmgr=0). Cobre as 52 ops de shader/material presas (sessão 8). */
+    if (!getenv("CUP_NOGATE854"))
+      *(uint32_t *)((uintptr_t)text_base + 0x871854) = 0xd503201fu; /* NOP */
     so_make_text_executable(); so_flush_caches();
-    fprintf(stderr, "[FORCEINTEG] 0x872774 (gate-fail branch) -> NOP\n");
+    fprintf(stderr, "[FORCEINTEG] 0x872774 + 0x871854 (gate budget-fail branches) -> NOP\n");
   }
   /* CUP_WAITGATE: FORCEINTEG cirúrgico — ignora o gate de budget SÓ dentro do
      WaitForAll (0x873a90). Hook do WaitForAll (flag in_waitall) + hook do gate
