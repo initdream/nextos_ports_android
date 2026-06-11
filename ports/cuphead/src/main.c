@@ -620,6 +620,145 @@ static void my_glLinkProgram(unsigned pr) {
   g_prN++;
 }
 
+/* ===== CUP_DRAWSPY: ring dos últimos draws p/ achar o que wedga o Utgard =====
+ * O bt do wedge mostra a main presa no frame-builder lock do Mali no draw
+ * SEGUINTE ao culpado (o GPU não termina o job já submetido) → registramos os
+ * últimos DS_RING draws (programa/textura/FBO/count) num ring; um watchdog
+ * detecta o stall (seq parado >6s) e dumpa o ring. ⚠️ sem glGetError/glFinish
+ * por draw (glFinish satura o Utgard). Bisseção: CUP_SKIPFBO=1 pula draws com
+ * FBO!=0 (render-to-texture); CUP_SKIPPROG=a,b,c pula programas específicos. */
+static int g_drawspy = 0;
+volatile int g_render_frame = -1;          /* setado no render loop (F2) */
+static void (*ds_r_DrawElements)(unsigned, int, unsigned, const void *);
+static void (*ds_r_DrawArrays)(unsigned, int, int);
+static void (*ds_r_TexImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *);
+static void (*ds_r_CompTexImage2D)(unsigned, int, unsigned, int, int, int, int, const void *);
+static void (*ds_r_GetIntegerv)(unsigned, int *);
+
+#define DS_RING 128
+typedef struct {
+  unsigned seq; int frame; unsigned char kind, in_progress; /* kind 0=elems 1=arrays */
+  unsigned mode, type; int count, prog, tex, fbo, unit, texw, texh;
+} ds_rec;
+static ds_rec ds_ring[DS_RING];
+static volatile unsigned ds_seq = 0;
+static volatile unsigned ds_skipped = 0;
+
+#define DS_MAXTEXID 32768
+static unsigned short ds_tw[DS_MAXTEXID], ds_th[DS_MAXTEXID];
+
+static int g_skipfbo = 0;
+static int g_skipprog[8], g_nskipprog = 0;
+
+static int ds_geti(unsigned pname) {
+  int v = 0;
+  if (!ds_r_GetIntegerv) ds_r_GetIntegerv = dlsym(RTLD_DEFAULT, "glGetIntegerv");
+  if (ds_r_GetIntegerv) ds_r_GetIntegerv(pname, &v);
+  return v;
+}
+static ds_rec *ds_enter(int kind, unsigned mode, int count, unsigned type) {
+  unsigned s = __atomic_fetch_add(&ds_seq, 1, __ATOMIC_RELAXED);
+  ds_rec *r = &ds_ring[s % DS_RING];
+  r->in_progress = 0; r->seq = s; r->frame = g_render_frame;
+  r->kind = (unsigned char)kind; r->mode = mode; r->count = count; r->type = type;
+  r->prog = ds_geti(0x8B8D);          /* GL_CURRENT_PROGRAM */
+  r->unit = ds_geti(0x84E0) - 0x84C0; /* GL_ACTIVE_TEXTURE - GL_TEXTURE0 */
+  r->tex  = ds_geti(0x8069);          /* GL_TEXTURE_BINDING_2D */
+  r->fbo  = ds_geti(0x8CA6);          /* GL_FRAMEBUFFER_BINDING */
+  r->texw = (r->tex > 0 && r->tex < DS_MAXTEXID) ? ds_tw[r->tex] : 0;
+  r->texh = (r->tex > 0 && r->tex < DS_MAXTEXID) ? ds_th[r->tex] : 0;
+  r->in_progress = 1;
+  return r;
+}
+static int ds_skip(const ds_rec *r) {
+  if (g_skipfbo && r->fbo != 0) return 1;
+  for (int i = 0; i < g_nskipprog; i++) if (r->prog == g_skipprog[i]) return 1;
+  return 0;
+}
+static void my_glDrawElements(unsigned mode, int count, unsigned type, const void *idx) {
+  ds_rec *r = ds_enter(0, mode, count, type);
+  if (r->seq < 8) fprintf(stderr, "[DS] draw#%u f=%d ELM cnt=%d prog=%d fbo=%d tex=%d(%dx%d)\n",
+                          r->seq, r->frame, count, r->prog, r->fbo, r->tex, r->texw, r->texh);
+  if (ds_skip(r)) { r->in_progress = 0; ds_skipped++; return; }
+  ds_r_DrawElements(mode, count, type, idx);
+  r->in_progress = 0;
+}
+static void my_glDrawArrays(unsigned mode, int first, int count) {
+  ds_rec *r = ds_enter(1, mode, count, 0);
+  if (ds_skip(r)) { r->in_progress = 0; ds_skipped++; return; }
+  ds_r_DrawArrays(mode, first, count);
+  r->in_progress = 0;
+}
+static void ds_rectex(int w, int h, const char *what) {
+  int t = ds_geti(0x8069);
+  if (t > 0 && t < DS_MAXTEXID) {
+    if ((unsigned short)w > ds_tw[t]) ds_tw[t] = (unsigned short)w;
+    if ((unsigned short)h > ds_th[t]) ds_th[t] = (unsigned short)h;
+  }
+  if (w > 2048 || h > 2048) { fprintf(stderr, "[DS] BIG TEX %s id=%d %dx%d\n", what, t, w, h); fsync(2); }
+}
+static void my_glTexImage2D(unsigned tgt, int lvl, int ifmt, int w, int h, int b, unsigned fmt, unsigned type, const void *px) {
+  if (lvl == 0 && tgt == 0x0DE1) ds_rectex(w, h, "tex");
+  ds_r_TexImage2D(tgt, lvl, ifmt, w, h, b, fmt, type, px);
+}
+static void my_glCompTexImage2D(unsigned tgt, int lvl, unsigned ifmt, int w, int h, int b, int sz, const void *px) {
+  if (lvl == 0 && tgt == 0x0DE1) ds_rectex(w, h, "ctex");
+  ds_r_CompTexImage2D(tgt, lvl, ifmt, w, h, b, sz, px);
+}
+static void ds_dump(void) {
+  unsigned end = ds_seq;
+  unsigned n = end < DS_RING ? end : DS_RING;
+  fprintf(stderr, "[DS] ===== DUMP ring (seq=%u frame=%d skipped=%u) =====\n", end, g_render_frame, ds_skipped);
+  for (unsigned i = end - n; i != end; i++) {
+    ds_rec *r = &ds_ring[i % DS_RING];
+    if (r->seq != i) continue;  /* slot já sobrescrito (race benigna) */
+    fprintf(stderr, "[DS] #%u f=%d %s mode=%u cnt=%d prog=%d fbo=%d u%d tex=%d(%dx%d)%s\n",
+            r->seq, r->frame, r->kind ? "ARR" : "ELM", r->mode, r->count,
+            r->prog, r->fbo, r->unit, r->tex, r->texw, r->texh,
+            r->in_progress ? "  <== IN-PROGRESS (bloqueado no driver)" : "");
+  }
+  fsync(2);
+}
+static void *ds_watchdog(void *a) {
+  (void)a;
+  unsigned last = 0; int still = 0, dumped = 0, beat = 0;
+  for (;;) {
+    sleep(2);
+    unsigned s = ds_seq;
+    if (++beat % 30 == 0) { fprintf(stderr, "[DS] alive seq=%u f=%d skipped=%u\n", s, g_render_frame, ds_skipped); fsync(2); }
+    if (s != last) { last = s; still = 0; dumped = 0; continue; }
+    if (s == 0) continue;
+    if (++still >= 3 && !dumped) {
+      fprintf(stderr, "[DS] STALL: draws parados ha %ds (seq=%u)\n", still * 2, s);
+      ds_dump(); dumped = 1;
+    }
+  }
+  return NULL;
+}
+static void *ds_route(const char *nm, void *real) {
+  void *w = real;
+  if (!g_drawspy || !nm || !real) return real;
+  if (!strcmp(nm, "glDrawElements")) { ds_r_DrawElements = real; w = (void *)my_glDrawElements; }
+  else if (!strcmp(nm, "glDrawArrays"))   { ds_r_DrawArrays = real;   w = (void *)my_glDrawArrays; }
+  else if (!strcmp(nm, "glTexImage2D"))   { ds_r_TexImage2D = real;   w = (void *)my_glTexImage2D; }
+  else if (!strcmp(nm, "glCompressedTexImage2D")) { ds_r_CompTexImage2D = real; w = (void *)my_glCompTexImage2D; }
+  if (w != real) { fprintf(stderr, "[DS] route %s (real=%p)\n", nm, real); fsync(2); }
+  return w;
+}
+static void ds_init(void) {
+  if (!getenv("CUP_DRAWSPY")) return;
+  g_drawspy = 1;
+  g_skipfbo = getenv("CUP_SKIPFBO") ? 1 : 0;
+  const char *sp = getenv("CUP_SKIPPROG");
+  if (sp) {
+    char buf[128]; strncpy(buf, sp, sizeof buf - 1); buf[sizeof buf - 1] = 0;
+    for (char *t = strtok(buf, ","); t && g_nskipprog < 8; t = strtok(NULL, ","))
+      g_skipprog[g_nskipprog++] = atoi(t);
+  }
+  pthread_t th; pthread_create(&th, NULL, ds_watchdog, NULL);
+  fprintf(stderr, "[DS] drawspy ON (skipfbo=%d nskipprog=%d)\n", g_skipfbo, g_nskipprog);
+}
+
 /* my_eglGetProcAddress: o Unity resolve as funções GL/extensões via
  * eglGetProcAddress (PLT→Mali real). Se uma extensão é ANUNCIADA (glGetString
  * EXTENSIONS) mas a função NÃO resolve (NULL), o Unity guarda um ponteiro
@@ -634,7 +773,7 @@ static void *my_eglGetProcAddress(const char *nm) {
   if (nm && getenv("CUP_NOVAO") && strstr(nm, "VertexArray")) p = NULL;  /* (vira no-op no Unity) */
   if (g_egp_n++ < 400)
     fprintf(stderr, "[EGP] %s -> %p%s\n", nm ? nm : "(null)", p, p ? "" : "  <== NULL!");
-  return p;
+  return ds_route(nm, p);
 }
 
 static char g_dl_self, g_dl_il2cpp;
@@ -818,6 +957,11 @@ static void *my_dlsym(void *h, const char *nm) {
   if (!nm) return NULL;
   if (g_dllog) fprintf(stderr, "[dlsym] h=%p \"%s\"\n", h, nm);
   if (!strcmp(nm, "glGetString")) return (void *)my_glGetString;
+  if (g_drawspy && nm[0] == 'g' && nm[1] == 'l') {   /* cobre resolução de gl* via dlsym tb */
+    void *p = dlsym(RTLD_DEFAULT, nm);
+    void *w = ds_route(nm, p);
+    if (w != p) return w;
+  }
   if (getenv("CUP_SHLOG")) {
     if (!strcmp(nm, "glCompileShader")) return (void *)my_glCompileShader;
     if (!strcmp(nm, "glLinkProgram")) return (void *)my_glLinkProgram;
@@ -1173,7 +1317,8 @@ int main(int argc, char **argv) {
   set_import("_exit", (void *)my_exit);
   /* __stack_chk_fail nao esta na tabela de imports -> patch direto na GOT (apos resolve) */
   set_import("glGetString", (void *)my_glGetString);
-  if (getenv("CUP_EGPLOG") || getenv("CUP_NOVAO"))
+  ds_init();  /* CUP_DRAWSPY: ring de draws + watchdog (intercepta via eglGetProcAddress) */
+  if (getenv("CUP_EGPLOG") || getenv("CUP_NOVAO") || g_drawspy)
     set_import("eglGetProcAddress", (void *)my_eglGetProcAddress);
   set_import("sysconf", (void *)my_sysconf);
   g_mmaplog = getenv("CUP_MMAPLOG") ? 1 : 0;
@@ -1224,7 +1369,7 @@ int main(int argc, char **argv) {
   patch_got("__android_log_print", (void *)my_alog_print);
   patch_got("__android_log_write", (void *)my_alog_write);
   patch_got("__android_log_vprint", (void *)my_alog_vprint);
-  if (getenv("CUP_EGPLOG") || getenv("CUP_NOVAO"))
+  if (getenv("CUP_EGPLOG") || getenv("CUP_NOVAO") || g_drawspy)
     patch_got("eglGetProcAddress", (void *)my_eglGetProcAddress);
   /* dl* estavam COMENTADOS em imports.gen.c -> set_import foi no-op e o dlopen@plt
      caiu no glibc REAL (falha ao carregar .so Android). Sem isso o il2cpp nao carrega. */
@@ -1511,6 +1656,7 @@ int main(int argc, char **argv) {
   int tapkey = getenv("CUP_AUTOTAP") ? atoi(getenv("CUP_AUTOTAP")) : 0;
   if (tapkey && inject) fprintf(stderr, "[AUTOTAP] keycode=%d via nativeInjectEvent=%p\n", tapkey, inject);
   for (int f = 0; render && (max_f <= 0 || f < max_f); f++) {
+    g_render_frame = f;  /* CUP_DRAWSPY: amarra os draws ao frame */
     if (f < 200) { fprintf(stderr, "[r%d>\n", f); dbg_sync(); }  /* ENTRA no render */
     if (g_skipbad) {
       /* arma o recovery: se nativeRender crashar nesta thread, volta aqui e pula o frame */
