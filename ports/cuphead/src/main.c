@@ -396,6 +396,8 @@ static const char *asset_redirect(const char *p, char *buf, size_t bufsz) {
      Resolve o load do DLC (base-path vinha lixo: "Шестигранные врата 1/AssetBundles/..")
      e qualquer base estranha; o path correto redireciona p/ si mesmo (anti-loop). */
   const char *ab = strstr(p, "/AssetBundles/");
+  /* path RELATIVO "AssetBundles/<nome>" (cutscene do livro monta sem base) */
+  if (!ab && !strncmp(p, "AssetBundles/", 13)) ab = p - 1;
   if (ab) {
     const char *sap = getenv("CUP_SAPATH"); if (!sap) sap = "/storage/cuphead-sa";
     snprintf(buf, bufsz, "%s/AssetBundles/%s", sap, ab + 14);
@@ -1195,6 +1197,59 @@ static void bootspy_install(uintptr_t base) {
   fprintf(stderr, "[BOOTSPY] %u hooks de boot instalados\n", (unsigned)(sizeof T / sizeof T[0]));
 }
 
+/* ===== CUP_MENUSPY: espião do SlotSelectScreen (menu principal pós-título) =====
+ * O Update (0xAB4FF0) despacha pelo state(+0x50): se state==0 (InitializeStorage)
+ * NÃO faz NADA (ret) — o menu renderiza mas ignora input até o save/storage init
+ * completar: OnPlayerDataInitialized(success=true) seta dataStatus(+0x1C8)=1
+ * (Received) -> Update inicia allDataLoaded_cr -> SetState(1=MainMenu). Logamos
+ * cada elo p/ ver onde a cadeia para no so-loader. */
+static long (*ms_orig_update)(void *);
+static long ms_hook_update(void *self) {
+  static int ls = -1, ld = -1;
+  int st = *(int *)((char *)self + 0x50), ds = *(int *)((char *)self + 0x1C8);
+  if (st != ls || ds != ld) {
+    fprintf(stderr, "[MENUSPY] SlotSelect state=%d dataStatus=%d f=%d\n", st, ds, g_render_frame);
+    fsync(2); ls = st; ld = ds;
+  }
+  return ms_orig_update(self);
+}
+static long (*ms_orig_setstate)(void *, int);
+static long ms_hook_setstate(void *self, int v) {
+  fprintf(stderr, "[MENUSPY] SetState(%d) f=%d\n", v, g_render_frame); fsync(2);
+  return ms_orig_setstate(self, v);
+}
+static long (*ms_orig_pdata)(void *, int);
+static long ms_hook_pdata(void *self, int ok) {
+  fprintf(stderr, "[MENUSPY] OnPlayerDataInitialized(success=%d) f=%d\n", ok & 1, g_render_frame); fsync(2);
+  return ms_orig_pdata(self, ok);
+}
+static long (*ms_orig_sdata)(void *, int);
+static long ms_hook_sdata(void *self, int ok) {
+  fprintf(stderr, "[MENUSPY] OnSettingsDataLoaded(success=%d) f=%d\n", ok & 1, g_render_frame); fsync(2);
+  return ms_orig_sdata(self, ok);
+}
+static long (*ms_orig_awake)(void *);
+static long ms_hook_awake(void *self) {
+  fprintf(stderr, "[MENUSPY] SlotSelectScreen.Awake f=%d\n", g_render_frame); fsync(2);
+  return ms_orig_awake(self);
+}
+static void menuspy_install(uintptr_t base) {
+  struct { uintptr_t rva; void *hook; void **orig; const char *nm; } T[] = {
+    {0xAB4FF0, (void *)ms_hook_update,   (void **)&ms_orig_update,   "SlotSelect.Update"},
+    {0xAB670C, (void *)ms_hook_setstate, (void **)&ms_orig_setstate, "SlotSelect.SetState"},
+    {0xAB8868, (void *)ms_hook_pdata,    (void **)&ms_orig_pdata,    "OnPlayerDataInitialized"},
+    {0xAB89A0, (void *)ms_hook_sdata,    (void **)&ms_orig_sdata,    "OnSettingsDataLoaded"},
+    {0xAB4BA4, (void *)ms_hook_awake,    (void **)&ms_orig_awake,    "SlotSelect.Awake"},
+  };
+  for (unsigned i = 0; i < sizeof T / sizeof T[0]; i++) {
+    void *tr = mk_tramp(base + T[i].rva, T[i].nm);
+    if (!tr) continue;
+    *T[i].orig = tr;
+    hook_arm64(base + T[i].rva, (uintptr_t)T[i].hook);
+  }
+  fprintf(stderr, "[MENUSPY] hooks SlotSelectScreen instalados\n"); fsync(2);
+}
+
 /* ===== CUP_TAPINPUT: pulsa AnyPlayerInput.GetAnyButtonDown (il2cpp 0xCC2854) =====
  * A coroutine WaitForUserInputBeforeContinue do disclaimer espera
  * WaitUntil(() => AnyPlayerInput.GetAnyButtonDown()). Sem plumbing real de input,
@@ -1897,6 +1952,7 @@ int main(int argc, char **argv) {
       fprintf(stderr, "[CRSPY] hooks start_cr(0x9A58D0 $PC+0xBC) + inputwait(0x9A619C $PC+0x1C)\n");
     }
     if (getenv("CUP_BOOTSPY")) bootspy_install(g_il2cpp_base);
+    if (getenv("CUP_MENUSPY")) menuspy_install(g_il2cpp_base);
     /* CUP_FORCESTARTCR: CupheadStartScene.Start (0x9A55CC) faz 3 checks
      * op_Inequality em Application.version/productName/identifier e DÁ EARLY-RETURN
      * (0x9A56F8) antes de StartCoroutine(start_cr) se algum não bate. No so-loader

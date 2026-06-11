@@ -96,6 +96,15 @@ void gp_poll(void) {
       if (gp_log) { fprintf(stderr, "[GP] btn %d = %d\n", e.number, e.value); fflush(stderr); }
     } else if (t == JS_EVENT_AXIS && e.number < GP_NAXIS) {
       gp_axis[e.number] = e.value;
+      /* anti-lixo de INIT: o joydev reporta -32767 em todos os eixos ANTES do 1º
+         report real do pad -> calibração envenenada -> eixo lê +32767 parado
+         (menu anda sozinho). Se o repouso calibrado é extremo e o eixo reporta 0
+         EXATO (centro real), re-zera o repouso. (gatilho real nunca senta em 0.) */
+      if (gp_calib && e.value == 0 &&
+          (gp_axis_rest[e.number] == 32767 || gp_axis_rest[e.number] == -32767)) {
+        gp_axis_rest[e.number] = 0;
+        if (gp_log) { fprintf(stderr, "[GP] RECAL ax%d repouso extremo -> 0\n", e.number); fflush(stderr); }
+      }
       if (gp_log && (e.value > 20000 || e.value < -20000)) {
         fprintf(stderr, "[GP] axis %d = %d\n", e.number, e.value); fflush(stderr);
       }
@@ -124,11 +133,14 @@ static int logical_h(void); static int logical_v(void);  /* fwd */
 static int axis_cur(int kind) { return (kind == 2) ? logical_v() : logical_h(); }
 
 /* fim do frame: snapshot p/ edge-detect do GetButtonDown/Up + axis-as-button */
+static int dirp_prev[5];               /* 1=Up 2=Down 3=Left 4=Right (frame anterior) */
+static int dir_held(int d);            /* fwd */
 void gp_frame_end(void) {
   memcpy(gp_btn_prev, gp_btn, sizeof(gp_btn));
   int h = logical_h(), v = logical_v();
   hpos_prev = h > gp_axbtn_thresh;  hneg_prev = h < -gp_axbtn_thresh;
   vpos_prev = v > gp_axbtn_thresh;  vneg_prev = v < -gp_axbtn_thresh;
+  for (int d = 1; d <= 4; d++) dirp_prev[d] = dir_held(d);
 }
 
 /* ---- il2cpp String -> ascii (layout: +0x10 len int32, +0x14 chars utf16) ---- */
@@ -219,19 +231,15 @@ static void log_action(const char *kind, const char *n) {
   fprintf(stderr, "[GP] action %s(\"%s\")\n", kind, n); fflush(stderr);
 }
 
-/* ---- hooks (substituem Rewired.Player.* string-overload) ---- */
-/* held: GetButton */
-int gp_GetButton(void *self, void *name) {
-  (void)self; char nm[32]; str_ascii(name, nm, sizeof nm); log_action("GetButton", nm);
+/* ---- lógica core por NOME de ação (compartilhada pelos hooks string e int) ---- */
+static int core_GetButton(const char *nm) {
   if (gv_force) return 1;
   int b = name_btn(nm); if (b >= 0) return gp_btn[gp_map[b]] ? 1 : 0;
   int k = name_axis(nm); if (k) return (axis_cur(k) > gp_axbtn_thresh) ? 1 : 0;  /* eixo+ segurado */
   int d = name_dir(nm); if (d)  return dir_held(d) ? 1 : 0;
   return 0;
 }
-/* edge down: GetButtonDown (+ axis-as-button: eixo cruzou p/ + ) */
-int gp_GetButtonDown(void *self, void *name) {
-  (void)self; char nm[32]; str_ascii(name, nm, sizeof nm); log_action("GetButtonDown", nm);
+static int core_GetButtonDown(const char *nm) {
   if (gv_force) { if (gp_log) { fprintf(stderr, "[GP] >>> FORCE GetButtonDown(\"%s\")=1\n", nm); fflush(stderr); } return 1; }
   int b = name_btn(nm), r = 0;
   if (b >= 0) { int j = gp_map[b]; r = (gp_btn[j] && !gp_btn_prev[j]) ? 1 : 0; }
@@ -240,26 +248,22 @@ int gp_GetButtonDown(void *self, void *name) {
        próprio edge); se físico, edge real p/ não scrollar sem parar. */
     if (k == 2) r = gv_v ? (gv_v > gp_axbtn_thresh) : (logical_v() > gp_axbtn_thresh && !vpos_prev);
     else if (k == 1) r = gv_h ? (gv_h > gp_axbtn_thresh) : (logical_h() > gp_axbtn_thresh && !hpos_prev);
-    else { int d = name_dir(nm); if (d) r = dir_held(d) ? 1 : 0; } }
+    /* direção digital (MenuUp/Down/...): EDGE, senão o menu rola 1 item POR FRAME */
+    else { int d = name_dir(nm); if (d) r = (dir_held(d) && !dirp_prev[d]) ? 1 : 0; } }
   if (gp_log && r) { fprintf(stderr, "[GP] >>> GetButtonDown(\"%s\")=1\n", nm); fflush(stderr); }
   return r;
 }
-/* edge up: GetButtonUp */
-int gp_GetButtonUp(void *self, void *name) {
-  (void)self; char nm[32]; str_ascii(name, nm, sizeof nm);
+static int core_GetButtonUp(const char *nm) {
   int b = name_btn(nm);
   if (b >= 0) { int j = gp_map[b]; return (!gp_btn[j] && gp_btn_prev[j]) ? 1 : 0; }
   return 0;
 }
-/* GetNegativeButton(Down): direção NEGATIVA de um axis-action (menu p/ baixo/esquerda) */
-int gp_GetNegativeButton(void *self, void *name) {
-  (void)self; char nm[32]; str_ascii(name, nm, sizeof nm);
+static int core_GetNegativeButton(const char *nm) {
   if (gv_force) return 1;
   int k = name_axis(nm); if (k) return (axis_cur(k) < -gp_axbtn_thresh) ? 1 : 0;
   return 0;
 }
-int gp_GetNegativeButtonDown(void *self, void *name) {
-  (void)self; char nm[32]; str_ascii(name, nm, sizeof nm);
+static int core_GetNegativeButtonDown(const char *nm) {
   if (gv_force) return 1;
   int k = name_axis(nm), r = 0;
   if (k == 2) r = gv_v ? (gv_v < -gp_axbtn_thresh) : (logical_v() < -gp_axbtn_thresh && !vneg_prev);
@@ -267,9 +271,7 @@ int gp_GetNegativeButtonDown(void *self, void *name) {
   if (gp_log && r) { fprintf(stderr, "[GP] >>> GetNegativeButtonDown(\"%s\")=1\n", nm); fflush(stderr); }
   return r;
 }
-/* eixo: GetAxis / GetAxisRaw */
-float gp_GetAxis(void *self, void *name) {
-  (void)self; char nm[32]; str_ascii(name, nm, sizeof nm); log_action("GetAxis", nm);
+static float core_GetAxis(const char *nm) {
   int kind = name_axis(nm), inv = 0, v = 0;
   if (kind == 1) v = logical_h();                       /* horizontal: stick0 + dpad4 + virt */
   else if (kind == 2) { v = logical_v(); inv = !gp_invv; }  /* vertical: stick1 + dpad5 + virt */
@@ -279,6 +281,88 @@ float gp_GetAxis(void *self, void *name) {
   f = inv ? -f : f;   /* Unity: up=+1 */
   if (gp_log) { fprintf(stderr, "[GP] >>> GetAxis(\"%s\")=%.2f (v=%d)\n", nm, f, v); fflush(stderr); }
   return f;
+}
+
+/* ---- hooks string-overload (Rewired.Player.*(string actionName)) ---- */
+int gp_GetButton(void *self, void *name) {
+  (void)self; char nm[32]; str_ascii(name, nm, sizeof nm); log_action("GetButton", nm);
+  return core_GetButton(nm);
+}
+int gp_GetButtonDown(void *self, void *name) {
+  (void)self; char nm[32]; str_ascii(name, nm, sizeof nm); log_action("GetButtonDown", nm);
+  return core_GetButtonDown(nm);
+}
+int gp_GetButtonUp(void *self, void *name) {
+  (void)self; char nm[32]; str_ascii(name, nm, sizeof nm);
+  return core_GetButtonUp(nm);
+}
+int gp_GetNegativeButton(void *self, void *name) {
+  (void)self; char nm[32]; str_ascii(name, nm, sizeof nm);
+  return core_GetNegativeButton(nm);
+}
+int gp_GetNegativeButtonDown(void *self, void *name) {
+  (void)self; char nm[32]; str_ascii(name, nm, sizeof nm);
+  return core_GetNegativeButtonDown(nm);
+}
+float gp_GetAxis(void *self, void *name) {
+  (void)self; char nm[32]; str_ascii(name, nm, sizeof nm); log_action("GetAxis", nm);
+  return core_GetAxis(nm);
+}
+
+/* ---- hooks int-overload (Rewired.Player.*(int actionId)) ----
+ * 🔑 O MENU usa ESTE caminho: SlotSelectScreen.GetButtonDown(CupheadButton) ->
+ * AnyPlayerInput.GetButtonDown(CupheadButton) 0xCBC1A4 -> Player.GetButtonDown(int)
+ * 0x11A54B0 — o enum CupheadButton É o actionId do Rewired (Accept=13 etc). Os
+ * hooks de string nunca eram consultados pelo menu (por isso ele não navegava). */
+static const char *aid_name(int id) {
+  switch (id) {
+    case 0:  return "MoveHorizontal";
+    case 1:  return "MoveVertical";
+    case 2:  return "Jump";
+    case 3:  return "Shoot";
+    case 4:  return "Super";
+    case 5:  return "SwitchWeapon";
+    case 6:  return "Lock";
+    case 7:  return "Dash";
+    case 8:  return "Pause";
+    case 13: return "Accept";
+    case 14: return "Cancel";
+    case 16: return "MenuUp";
+    case 18: return "MenuLeft";
+    case 19: return "MenuDown";
+    case 20: return "MenuRight";
+    case 22: return "MenuHorizontal";
+    case 23: return "MenuVertical";
+  }
+  return "?";  /* NextPage(11)/PreviousPage(12)/EquipMenu(15)/Swap(26): sem mapa ainda */
+}
+static void log_action_i(const char *kind, int id, const char *nm) {
+  static unsigned seen = 0;  /* bitmask por id (0..31), loga 1ª vez de cada */
+  if (!gp_log || id < 0 || id > 31 || (seen & (1u << id))) return;
+  seen |= 1u << id;
+  fprintf(stderr, "[GP] action %s(id=%d \"%s\")\n", kind, id, nm); fflush(stderr);
+}
+int gp_GetButton_i(void *self, int id) {
+  (void)self; const char *nm = aid_name(id); log_action_i("GetButton", id, nm);
+  return core_GetButton(nm);
+}
+int gp_GetButtonDown_i(void *self, int id) {
+  (void)self; const char *nm = aid_name(id); log_action_i("GetButtonDown", id, nm);
+  return core_GetButtonDown(nm);
+}
+int gp_GetButtonUp_i(void *self, int id) {
+  (void)self; return core_GetButtonUp(aid_name(id));
+}
+int gp_GetNegativeButton_i(void *self, int id) {
+  (void)self; return core_GetNegativeButton(aid_name(id));
+}
+int gp_GetNegativeButtonDown_i(void *self, int id) {
+  (void)self; const char *nm = aid_name(id); log_action_i("GetNegButtonDown", id, nm);
+  return core_GetNegativeButtonDown(nm);
+}
+float gp_GetAxis_i(void *self, int id) {
+  (void)self; const char *nm = aid_name(id); log_action_i("GetAxis", id, nm);
+  return core_GetAxis(nm);
 }
 
 /* "qualquer botão" — p/ o disclaimer "press any button to skip" e menus.
@@ -329,6 +413,14 @@ void gp_install_hooks(uintptr_t base) {
   hook_arm64(base + 0x11a672c, (uintptr_t)gp_GetAnyButtonDown); /* Rewired.Player.GetAnyButtonDown */
   hook_arm64(base + 0x11a6968, (uintptr_t)gp_GetNegativeButton);     /* GetNegativeButton(string)     */
   hook_arm64(base + 0x11a6a38, (uintptr_t)gp_GetNegativeButtonDown); /* GetNegativeButtonDown(string) */
+  /* int-overloads — o caminho REAL do menu (CupheadButton -> actionId) */
+  hook_arm64(base + 0x11a53e0, (uintptr_t)gp_GetButton_i);             /* GetButton(int)             */
+  hook_arm64(base + 0x11a54b0, (uintptr_t)gp_GetButtonDown_i);         /* GetButtonDown(int)         */
+  hook_arm64(base + 0x11a5580, (uintptr_t)gp_GetButtonUp_i);           /* GetButtonUp(int)           */
+  hook_arm64(base + 0x11a69d0, (uintptr_t)gp_GetNegativeButton_i);     /* GetNegativeButton(int)     */
+  hook_arm64(base + 0x11a6aa0, (uintptr_t)gp_GetNegativeButtonDown_i); /* GetNegativeButtonDown(int) */
+  hook_arm64(base + 0x11a8014, (uintptr_t)gp_GetAxis_i);               /* GetAxis(int)               */
+  hook_arm64(base + 0x11a80e4, (uintptr_t)gp_GetAxis_i);               /* GetAxisRaw(int)            */
 }
 
 void gp_init(uintptr_t il2cpp_base) {
