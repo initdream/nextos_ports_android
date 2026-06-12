@@ -692,7 +692,9 @@ static int ds_skip(const ds_rec *r) {
   for (int i = 0; i < g_nskipprog; i++) if (r->prog == g_skipprog[i]) return 1;
   return 0;
 }
+volatile unsigned long g_frame_draws, g_frame_verts;   /* CUP_DRAWCOUNT: carga de desenho/frame */
 static void my_glDrawElements(unsigned mode, int count, unsigned type, const void *idx) {
+  g_frame_draws++; g_frame_verts += (unsigned)count;
   ds_rec *r = ds_enter(0, mode, count, type);
   if (r->seq < 8) fprintf(stderr, "[DS] draw#%u f=%d ELM cnt=%d prog=%d fbo=%d tex=%d(%dx%d)\n",
                           r->seq, r->frame, count, r->prog, r->fbo, r->tex, r->texw, r->texh);
@@ -701,6 +703,7 @@ static void my_glDrawElements(unsigned mode, int count, unsigned type, const voi
   r->in_progress = 0;
 }
 static void my_glDrawArrays(unsigned mode, int first, int count) {
+  g_frame_draws++; g_frame_verts += (unsigned)count;
   ds_rec *r = ds_enter(1, mode, count, 0);
   if (ds_skip(r)) { r->in_progress = 0; ds_skipped++; return; }
   ds_r_DrawArrays(mode, first, count);
@@ -801,7 +804,14 @@ static void *ds_watchdog(void *a) {
 }
 static void *ds_route(const char *nm, void *real) {
   void *w = real;
-  if (!g_drawspy || !nm || !real) return real;
+  if (!nm || !real) return real;
+  /* CUP_DRAWCOUNT: roteia só os draws (contador leve), mesmo sem DRAWSPY completo */
+  if (!g_drawspy && getenv("CUP_DRAWCOUNT")) {
+    if (!strcmp(nm, "glDrawElements")) { ds_r_DrawElements = real; return (void *)my_glDrawElements; }
+    if (!strcmp(nm, "glDrawArrays"))   { ds_r_DrawArrays = real;   return (void *)my_glDrawArrays; }
+    return real;
+  }
+  if (!g_drawspy) return real;
   if (!strcmp(nm, "glDrawElements")) { ds_r_DrawElements = real; w = (void *)my_glDrawElements; }
   else if (!strcmp(nm, "glDrawArrays"))   { ds_r_DrawArrays = real;   w = (void *)my_glDrawArrays; }
   else if (!strcmp(nm, "glTexImage2D"))   { ds_r_TexImage2D = real;   w = (void *)my_glTexImage2D; }
@@ -2736,10 +2746,13 @@ int main(int argc, char **argv) {
         if (f0 >= 0) {
           double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
           if (dt > 0.5)
-            fprintf(stderr, "[FPS] f=%d media=%.1f (janela %d frames / %.1fs)\n",
-                    f, (f - f0) / dt, f - f0, dt);
+            fprintf(stderr, "[FPS] f=%d media=%.1f draws/f=%lu kverts/f=%lu (janela %d frames / %.1fs)\n",
+                    f, (f - f0) / dt,
+                    (f > f0) ? g_frame_draws / (unsigned)(f - f0) : 0,
+                    (f > f0) ? (g_frame_verts / (unsigned)(f - f0)) / 1000 : 0,
+                    f - f0, dt);
         }
-        t0 = t1; f0 = f;
+        t0 = t1; f0 = f; g_frame_draws = 0; g_frame_verts = 0;
       }
     }
   }
