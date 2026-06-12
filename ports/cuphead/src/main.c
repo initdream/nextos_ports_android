@@ -1904,6 +1904,39 @@ static long fmod_ostart_hook(long a, long b, long c, long d, long e, long f, lon
   fprintf(stderr, "[FMODSPY] output_opensl.start -> %ld\n", r); fsync(2);
   return r;
 }
+/* ===== CUP_FMODALLOCGUARD (s14, default ON com FORCESL) — SOM =====
+ * O alocador do FMOD (0xa66e6c / 0xa66b74: pool, size w1, file x2, line w3) recebe
+ * um pedido INSANO de ~4.29GB do **DSP de flange** (fmod_dsp_flange.cpp:172): o
+ * cálculo do buffer de delay (samplerate*40ms / blocksize * canais * 2) estoura no
+ * so-loader (um dos campos do mixer vem corrompido) -> o wrapper loga "System out of
+ * memory (MemoryLabel: FMOD)" e ABORTA o engine (fatal, SIGTRAP no boot). O próprio
+ * flange tem caminho de falha LIMPO: se a alocação retorna NULL (0xa47570 cbz ->
+ * 0xa47658), ele retorna FMOD_ERR_MEMORY e o FMOD SEGUE sem o efeito de flange
+ * (irrelevante p/ o jogo). Guard: pedidos > 100MB do FMOD -> NULL (sem chamar o
+ * wrapper fatal). Os allocs normais (KB/poucos MB) passam direto. */
+#define FMOD_ALLOC_SANE 0x6400000UL  /* 100 MB */
+static long (*fmod_alloc_orig)(long, long, long, long, long, long, long, long);
+static long fmod_alloc_hook(long a, long b, long c, long d, long e, long f, long g, long h) {
+  if ((unsigned long)b > FMOD_ALLOC_SANE) {
+    static int n; if (n++ < 6)
+      fprintf(stderr, "[FMODGUARD] alloc insana %lu (file=%s line=%ld) -> NULL (flange skip)\n",
+              (unsigned long)b, (c && *(char *)c) ? (char *)c : "?", d);
+    fsync(2);
+    return 0;  /* NULL: o caller (flange create) trata como ERR_MEMORY e segue */
+  }
+  return fmod_alloc_orig(a, b, c, d, e, f, g, h);
+}
+static long (*fmod_alloc2_orig)(long, long, long, long, long, long, long, long);
+static long fmod_alloc2_hook(long a, long b, long c, long d, long e, long f, long g, long h) {
+  if ((unsigned long)b > FMOD_ALLOC_SANE) {
+    static int n; if (n++ < 6)
+      fprintf(stderr, "[FMODGUARD] alloc2 insana %lu (file=%s line=%ld) -> NULL (flange skip)\n",
+              (unsigned long)b, (c && *(char *)c) ? (char *)c : "?", d);
+    fsync(2);
+    return 0;
+  }
+  return fmod_alloc2_orig(a, b, c, d, e, f, g, h);
+}
 static void *fmod_audio_thread(void *arg) {
   (void)arg;
   void *fp = NULL;
@@ -2261,6 +2294,21 @@ int main(int argc, char **argv) {
     extern void so_make_text_writable(void), so_make_text_executable(void);
     so_make_text_writable();
     hook_arm64((uintptr_t)text_base + 0x350298, (uintptr_t)forcesl_hook);
+    /* guard do alocador do FMOD (default ON; CUP_NOFMODGUARD desliga) — mata o OOM
+       fatal do flange. Dentro da janela WRITABLE (hook escreve no .text). */
+    if (!getenv("CUP_NOFMODGUARD")) {
+      struct { uintptr_t rva; void *hook; void **orig; const char *nm; } G[] = {
+        {0xa66e6c, (void *)fmod_alloc_hook,  (void **)&fmod_alloc_orig,  "fmod.alloc"},
+        {0xa66b74, (void *)fmod_alloc2_hook, (void **)&fmod_alloc2_orig, "fmod.alloc2"},
+      };
+      for (unsigned i = 0; i < sizeof G / sizeof G[0]; i++) {
+        void *tr = mk_tramp((uintptr_t)text_base + G[i].rva, G[i].nm);
+        if (!tr) { fprintf(stderr, "[FMODGUARD] tramp %s falhou\n", G[i].nm); continue; }
+        *G[i].orig = tr;
+        hook_arm64((uintptr_t)text_base + G[i].rva, (uintptr_t)G[i].hook);
+      }
+      fprintf(stderr, "[FMODGUARD] guard do alocador instalado\n");
+    }
     if (getenv("CUP_FMODSPY")) {   /* dentro da janela WRITABLE (hook escreve no .text) */
       struct { uintptr_t rva; void *hook; void **orig; const char *nm; } T[] = {
         {0xa6281c, (void *)fmod_init_hook,   (void **)&fmod_init_orig,   "Sys::init"},

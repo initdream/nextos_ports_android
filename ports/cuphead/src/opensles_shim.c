@@ -846,6 +846,11 @@ static SLresult bq_GetState_or_RegisterCallback(void *self, void *arg1, void *ar
 
 /* Stub for unused interfaces */
 static SLresult stub_success(void) { return SL_RESULT_SUCCESS; }
+/* s14: recurso de engine não suportado (CreateAudioRecorder/Midi/LED...) */
+static SLresult engine_Unsupported(void) {
+  static int n; if (n++ < 6) fprintf(stderr, "[SL] engine itf não-suportado chamado -> FEATURE_UNSUPPORTED\n");
+  return 12 /* SL_RESULT_FEATURE_UNSUPPORTED */;
+}
 
 /* GetState (SLObjectItf vtable[2]): FMOD confere o estado pós-Realize; o
  * stub_success não escrevia *pState -> lixo -> init abortava ("FMOD failed to
@@ -1083,7 +1088,12 @@ static void init_engine(void) {
   g_engine_obj_vtable[6] = (void *)engine_obj_Destroy;
   g_engine_obj_ptr = g_engine_obj_vtable;
 
-  for (int i = 0; i < 16; i++) g_engine_itf_vtable[i] = (void *)stub_success;
+  /* s14: stub_success SEM escrever o objeto de saída = ponteiro lixo. O FMOD cria
+     AudioRecorder (microfone) no System::init; com lixo, derivava tamanhos
+     negativos -> malloc 4.29GB -> fatal "System out of memory (MemoryLabel:
+     FMOD)". FEATURE_UNSUPPORTED (12) faz o FMOD desistir LIMPO do subsistema
+     (sem microfone — irrelevante p/ o jogo). */
+  for (int i = 0; i < 16; i++) g_engine_itf_vtable[i] = (void *)engine_Unsupported;
   g_engine_itf_vtable[2] = (void *)engine_CreateAudioPlayer;
   g_engine_itf_vtable[7] = (void *)engine_CreateOutputMix;
   g_engine_itf_ptr = g_engine_itf_vtable;
