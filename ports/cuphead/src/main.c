@@ -1215,7 +1215,41 @@ static long scene541_hook(long a0, long a1, long a2, long a3, long a4, long a5, 
     g_sceneadopt_hits++;
     return scene541_orig(a0, a1, a2, a3, a4, a5, a6, a7);
   }
-  if (g_sceneskip_hits < 8) fprintf(stderr, "[SCENESKIP] 0x541c9c scene=NULL -> skip GO (f=%d)\n", g_render_frame);
+  /* ===== CUP_HIERFIX (s14, default ON; CUP_NOHIERFIX desliga) — FIX REAL =====
+   * Ground truth s14: a0 é o TRANSFORM do prefab de ORIGEM do Instantiate (0x541c9c roda
+   * no source, início do clone worker 0x5424b0) e {P,idx}={NULL,-1} = o prefab carregado
+   * dos assets NUNCA foi inserido numa TransformHierarchy (o passo do load que a
+   * integração forçada pula; caller normal 0x459230 no caminho de load). Sem P o clone
+   * produz NADA -> CloneObject retorna NULL (os DESERGUARD pareados) -> Instantiate=null
+   * -> player/câmera/UI do mapa nem EXISTEM.
+   * Fix: libunity 0x901164(transform) = rebuild da hierarchy da árvore inteira: sobe à
+   * raiz ([T+0x90]), conta a sub-árvore (0x90110c, só anda em filhos [T+0x70/0x80] —
+   * null-safe), cria hierarchy (0x8f9914), insere recursivo (0x9012b8, escreve {P,idx}
+   * em cada nó), registra no manager global ([0x12c0398]) e destrói a antiga (0x8f9d80,
+   * null-safe). Depois disso o clone segue o caminho NORMAL do engine. */
+  if (a0 && !getenv("CUP_NOHIERFIX")) {
+    static volatile uint32_t hf_n;
+    /* raiz da árvore (p/ log; o rebuild já sobe sozinho) */
+    void *root = (void *)a0;
+    while (*(void **)((char *)root + 0x90)) root = *(void **)((char *)root + 0x90);
+    ((void (*)(void *))(g_unity_base + 0x901164))((void *)a0);
+    void *P = *(void **)((char *)a0 + 56);
+    long idx = *(long *)((char *)a0 + 64);
+    if (hf_n < 16)
+      fprintf(stderr, "[HIERFIX] 0x901164(rebuild) t=%p root=%p -> P=%p idx=%ld (f=%d)\n",
+              (void *)a0, root, P, idx, g_render_frame);
+    hf_n++;
+    if (P) return scene541_orig(a0, a1, a2, a3, a4, a5, a6, a7);
+    /* rebuild não populou — cai no skip de segurança */
+  }
+  if (g_sceneskip_hits < 8) {
+    /* s14: a0 = Transform (RE 0x541b90: Component -> [obj+0x30]=GameObject -> cast).
+     * {P=hierarchy, idx} em [a0+0x38/0x40]; +0x30 = GameObject do Component. */
+    fprintf(stderr, "[SCENESKIP] 0x541c9c scene=NULL -> skip GO (f=%d) obj=%p go=%p idx=%ld\n",
+            g_render_frame, (void *)a0,
+            a0 ? *(void **)((char *)a0 + 0x30) : NULL,
+            a0 ? *(long *)((char *)a0 + 0x40) : -1);
+  }
   g_sceneskip_hits++;
   return 0;
 }
@@ -1268,6 +1302,56 @@ static long deser542_hook(long a0, long a1, long a2, long a3, long a4, long a5, 
     return 0;
   }
   return deser542_orig(a0, a1, a2, a3, a4, a5, a6, a7);
+}
+/* ===== CUP_SCENESPY / CUP_SETACTIVE (s14): SceneManager nativo =====
+ * RE (icall table libunity): INTERNAL_CALL_GetActiveScene=0x1bb414, SetActiveScene=
+ * 0x1bb44c -> setter real 0x875dc4(mgr, scene); MoveGameObjectToScene=0x1bbc68.
+ * Singleton SceneManager = [libunity+0x12bc850]. Cena ativa = [mgr+0x48]; fallback
+ * do GetActiveScene = ÚLTIMA da lista (array de ptrs [mgr+0x50], count [mgr+0x60]).
+ * UnityScene: nome std::string SSO (+0x38 ptr de dados; ==NULL -> inline em +0x40),
+ * estado +0x9c (2 = loaded; SetActiveScene exige ==2).
+ * Hipótese do player-fantasma do mapa: Object.Instantiate (Map.Awake/CreateUI) dá a
+ * cena ATIVA aos clones; se o mgr não tem cena registrada/ativa no so-loader, o
+ * Transform do clone fica com {hierarchy P, idx} = NULL em [+0x38/+0x40] -> SCENESKIP
+ * o esconde -> player invisível. SCENESPY mede; SETACTIVE conserta ([mgr+0x48]==NULL
+ * com cena loaded na lista -> chama o setter real). */
+static void scenespy_dump(const char *tag) {
+  if (!g_unity_base) return;
+  void *mgr = *(void **)(g_unity_base + 0x12bc850);
+  if (!mgr) { fprintf(stderr, "[SCENESPY:%s] mgr=NULL\n", tag); fsync(2); return; }
+  void *active = *(void **)((char *)mgr + 0x48);
+  void **arr = *(void ***)((char *)mgr + 0x50);
+  long cnt = *(long *)((char *)mgr + 0x60);
+  fprintf(stderr, "[SCENESPY:%s] mgr=%p active=%p count=%ld f=%d\n", tag, mgr, active, cnt, g_render_frame);
+  for (long i = 0; i < cnt && i < 8 && arr; i++) {
+    char *sc = (char *)arr[i];
+    if (!sc) { fprintf(stderr, "[SCENESPY:%s]  cena[%ld]=NULL\n", tag, i); continue; }
+    char *nm = *(char **)(sc + 0x38); if (!nm) nm = sc + 0x40;
+    fprintf(stderr, "[SCENESPY:%s]  cena[%ld]=%p state=%d nome=%.48s%s\n", tag, i, sc,
+            *(int *)(sc + 0x9c), nm, sc == active ? " (ATIVA)" : "");
+  }
+  fsync(2);
+}
+static volatile uint32_t g_setactive_n;
+static void setactive_fix(void) {
+  if (!g_unity_base) return;
+  void *mgr = *(void **)(g_unity_base + 0x12bc850);
+  if (!mgr) return;
+  void *active = *(void **)((char *)mgr + 0x48);
+  void **arr = *(void ***)((char *)mgr + 0x50);
+  long cnt = *(long *)((char *)mgr + 0x60);
+  if (active || !arr || cnt <= 0) return;
+  /* última cena loaded (state==2) — mesma escolha do fallback do GetActiveScene */
+  for (long i = cnt - 1; i >= 0; i--) {
+    char *sc = (char *)arr[i];
+    if (!sc || *(int *)(sc + 0x9c) != 2) continue;
+    int ok = ((int (*)(void *, void *))(g_unity_base + 0x875dc4))(mgr, sc);
+    char *nm = *(char **)(sc + 0x38); if (!nm) nm = sc + 0x40;
+    fprintf(stderr, "[SETACTIVE] cena[%ld]=%p (%.48s) -> SetActiveScene ret=%d (#%u f=%d)\n",
+            i, sc, nm, ok, ++g_setactive_n, g_render_frame);
+    fsync(2);
+    return;
+  }
 }
 static void bootspy_install(uintptr_t base) {
   struct { uintptr_t rva; void *hook; void **orig; const char *nm; } T[] = {
@@ -2396,6 +2480,10 @@ int main(int argc, char **argv) {
   /* CUP_MEMLOG: telemetria de memória a cada ~10s (600 frames) — p/ achar a curva
      do vazamento que mata o device ~6-7min de render (thrash->sshd starved->freeze) */
   int memlog = getenv("CUP_MEMLOG") ? 1 : 0;
+  /* CUP_SCENESPY: dump periódico do SceneManager nativo; CUP_SETACTIVE: conserta
+     cena ativa NULL (raiz provável do player-fantasma do mapa, s14) */
+  int scenespy = getenv("CUP_SCENESPY") ? 1 : 0;
+  int setactive = getenv("CUP_SETACTIVE") ? 1 : 0;
   /* CUP_GCEVERY=N: força il2cpp_gc_collect a cada N frames (contém heap Boehm) */
   int gcevery = getenv("CUP_GCEVERY") ? atoi(getenv("CUP_GCEVERY")) : 0;
   int gc_pending = 0, gc_idle = 0;
@@ -2421,6 +2509,8 @@ int main(int argc, char **argv) {
         fsync(2);
       }
     }
+    if (scenespy && f % 600 == 0) scenespy_dump("tick");
+    if (setactive && f % 30 == 0) setactive_fix();
     if (gcevery && f > gcon_f && f % gcevery == 0) gc_pending = 1;
     if (gc_pending) {
       /* limpeza de transição (ideia do usuário): solta assets da cena anterior +
@@ -2447,6 +2537,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[SCENESKIP] GO sem scene pulado (%u hits, f=%d) — sobrevivido\n",
                 g_sceneskip_hits, f); fsync(2);
         sg_last = g_sceneskip_hits;
+        if (scenespy) scenespy_dump("skip");   /* estado do mgr NO momento do problema */
       }
       if (g_maskguard_hits != mg_last) {
         fprintf(stderr, "[MASKGUARD] count insana clampada (%u hits, f=%d) — sobrevivido\n",
