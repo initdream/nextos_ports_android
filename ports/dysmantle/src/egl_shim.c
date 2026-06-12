@@ -13,6 +13,8 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <unistd.h>
 
 #include "egl_shim.h"
 #include "util.h"
@@ -261,11 +263,35 @@ EGLBoolean egl_shim_MakeCurrent(EGLDisplay dpy, EGLSurface draw,
   return EGL_TRUE;
 }
 
+/* screenshot sob demanda (receita Bully): `touch /dev/shm/dys_shot` ->
+ * RGBA cru do backbuffer em /dev/shm/dys_shot.raw + .txt WxH (flip vertical
+ * na conversao). Roda na thread de render, custo zero sem o trigger. */
+static void dys_maybe_screenshot(void) {
+  static int chk = 0;
+  if (++chk % 15) return;
+  if (access("/dev/shm/dys_shot", F_OK) != 0) return;
+  unlink("/dev/shm/dys_shot");
+  GLint vp[4] = {0,0,0,0};
+  glGetIntegerv(GL_VIEWPORT, vp);
+  int w = vp[2], h = vp[3];
+  if (w <= 0 || h <= 0) return;
+  unsigned char *buf = malloc((size_t)w * h * 4);
+  if (!buf) return;
+  glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+  FILE *o = fopen("/dev/shm/dys_shot.raw", "wb");
+  if (o) { fwrite(buf, 1, (size_t)w * h * 4, o); fclose(o); }
+  FILE *t = fopen("/dev/shm/dys_shot.txt", "w");
+  if (t) { fprintf(t, "%d %d\n", w, h); fclose(t); }
+  free(buf);
+  debugPrintf("[shot] %dx%d salvo\n", w, h);
+}
+
 EGLBoolean egl_shim_SwapBuffers(EGLDisplay dpy, EGLSurface surface) {
   (void)dpy; (void)surface;
   if (!egl_window) return EGL_TRUE;
 
   if (has_real_gl && current_context && !current_context->is_pbuffer) {
+    dys_maybe_screenshot();
     SDL_GL_SwapWindow(egl_window);
     int fc = ++frame_count;
     if (fc <= 10 || fc % 60 == 0) {
