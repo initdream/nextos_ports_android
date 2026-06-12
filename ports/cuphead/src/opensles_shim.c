@@ -21,7 +21,11 @@
 #define MAX_PLAYERS 16
 #define RING_BUFFER_SIZE (4 * 1024 * 1024)
 #define RING_BUFFER_MASK (RING_BUFFER_SIZE - 1)
-#define SDL_AUDIO_SAMPLES 1024
+/* s14: buffer GRANDE de propósito. Sob carga pesada (fases) a CPU do S905X satura
+ * (swap thrash + GC) e a thread do pump fica sem tempo -> buffer pequeno esvazia ->
+ * underrun -> som ESTALA (feedback do Felipe). 4096 amostras (~93ms a 44.1kHz) dá
+ * folga p/ a thread se atrasar sem furar. */
+#define SDL_AUDIO_SAMPLES 4096
 
 /* Interface ID storage */
 static const int id_engine_tag = 1;
@@ -1115,12 +1119,16 @@ static void pump_callbacks_impl(void) {
     if (callback_threshold == 0 || callback_threshold > (RING_BUFFER_SIZE / 2)) {
       callback_threshold = RING_BUFFER_SIZE / 4;
     }
-    /* Request data earlier: use 2x threshold to keep buffer fuller */
+    /* s14: mantém o ring FUNDO (>= ~6x o buffer do SDL = ~140KB stereo s16 ~ 0.8s)
+     * p/ sobreviver a stalls de CPU nas fases (anti-estalo do Felipe). Era 2x o
+     * último enqueue (raso) -> esvaziava no primeiro engasgo. */
     uint32_t refill_threshold = callback_threshold * 2;
+    uint32_t deep = SDL_AUDIO_SAMPLES * 2 /*stereo*/ * 2 /*s16*/ * 6;
+    if (refill_threshold < deep) refill_threshold = deep;
     if (refill_threshold > RING_BUFFER_SIZE / 2) refill_threshold = RING_BUFFER_SIZE / 2;
 
-    /* Call callback multiple times to fill buffer ahead */
-    int max_calls = 4;
+    /* Call callback multiple times to fill buffer ahead (recupera rápido pós-stall) */
+    int max_calls = 32;
     while (p->callback && readable <= refill_threshold && max_calls > 0) {
       uint32_t counter_before = p->enqueue_counter;
       /* if (p->debug_callback_logs < 16 || counter_before % 64 == 0) {
