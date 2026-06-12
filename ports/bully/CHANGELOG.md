@@ -41,8 +41,9 @@ build mobile — foi destravada via toque sintetico no HUD.
   com `resolution=rs_high` na 1a execucao (depois a escolha do usuario manda).
 - **MSAA 4x agora e OPCIONAL e vem DESLIGADO** (linha comentada no Bully.sh;
   descomente `export BULLY_MSAA=4` p/ ligar em paineis 480p).
-- **Instancia unica**: o launcher mata instancia anterior presa (crash) antes
-  de subir — evita "jogo sem tela + som duplicado" (briga de DRM master).
+- **Instancia unica (SO X5M/Valhall, gateado por device-tree)**: mata
+  instancia anterior presa antes de subir — evita "jogo sem tela + som
+  duplicado" (briga de DRM master). Nos demais devices nem executa.
 - **Saves do Android sao compativeis**: copie `BullyFile*`+`FileInfo*` de
   `Android/data/com.rockstargames.bully/files/` pra pasta `bully/` e eles
   aparecem no Load Game.

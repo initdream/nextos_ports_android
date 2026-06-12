@@ -15,13 +15,17 @@ source $controlfolder/control.txt
 [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
 get_controls
 
-# Instancia anterior (crash/ssh) segura o DRM master -> a nova abre SEM TELA
-# (pageflip -13) com som duplicado. Garante instancia UNICA antes de subir.
-if pgrep -x bully >/dev/null 2>&1; then
-  pkill -x bully; sleep 1
-  pgrep -x bully >/dev/null 2>&1 && { pkill -9 -x bully; sleep 1; }
+# SO X5M/Valhall (s7d|s6|s5): instancia anterior presa segura o DRM master ->
+# a nova abre SEM TELA (pageflip -13) com som duplicado. Garante instancia
+# UNICA antes de subir. Nos DEMAIS devices este bloco NEM EXECUTA (caminho
+# identico a v5, que sempre funcionou).
+if grep -qE "s7d|s6|s5" /proc/device-tree/compatible 2>/dev/null; then
+  if pgrep -x bully >/dev/null 2>&1; then
+    pkill -x bully; sleep 1
+    pgrep -x bully >/dev/null 2>&1 && { pkill -9 -x bully; sleep 1; }
+  fi
+  pkill -x gptokeyb 2>/dev/null
 fi
-pkill -x gptokeyb 2>/dev/null
 
 GAMEDIR="/$directory/ports/bully"
 cd "$GAMEDIR"
