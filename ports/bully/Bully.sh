@@ -48,7 +48,11 @@ if [ ! -f "$GAMEDIR/libGame.so" ] || [ ! -f "$GAMEDIR/assets/data_0.zip" ]; then
 fi
 
 # ---------- ambiente ----------
-export LD_LIBRARY_PATH="/usr/lib:$GAMEDIR:$LD_LIBRARY_PATH"
+# runtime/ = glibc 2.43 bundlada (ld+libc+libm) p/ devices com glibc velha (<2.34,
+# ex: ArkOS). O binario usa interpretador RELATIVO runtime/ld-linux-aarch64.so.1
+# (patchelf no empacote) -> o cd "$GAMEDIR" acima e OBRIGATORIO. Multiarch dirs
+# no fim p/ SDL2/EGL de CFWs Debian-based. SDL2/EGL/GPU sao SEMPRE os do device.
+export LD_LIBRARY_PATH="$GAMEDIR/runtime:/usr/lib:$GAMEDIR:$LD_LIBRARY_PATH:/usr/lib/aarch64-linux-gnu:/lib/aarch64-linux-gnu"
 export SDL_GAMECONTROLLERCONFIG="$sdl_controllerconfig"
 export SDL2COMPAT_FORCE_FULLSCREEN_DESKTOP=1
 export SDL_VIDEO_FULLSCREEN_DESKTOP=1
@@ -56,11 +60,13 @@ export SDL_VIDEO_FULLSCREEN_DESKTOP=1
 # o pm_platform_helper ja forca SDL_VIDEODRIVER=kmsdrm; aqui garante o fbdev (Mali-450).
 if [ -e /dev/dri/card0 ]; then
   export SDL_VIDEODRIVER=kmsdrm            # device com DRM/KMS (Mali-G310 Valhall, kernel mainline)
+  export BULLY_MSAA=4                      # anti-aliasing 4x (faz diferenca em paineis 480p;
+                                           # quase de graca em GPU tile-based; fallback auto se recusar)
 else
   export SDL_VIDEODRIVER=mali              # EGL fbdev (Amlogic-old Mali-450, kernel 3.14)
   export BULLY_TEX_LIGHT=1                 # Mali-450: pula mapas _n/_s
   export BULLY_TEX_HALF=1                  # Mali-450: pula mipmaps + tex>=512 pela metade
-fi
+fi                                         # (Mali-450: BULLY_MSAA nem setado -> caminho identico ao v4)
 
 $ESUDO chmod +x "$GAMEDIR/bully"
 
