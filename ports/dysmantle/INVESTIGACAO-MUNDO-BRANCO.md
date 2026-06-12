@@ -275,3 +275,43 @@ ou RE do construtor da ModelSurface p/ achar onde o formato deveria ser setado (
   falta com o jogo estável.
 - Próxima sessão = "nova seção" dedicada (decisão do usuário): jogar, mapear o que aparece × falta,
   e atacar os casos específicos (lixeira, terreno).
+
+## 🔑 SESSÃO 2026-06-12 — X5M (Mali-G310 Valhall, KMSDRM): MUNDO BRANCO REPRODUZ IDÊNTICO
+**DESCOBERTA DEFINITIVA: NÃO é o Mali-450/Utgard.** Portado pro S905X5M (Mali-G310
+Valhall, GLES3 real, KMSDRM) e o mundo branco é PIXEL-IDÊNTICO ao Amlogic-old. Menu
+perfeito 1080p, entra no mundo, mesmo padrão: **modelos 3D renderizam (player, baú
+laranja, folha), sprites/tiles do CHÃO + árvores (só sombras) NÃO**. => é o NOSSO
+SO-LOADER, não a GPU. Hipótese GL (ES2 vs ES3) ELIMINADA: testado contexto ES3.0
+real (GLVER=3.0, egl_shim pede major=3) — branco igual.
+
+### Bitmap cache corrompido = RED HERRING (resolvido)
+- `tile-floor-normals.jpg failed / Not a JPEG: starts with 0xff 0xd9` vinha do CACHE
+  (`gamedata/10tons/DYSMANTLE/cache/*.jpg.ktx` com JPEG vazio, sobra de run Mali-450).
+- FIX: apagar o cache (`mv cache cache.poisoned.bak && mkdir cache`). Após isso:
+  **0 falhas de bitmap** — todas as texturas (incl. tile-floor) carregam. NXFS hook
+  confirma reads corretos (ff d8 ff e0 = JPEG válido). NÃO era a causa do branco.
+
+### Causa-raiz CONFIRMADA e localizada: 2º caller de createvb(fmt=0) NÃO hookado
+- **2299 falhas** "Can't create a vertex buffer / unknown vertex format" em jogo.
+- hook_genverts (GenerateVerticesByFormat @0xa025b8) já trata 1 caller. As 2299
+  restantes vêm de **`ModelSurface::InitializeVertexAndIndexBuffers @0xa03c20`**
+  (chama createvb @0x4837d4 com fmt=0) — esse caller NÃO está hookado.
+- GENV-NULLSTREAMS (fmt=0, streams todos nulos): só 6 ocorrências, this+232=1.
+- Env `DYSMANTLE_GENSTREAMS=1` (popular streams do interleaved): NÃO disparou +
+  deixou TELA PRETA (arriscado, descartado).
+
+### PRÓXIMO PASSO (claro): hookar o 2º caller
+- Detour em InitializeVertexAndIndexBuffers ou na própria
+  `NX_Graphics_CreateVertexBufferWithVertices @0x4837d4`: quando fmt==0, inferir o
+  formato real (dos streams da ModelSurface dona) antes de criar o buffer. ⚠️ forçar
+  fmt fixo=7 dá garbage (bolas pretas) — TEM que ser o formato real por-surface.
+- ModelSurface symbols: GenerateVerticesByFormat @0xa025b8, GetVerticesByFormat
+  @0xa0571c, InitializeIndexBuffer @0xa04250, FreeVertexAndIndexBuffers @0xa054c8.
+
+### Tooling X5M criado (commits b437d84, 94d6983)
+- Resolução DINÂMICA (desktop mode + DYSMANTLE_RES override) — não mais 1280x720 fixo.
+- Screenshot remoto: `touch /dev/shm/dys_shot` -> /dev/shm/dys_shot.raw (RGBA flip-V).
+- Injetor de botões: `echo MASK > /dev/shm/dys_btn` (Paddleboat: 0x1=dpad-up
+  0x4=dpad-down 0x10=A 0x20=B). Navega menu via ssh.
+- Hooks BitmapLoader (SetBitmapName+LoadBitmapInternal) e NXFS (OpenFile+ReadFile).
+- Launcher /storage/roms/ports/dysmantle/run-x5m.sh (SDL_VIDEODRIVER=kmsdrm).
