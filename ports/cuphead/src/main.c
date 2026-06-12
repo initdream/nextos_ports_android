@@ -1530,8 +1530,25 @@ static void *my_dlsym(void *h, const char *nm) {
     if (!strcmp(nm, "SL_IID_BUFFERQUEUE") || !strcmp(nm, "SL_IID_ANDROIDSIMPLEBUFFERQUEUE"))
       return (void *)&sl_IID_BUFFERQUEUE;
     if (!strcmp(nm, "SL_IID_EFFECTSEND")) return (void *)&sl_IID_EFFECTSEND;
+    if (!strcmp(nm, "SL_IID_ANDROIDCONFIGURATION")) return (void *)&sl_IID_ANDROIDCONFIGURATION;
     if (!strcmp(nm, "SL_IID_ENGINECAPABILITIES")) return (void *)&sl_IID_ENGINECAPABILITIES;
     if (!strcmp(nm, "SL_IID_ENVIRONMENTALREVERB")) return (void *)&sl_IID_ENVIRONMENTALREVERB;
+    /* s14: o FMOD resolve TODOS os SL_IID_* de antemão e ABORTA o init se qualquer
+       um vier NULL (RECORD, MIDI...). Identidade genérica única por nome — os
+       GetInterface dos objetos do shim devolvem stub-success p/ IID desconhecido. */
+    if (!strncmp(nm, "SL_IID_", 7)) {
+      static struct { char name[48]; void *id; } gen[24];
+      static void *slots[24];
+      for (int i = 0; i < 24; i++) {
+        if (gen[i].name[0] && !strcmp(gen[i].name, nm)) return (void *)&gen[i].id;
+        if (!gen[i].name[0]) {
+          snprintf(gen[i].name, sizeof gen[i].name, "%s", nm);
+          gen[i].id = &slots[i];
+          fprintf(stderr, "[DLSYM:SL] %s -> identidade generica\n", nm);
+          return (void *)&gen[i].id;
+        }
+      }
+    }
     fprintf(stderr, "[DLSYM:SL] %s -> NULL\n", nm);
     return NULL;
   }
@@ -1862,16 +1879,48 @@ static void *preload_tick_thread(void *arg) {
   while (g_fmod_run) { sh_tick_preload(); usleep(16000); }
   return NULL;
 }
+/* CUP_FORCESL: substitui a decisão de backend de áudio do FMOD (0x350298) */
+static long forcesl_hook(void) { return 2; }   /* 2 = OpenSL */
+/* CUP_FMODSPY (s14): loga o retorno das etapas do init do FMOD p/ achar QUAL
+ * subsistema falha (output OpenSL passa: engine+player+8 enqueues+start ok, e o
+ * 3->1 é teardown). 0xa6281c=System::init; 0xa6dbe0=output_opensl init;
+ * 0xa6e270=output start (SetPlayState PLAYING). */
+static long (*fmod_init_orig)(long, long, long, long, long, long, long, long);
+static long (*fmod_oinit_orig)(long, long, long, long, long, long, long, long);
+static long (*fmod_ostart_orig)(long, long, long, long, long, long, long, long);
+static long fmod_init_hook(long a, long b, long c, long d, long e, long f, long g, long h) {
+  long r = fmod_init_orig(a, b, c, d, e, f, g, h);
+  fprintf(stderr, "[FMODSPY] System::init(maxch=%ld flags=0x%lx extra=%lx) -> %ld\n", b, c, d, r);
+  fsync(2);
+  return r;
+}
+static long fmod_oinit_hook(long a, long b, long c, long d, long e, long f, long g, long h) {
+  long r = fmod_oinit_orig(a, b, c, d, e, f, g, h);
+  fprintf(stderr, "[FMODSPY] output_opensl.init -> %ld\n", r); fsync(2);
+  return r;
+}
+static long fmod_ostart_hook(long a, long b, long c, long d, long e, long f, long g, long h) {
+  long r = fmod_ostart_orig(a, b, c, d, e, f, g, h);
+  fprintf(stderr, "[FMODSPY] output_opensl.start -> %ld\n", r); fsync(2);
+  return r;
+}
 static void *fmod_audio_thread(void *arg) {
   (void)arg;
   void *fp = NULL;
   while (g_fmod_run && !(fp = jni_find_native("fmodProcess"))) usleep(20000);
   if (!fp) return NULL;
+  /* s14 (FORCESL): se o FMOD inicializou o output OpenSL (shim ativo), o mixer
+     dele bombeia sozinho via buffer queue — alimentar fmodProcess em paralelo
+     seria mix dobrado. Espera o init e só alimenta se o OpenSL NÃO assumiu
+     (fallback = comportamento antigo do null output). CUP_FMODFEED força. */
+  usleep(3000000);
+  if (opensles_shim_engine_active() && !getenv("CUP_FMODFEED")) {
+    fprintf(stderr, "[AUDIO] OpenSL ativo -> feeder fmodProcess DESLIGADO\n");
+    return NULL;
+  }
   fprintf(stderr, "[AUDIO] fmodProcess=%p; thread alimentando (10ms)\n", fp);
   static long dev = 0xFAD;            /* this (FMODAudioDevice) fake */
   void *bb = jni_fmod_bytebuffer();
-  /* dá um tempo p/ o FMOD terminar o init antes de bater no mixer */
-  usleep(300000);
   unsigned long n = 0;
   while (g_fmod_run) {
     int r = ((int (*)(void *, void *, void *))fp)(g_fmod_env, &dev, bb);
@@ -2201,6 +2250,34 @@ int main(int argc, char **argv) {
     so_make_text_executable(); so_flush_caches();
     fprintf(stderr, "[GATEWAIT] hook gate(0x871844) sempre: bypass budget + spin-wait jobs\n");
   }
+  /* ===== CUP_FORCESL (s14, default ON; CUP_NOFORCESL desliga) — SOM =====
+   * O FMOD escolhe o output Android em 0x350298: retorna 2=OpenSL (setOutput 22) ou
+   * 1=AudioTrack-Java (setOutput 21). Exige SDK>16 (0x3506b8 lê Build.VERSION.SDK_INT
+   * via JNI, cache [0x128dcc0] — nosso shim devolve 0) + checks de low-latency → cai
+   * SEMPRE no AudioTrack; sem JVM real o init falha → "null output" → SEM SOM (o
+   * dlopen(libOpenSLES) era só probe; slCreateEngine nunca rodava). Forçamos retorno
+   * 2 → init entra no slCreateEngine → opensles_shim → SDL2 (receita DYSMANTLE sdk=25). */
+  if (!getenv("CUP_NOFORCESL")) {
+    extern void so_make_text_writable(void), so_make_text_executable(void);
+    so_make_text_writable();
+    hook_arm64((uintptr_t)text_base + 0x350298, (uintptr_t)forcesl_hook);
+    if (getenv("CUP_FMODSPY")) {   /* dentro da janela WRITABLE (hook escreve no .text) */
+      struct { uintptr_t rva; void *hook; void **orig; const char *nm; } T[] = {
+        {0xa6281c, (void *)fmod_init_hook,   (void **)&fmod_init_orig,   "Sys::init"},
+        {0xa6dbe0, (void *)fmod_oinit_hook,  (void **)&fmod_oinit_orig,  "osl.init"},
+        {0xa6e270, (void *)fmod_ostart_hook, (void **)&fmod_ostart_orig, "osl.start"},
+      };
+      for (unsigned i = 0; i < sizeof T / sizeof T[0]; i++) {
+        void *tr = mk_tramp((uintptr_t)text_base + T[i].rva, T[i].nm);
+        if (!tr) { fprintf(stderr, "[FMODSPY] tramp %s falhou\n", T[i].nm); continue; }
+        *T[i].orig = tr;
+        hook_arm64((uintptr_t)text_base + T[i].rva, (uintptr_t)T[i].hook);
+      }
+      fprintf(stderr, "[FMODSPY] hooks init/oinit/ostart instalados\n");
+    }
+    so_make_text_executable(); so_flush_caches();
+    fprintf(stderr, "[FORCESL] hook 0x350298 -> 2 (FMOD output = OpenSL/shim)\n");
+  }
   /* CUP_CLAMPSIG: clampa o count de Semaphore::Signal (0x65850c) p/ matar o storm
      (count deriva p/ enorme ~frame 110 → posta bilhões de vezes = livelock). */
   if (getenv("CUP_CLAMPSIG")) {
@@ -2399,7 +2476,9 @@ int main(int argc, char **argv) {
   if ((fn = jni_find_native("nativeFocusChanged"))) ((void (*)(void *, void *, int))fn)(env, &thiz, 1);
 
   /* dispara a thread de áudio do FMOD (alimenta fmodProcess em paralelo ao
-     render — destrava o boot que espera o mixer). CUP_NOAUDIOTHREAD=1 desliga. */
+     render — destrava o boot que espera o mixer). CUP_NOAUDIOTHREAD=1 desliga.
+     s14: a própria thread checa opensles_shim_engine_active() e se desliga
+     quando o OpenSL (FORCESL) assumiu o mixer. */
   if (!getenv("CUP_NOAUDIOTHREAD")) {
     g_fmod_env = env;
     pthread_t at; pthread_create(&at, NULL, fmod_audio_thread, NULL);
@@ -2602,6 +2681,19 @@ int main(int argc, char **argv) {
     }
     if (gamepad_on) gp_frame_end();  /* snapshot p/ edge-detect do GetButtonDown/Up */
     if (f % 60 == 0) { fprintf(stderr, "[render %d]\n", f); dbg_sync(); }
+    { /* FPS médio por janela de 600 frames (mede lag do mapa/fases p/ tuning) */
+      static struct timespec t0; static int f0 = -1;
+      if (f % 600 == 0) {
+        struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+        if (f0 >= 0) {
+          double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+          if (dt > 0.5)
+            fprintf(stderr, "[FPS] f=%d media=%.1f (janela %d frames / %.1fs)\n",
+                    f, (f - f0) / dt, f - f0, dt);
+        }
+        t0 = t1; f0 = f;
+      }
+    }
   }
   fprintf(stderr, "[F2] === render loop terminou ===\n");
   fflush(stderr); dbg_sync();

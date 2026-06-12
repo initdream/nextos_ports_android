@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "opensles_shim.h"
 #include "so_util.h"
@@ -20,7 +21,7 @@
 #define MAX_PLAYERS 16
 #define RING_BUFFER_SIZE (4 * 1024 * 1024)
 #define RING_BUFFER_MASK (RING_BUFFER_SIZE - 1)
-#define SDL_AUDIO_SAMPLES 4096
+#define SDL_AUDIO_SAMPLES 1024
 
 /* Interface ID storage */
 static const int id_engine_tag = 1;
@@ -30,6 +31,7 @@ static const int id_bufferqueue_tag = 4;
 static const int id_effectsend_tag = 5;
 static const int id_enginecap_tag = 6;
 static const int id_envreverb_tag = 7;
+static const int id_androidcfg_tag = 8;
 
 const SLInterfaceID sl_IID_ENGINE = &id_engine_tag;
 const SLInterfaceID sl_IID_PLAY = &id_play_tag;
@@ -38,6 +40,9 @@ const SLInterfaceID sl_IID_BUFFERQUEUE = &id_bufferqueue_tag;
 const SLInterfaceID sl_IID_EFFECTSEND = &id_effectsend_tag;
 const SLInterfaceID sl_IID_ENGINECAPABILITIES = &id_enginecap_tag;
 const SLInterfaceID sl_IID_ENVIRONMENTALREVERB = &id_envreverb_tag;
+/* FMOD (Unity) exige SL_IID_ANDROIDCONFIGURATION no init (s14) — identidade própria;
+   GetInterface devolve stub-success (config de stream type/latency é só hint) */
+const SLInterfaceID sl_IID_ANDROIDCONFIGURATION = &id_androidcfg_tag;
 
 /* OpenSL ES data structures */
 typedef struct {
@@ -444,6 +449,20 @@ static void sdl_audio_callback(void *userdata, Uint8 *stream, int len) {
 }
 
 /* Initialize SDL2 audio */
+int opensles_shim_engine_active(void) { return g_audio_initialized && g_audio_dev != 0; }
+/* s14 (Cuphead/FMOD): o System::init do FMOD roda DENTRO do nativeRender e BLOQUEIA
+ * esperando os callbacks da buffer queue — mas o pump era chamado só pelo render
+ * loop (a MESMA thread!) -> os 2 primeiros Enqueue nunca drenavam -> timeout ->
+ * "failed to initialize the output device". Pump em THREAD PRÓPRIA (modelo real do
+ * OpenSL: callbacks numa thread de áudio); o hook do render loop vira no-op. */
+static void pump_callbacks_impl(void);
+static volatile int g_pump_thread_on;
+static void *sl_pump_thread(void *arg) {
+  (void)arg;
+  fprintf(stderr, "[SL] pump thread ativa (4ms)\n");
+  while (1) { pump_callbacks_impl(); usleep(4000); }
+  return NULL;
+}
 static void ensure_audio_initialized(void) {
   if (g_audio_initialized) return;
 
@@ -456,17 +475,26 @@ static void ensure_audio_initialized(void) {
   want.callback = sdl_audio_callback;
   want.userdata = NULL;
 
+  if (!SDL_WasInit(SDL_INIT_AUDIO) && SDL_InitSubSystem(SDL_INIT_AUDIO) != 0)
+    fprintf(stderr, "[SL] SDL_InitSubSystem(AUDIO): %s\n", SDL_GetError());
   g_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, SDL_AUDIO_ALLOW_SAMPLES_CHANGE);
   if (g_audio_dev == 0) {
-    debugPrintf("opensles_shim: SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
+    fprintf(stderr, "[SL] SDL_OpenAudioDevice FALHOU: %s (driver=%s)\n",
+            SDL_GetError(), SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?");
     g_audio_initialized = 1;
     return;
   }
 
-  debugPrintf("opensles_shim: SDL audio opened: %dHz %dch %d samples\n",
-              have.freq, have.channels, have.samples);
+  fprintf(stderr, "[SL] SDL audio aberto: %dHz %dch %d samples (driver=%s)\n",
+          have.freq, have.channels, have.samples,
+          SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?");
   SDL_PauseAudioDevice(g_audio_dev, 0);
   g_audio_initialized = 1;
+  if (!g_pump_thread_on) {
+    g_pump_thread_on = 1;
+    pthread_t pt; pthread_create(&pt, NULL, sl_pump_thread, NULL);
+    pthread_detach(pt);
+  }
 }
 
 /* Reset player metadata without touching the 4MB ring buffer.
@@ -604,8 +632,7 @@ static SLresult play_SetPlayState(void *self, SLuint32 state) {
   for (int i = 0; i < MAX_PLAYERS; i++) {
     if (&g_players[i].play_ptr == itf_ptr) {
       AudioPlayer *p = &g_players[i];
-      /* debugPrintf("opensles_shim: player %d SetPlayState(%u -> %u)\n",
-                  i, p->play_state, state); */
+      { static int n; if (n++ < 12) fprintf(stderr, "[SL] SetPlayState p%d %u->%u\n", i, p->play_state, state); }
       if (g_audio_dev) SDL_LockAudioDevice(g_audio_dev);
       if (state == SL_PLAYSTATE_STOPPED && p->play_state != SL_PLAYSTATE_STOPPED) {
         p->headatend_fired = 0;
@@ -632,6 +659,7 @@ static SLresult play_GetPlayState(void *self, SLuint32 *pState) {
   for (int i = 0; i < MAX_PLAYERS; i++) {
     if (&g_players[i].play_ptr == itf_ptr) {
       if (pState) *pState = g_players[i].play_state;
+      { static int n; if (n++ < 6) fprintf(stderr, "[SL] GetPlayState p%d -> %u\n", i, g_players[i].play_state); }
       return SL_RESULT_SUCCESS;
     }
   }
@@ -643,7 +671,7 @@ static SLresult play_RegisterCallback(void *self, void *callback, void *ctx) {
   void **itf_ptr = (void **)self;
   for (int i = 0; i < MAX_PLAYERS; i++) {
     if (&g_players[i].play_ptr == itf_ptr) {
-      /* uintptr_t ra = (uintptr_t)__builtin_return_address(0); */
+      { static int n; if (n++ < 4) fprintf(stderr, "[SL] play_RegisterCallback p%d cb=%p\n", i, callback); }
       g_players[i].play_callback = (void (*)(void *, void *, SLuint32))callback;
       g_players[i].play_callback_context = ctx;
       /* if (text_base && ra >= (uintptr_t)text_base &&
@@ -712,7 +740,7 @@ static SLresult volume_GetMaxVolumeLevel(void *self, SLmillibel *pMaxLevel) {
 /* SLBufferQueueItf methods */
 static SLresult bq_Enqueue(void *self, const void *pBuffer, SLuint32 size) {
   void **itf_ptr = (void **)self;
-  { static int n; if (n++ < 2) fprintf(stderr, "[SL] bq_Enqueue #%d size=%u (PCM fluindo!)\n", n, (unsigned)size); }
+  { static int n; if (n++ < 16) fprintf(stderr, "[SL] bq_Enqueue #%d size=%u (PCM fluindo!)\n", n, (unsigned)size); }
   for (int i = 0; i < MAX_PLAYERS; i++) {
     if (&g_players[i].bq_ptr == itf_ptr) {
       AudioPlayer *p = &g_players[i];
@@ -775,6 +803,7 @@ static SLresult bq_GetState(void *self, void *pState) {
         }
         state[0] = p->queued_count;
         state[1] = play_index;
+        { static int n; if (n++ < 12) fprintf(stderr, "[SL] bq_GetState p%d count=%u idx=%u\n", i, state[0], state[1]); }
       }
       return SL_RESULT_SUCCESS;
     }
@@ -787,7 +816,7 @@ static SLresult bq_RegisterCallback(void *self, slBufferQueueCallback callback, 
   for (int i = 0; i < MAX_PLAYERS; i++) {
     if (&g_players[i].bq_ptr == itf_ptr) {
       AudioPlayer *p = &g_players[i];
-      /* uintptr_t ra = (uintptr_t)__builtin_return_address(0); */
+      { static int n; if (n++ < 4) fprintf(stderr, "[SL] bq_RegisterCallback p%d cb=%p\n", i, callback); }
       p->callback = callback;
       p->callback_context = pContext;
       /* if (text_base && ra >= (uintptr_t)text_base &&
@@ -851,7 +880,7 @@ static SLresult player_GetInterface(void *self, SLInterfaceID iid, void **pInter
         /* debugPrintf("opensles_shim: player %d GetInterface(EFFECTSEND)\n", i); */
         *pInterface = &p->effectsend_ptr;
       } else {
-        /* debugPrintf("opensles_shim: player %d GetInterface(unknown=%p)\n", i, iid); */
+        { static int n; if (n++ < 8) fprintf(stderr, "[SL] player%d GetInterface(iid=%p desconhecido)\n", i, (void *)iid); }
         *pInterface = &p->effectsend_ptr;
       }
       return SL_RESULT_SUCCESS;
@@ -1060,8 +1089,13 @@ static void init_engine(void) {
   g_engine_itf_ptr = g_engine_itf_vtable;
 }
 
-/* Public API */
+/* Public API: com a pump thread ativa (s14) o hook do render loop vira no-op
+ * (dois pumpers = race nos contadores do ring) */
 void opensles_shim_pump_callbacks(void) {
+  if (g_pump_thread_on) return;
+  pump_callbacks_impl();
+}
+static void pump_callbacks_impl(void) {
   for (int i = 0; i < MAX_PLAYERS; i++) {
     AudioPlayer *p = &g_players[i];
     if (!p->active || p->play_state != SL_PLAYSTATE_PLAYING) continue;
@@ -1084,6 +1118,7 @@ void opensles_shim_pump_callbacks(void) {
                     i, readable, refill_threshold, counter_before);
         p->debug_callback_logs++;
       } */
+      { static int n; if (n++ < 8) fprintf(stderr, "[SL] pump: callback p%d #%d (readable=%u thr=%u)\n", i, n, readable, refill_threshold); }
       p->callback(&p->bq_ptr, p->callback_context);
 
       if (p->ever_enqueued && !p->decoder_done &&

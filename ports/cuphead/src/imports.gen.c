@@ -43,6 +43,8 @@ FILE *stderr_fake;
 // extern decls dos _fake (def em pthread_fake.c)
 extern long pthread_attr_destroy_fake(); extern long pthread_attr_getstack_fake();
 extern long pthread_attr_init_fake(); extern long pthread_condattr_destroy_fake();
+extern long pthread_attr_setdetachstate_fake(); extern long pthread_attr_setstacksize_fake();
+extern long pthread_attr_setschedparam_fake(); extern long pthread_setname_np_fake();
 extern long pthread_condattr_init_fake(); extern long pthread_condattr_setclock_fake();
 extern long pthread_cond_broadcast_fake(); extern long pthread_cond_destroy_fake();
 extern long pthread_cond_init_fake(); extern long pthread_cond_signal_fake();
@@ -161,6 +163,10 @@ DynLibFunction dynlib_functions[] = {
   {"pthread_attr_destroy", (uintptr_t)&pthread_attr_destroy_fake},  // pthread wrapper (core)
   {"pthread_attr_getstack", (uintptr_t)&pthread_attr_getstack_fake},  // pthread wrapper (core)
   {"pthread_attr_init", (uintptr_t)&pthread_attr_init_fake},  // pthread wrapper (core)
+  {"pthread_attr_setdetachstate", (uintptr_t)&pthread_attr_setdetachstate_fake},  // s14: FMOD mixer thread (faltava -> stub !=0 -> erro 33 no start do output)
+  {"pthread_attr_setstacksize", (uintptr_t)&pthread_attr_setstacksize_fake},  // s14: FMOD mixer thread
+  {"pthread_attr_setschedparam", (uintptr_t)&pthread_attr_setschedparam_fake},  // s14
+  {"pthread_setname_np", (uintptr_t)&pthread_setname_np_fake},  // s14
   {"pthread_condattr_destroy", (uintptr_t)&pthread_condattr_destroy_fake},  // pthread wrapper (core)
   {"pthread_condattr_init", (uintptr_t)&pthread_condattr_init_fake},  // pthread wrapper (core)
   {"pthread_condattr_setclock", (uintptr_t)&pthread_condattr_setclock_fake},  // pthread wrapper (core)

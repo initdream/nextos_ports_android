@@ -46,6 +46,7 @@ extern const SLInterfaceID sl_IID_VOLUME;
 extern const SLInterfaceID sl_IID_BUFFERQUEUE;
 extern const SLInterfaceID sl_IID_EFFECTSEND;
 extern const SLInterfaceID sl_IID_ENGINECAPABILITIES;
+extern const SLInterfaceID sl_IID_ANDROIDCONFIGURATION;
 extern const SLInterfaceID sl_IID_ENVIRONMENTALREVERB;
 
 SLresult slCreateEngine_shim(void **pEngine, SLuint32 numOptions,
@@ -55,5 +56,7 @@ SLresult slCreateEngine_shim(void **pEngine, SLuint32 numOptions,
                               const SLBoolean *pInterfaceRequired);
 
 void opensles_shim_pump_callbacks(void);
+/* 1 = SDL audio aberto (FMOD entrou no caminho OpenSL) — gate do feeder fmodProcess */
+int opensles_shim_engine_active(void);
 
 #endif
