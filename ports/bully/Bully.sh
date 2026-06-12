@@ -15,6 +15,14 @@ source $controlfolder/control.txt
 [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
 get_controls
 
+# Instancia anterior (crash/ssh) segura o DRM master -> a nova abre SEM TELA
+# (pageflip -13) com som duplicado. Garante instancia UNICA antes de subir.
+if pgrep -x bully >/dev/null 2>&1; then
+  pkill -x bully; sleep 1
+  pgrep -x bully >/dev/null 2>&1 && { pkill -9 -x bully; sleep 1; }
+fi
+pkill -x gptokeyb 2>/dev/null
+
 GAMEDIR="/$directory/ports/bully"
 cd "$GAMEDIR"
 > "$GAMEDIR/log.txt" && exec > >(tee "$GAMEDIR/log.txt") 2>&1
@@ -60,13 +68,26 @@ export SDL_VIDEO_FULLSCREEN_DESKTOP=1
 # o pm_platform_helper ja forca SDL_VIDEODRIVER=kmsdrm; aqui garante o fbdev (Mali-450).
 if [ -e /dev/dri/card0 ]; then
   export SDL_VIDEODRIVER=kmsdrm            # device com DRM/KMS (Mali-G310 Valhall, kernel mainline)
-  export BULLY_MSAA=4                      # anti-aliasing 4x (faz diferenca em paineis 480p;
-                                           # quase de graca em GPU tile-based; fallback auto se recusar)
+  # Anti-aliasing 4x OPCIONAL (v6: desligado por padrao). Ajuda em paineis
+  # 480p e custa pouco em GPU tile-based (fallback automatico se a GPU
+  # recusar). P/ LIGAR: descomente a linha abaixo (tire o "# " do inicio).
+  # export BULLY_MSAA=4
 else
   export SDL_VIDEODRIVER=mali              # EGL fbdev (Amlogic-old Mali-450, kernel 3.14)
   export BULLY_TEX_LIGHT=1                 # Mali-450: pula mapas _n/_s
   export BULLY_TEX_HALF=1                  # Mali-450: pula mipmaps + tex>=512 pela metade
 fi                                         # (Mali-450: BULLY_MSAA nem setado -> caminho identico ao v4)
+
+# X5M (Valhall s7d/s6/s5): o modeset do jogo CONGELA o PCM HDMI se ele estiver
+# aberto durante a troca de modo (state XRUN, hw_ptr parado) -> jogo mudo.
+# SOLTA o audio antes de abrir o jogo: espera o PCM fechar (o ES fecha o stream
+# ao lancar; o sink suspende sozinho). So neste device; nos outros nem entra.
+if grep -qE "s7d|s6|s5" /proc/device-tree/compatible 2>/dev/null; then
+  for i in $(seq 1 32); do
+    grep -q closed /proc/asound/card0/pcm0p/sub0/status 2>/dev/null && break
+    sleep 0.25
+  done
+fi
 
 $ESUDO chmod +x "$GAMEDIR/bully"
 
