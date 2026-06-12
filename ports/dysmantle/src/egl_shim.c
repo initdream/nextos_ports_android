@@ -79,8 +79,13 @@ void egl_shim_create_window(void) {
       debugPrintf("egl_shim: DYSMANTLE_RES override %dx%d\n", w, h);
     } }
   SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
-  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
-  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+  /* contexto ES casa com o DYSMANTLE_GLVER passado pro engine (default 2.0);
+   * em GPU ES3 real (Mali-G310) GLVER=3.0 -> contexto ES 3.0 de verdade */
+  { const char *gv = getenv("DYSMANTLE_GLVER");
+    int major = (gv && gv[0] == '3') ? 3 : 2;
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, major);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    if (major == 3) debugPrintf("egl_shim: pedindo contexto ES 3.0\n"); }
   SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
   SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
   SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);

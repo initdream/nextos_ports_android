@@ -597,6 +597,70 @@ static void hook_createvb(void) {
   fprintf(stderr, "hook_createvb: detour @ %p tramp=%p\n", (void *)addr, (void *)tr);
 }
 
+/* GOT-hooks BitmapLoader: nome do bitmap + resultado do LoadBitmapInternal
+ * (caça do mundo-branco: 'tile-floor-normals.jpg' falha; queremos o passo). */
+static char g_last_bmp_name[256] = "?";
+static void (*orig_setbmpname)(void *, const char *, size_t) = NULL;
+static void my_setbmpname(void *bmp, const char *p, size_t n) {
+  if (p && n > 0 && n < sizeof(g_last_bmp_name)) {
+    memcpy(g_last_bmp_name, p, n); g_last_bmp_name[n] = 0;
+  }
+  if (orig_setbmpname) orig_setbmpname(bmp, p, n);
+}
+static unsigned char (*orig_loadbmpint)(void *, int, int, unsigned) = NULL;
+static unsigned char my_loadbmpint(void *self, int a, int b, unsigned c) {
+  unsigned char r = orig_loadbmpint ? orig_loadbmpint(self, a, b, c) : 0;
+  static int n = 0;
+  if (!r || n < 12) {
+    fprintf(stderr, "[BMP] LoadBitmapInternal('%s', %d, %d, %u) -> %d\n",
+            g_last_bmp_name, a, b, c, r);
+    n++;
+  }
+  return r;
+}
+static void hook_bitmaploader(void) {
+  uintptr_t s1 = so_find_rel_addr_safe(
+      "_ZN12BitmapLoader13SetBitmapNameER11nx_bitmap_tNSt6__ndk117basic_string_viewIcNS2_11char_traitsIcEEEE");
+  if (s1) { uintptr_t *p = (uintptr_t *)s1; orig_setbmpname = (void *)*p; *p = (uintptr_t)my_setbmpname; }
+  uintptr_t s2 = so_find_rel_addr_safe("_ZN12BitmapLoader18LoadBitmapInternalEbbj");
+  if (s2) { uintptr_t *p = (uintptr_t *)s2; orig_loadbmpint = (void *)*p; *p = (uintptr_t)my_loadbmpint; }
+  fprintf(stderr, "hook: BitmapLoader SetName=%p LoadInternal=%p\n", (void *)s1, (void *)s2);
+}
+
+/* GOT-hooks NX_FileSystem: rastreia open/read do tile-floor (mundo-branco) */
+static void *g_watch_file = NULL;
+static void *(*orig_nxopen)(const char *, const char *) = NULL;
+static void *my_nxopen(const char *path, const char *mode) {
+  void *f = orig_nxopen ? orig_nxopen(path, mode) : NULL;
+  if (path && strstr(path, "tile-floor")) {
+    fprintf(stderr, "[NXFS] OpenFile('%s','%s') -> %p\n", path, mode ? mode : "?", f);
+    if (f) {
+      g_watch_file = f;
+      uint64_t *w = (uint64_t *)f;
+      for (int i = 0; i < 10; i++)
+        fprintf(stderr, "  f[%d]=0x%016lx\n", i, (unsigned long)w[i]);
+    }
+  }
+  return f;
+}
+static unsigned long (*orig_nxread)(void *, size_t, void *) = NULL;
+static unsigned long my_nxread(void *buf, size_t n, void *file) {
+  unsigned long r = orig_nxread ? orig_nxread(buf, n, file) : 0;
+  if (file && file == g_watch_file) {
+    unsigned char *b = buf;
+    fprintf(stderr, "[NXFS] ReadFile(n=%zu, f=%p) -> %lu  b=%02x %02x %02x %02x\n",
+            n, file, r, r > 0 ? b[0] : 0, r > 1 ? b[1] : 0, r > 2 ? b[2] : 0, r > 3 ? b[3] : 0);
+  }
+  return r;
+}
+static void hook_nxfs(void) {
+  uintptr_t s1 = so_find_rel_addr_safe("_Z22NX_FileSystem_OpenFilePKcS0_");
+  if (s1) { uintptr_t *p = (uintptr_t *)s1; orig_nxopen = (void *)*p; *p = (uintptr_t)my_nxopen; }
+  uintptr_t s2 = so_find_rel_addr_safe("_Z22NX_FileSystem_ReadFilePvmP9nx_file_t");
+  if (s2) { uintptr_t *p = (uintptr_t *)s2; orig_nxread = (void *)*p; *p = (uintptr_t)my_nxread; }
+  fprintf(stderr, "hook: NXFS Open=%p Read=%p\n", (void *)s1, (void *)s2);
+}
+
 /* GOT-hook Paddleboat_getControllerData: loga se/quando a engine lê o pad */
 static int32_t (*orig_pb_getdata)(int32_t, void *) = NULL;
 static int32_t my_pb_getdata(int32_t idx, void *data) {
@@ -608,6 +672,25 @@ static int32_t my_pb_getdata(int32_t idx, void *data) {
             buttons);
   }
   n++;
+  /* injetor remoto: `echo MASK > /dev/shm/dys_btn` OR-a a mascara Paddleboat
+   * nos botoes por ~20 leituras (navegacao de menu via ssh, estilo sonda). */
+  if (data) {
+    static int hold = 0; static uint32_t held_mask = 0; static int chk = 0;
+    if (hold > 0) {
+      *(uint32_t *)((char *)data + 8) |= held_mask;
+      if (--hold == 0) fprintf(stderr, "[inj] solta 0x%x\n", held_mask);
+    } else if (++chk % 10 == 0) {
+      FILE *f = fopen("/dev/shm/dys_btn", "r");
+      if (f) {
+        unsigned m = 0;
+        if (fscanf(f, "%x", &m) == 1 && m) {
+          held_mask = m; hold = 20;
+          fprintf(stderr, "[inj] segura 0x%x\n", m);
+        }
+        fclose(f); unlink("/dev/shm/dys_btn");
+      }
+    }
+  }
   return r;
 }
 static void hook_pb_getdata(void) {
@@ -752,6 +835,8 @@ int main(int argc, char *argv[]) {
    * dimensionado p/ ES2 -> stack smash no nosso contexto Utgard (ES2).
    * Forçamos "2.0" p/ alinhar a engine ao caminho ES2. */
   hook_getproductvalue();
+  hook_bitmaploader(); /* caça mundo-branco: nome+resultado de cada bitmap */
+  hook_nxfs(); /* rastreia open/read do tile-floor no VFS */
   /* 🎮 Paddleboat MODO CONSOLE: o FrameStart da engine só chama
    * getControllerData quando o flag dirty (impl+64) está setado, e esse
    * flag depende do ciclo de eventos GameActivity (que no nosso shim não
@@ -760,7 +845,7 @@ int main(int argc, char *argv[]) {
    * em slot 0. (env DYSMANTLE_PB_NOFORCE desliga p/ debug.) */
   if (!getenv("DYSMANTLE_PB_NOFORCE"))
     patch_vaddr(0x46f53c, 0xd503201f); /* nop o cbz dirty-check */
-  if (getenv("DYSMANTLE_PB_DEBUG")) hook_pb_getdata();
+  hook_pb_getdata(); /* sempre: injetor de botoes remoto + diagnostico */
   /* 🌍 fix do mundo branco: a engine pede vertex buffers com format=0 (o
    * converter Legacy não trata → "unknown vertex format" → malha não sobe).
    * Remapeamos format 0 → um layout 2D válido (default 0x7 = pos+uv+cor).
