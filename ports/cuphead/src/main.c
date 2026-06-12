@@ -626,10 +626,106 @@ static void my_glCompileShader(unsigned sh) {
     g_shN++;
   }
 }
+/* CUP_SHADERDUMP: loga o fonte GLSL na SUBMISSÃO (glGetShaderSource no Mali volta vazio) */
+extern volatile int g_render_frame;
+static int strstr2_any(const char **string, int count, const char *tok) {
+  for (int i = 0; i < count && string[i]; i++)
+    if (strstr(string[i], tok)) return 1;
+  return 0;
+}
+static void (*r_glShaderSource)(unsigned, int, const char **, const int *);
+static void my_glShaderSource(unsigned sh, int count, const char **string, const int *length) {
+  if (!r_glShaderSource) r_glShaderSource = dlsym(RTLD_DEFAULT, "glShaderSource");
+  if (getenv("CUP_SHADERDUMP") && string) {
+    fprintf(stderr, "[SHSRC] shader=%u count=%d f=%d:\n", sh, count, g_render_frame);
+    size_t tot = 0;
+    for (int i = 0; i < count && string[i] && tot < 6000; i++) {
+      int len = length ? length[i] : (int)strlen(string[i]);
+      if (len > (int)(6000 - tot)) len = (int)(6000 - tot);
+      fwrite(string[i], 1, len, stderr);
+      tot += len;
+    }
+    fprintf(stderr, "\n[SHSRC] ---fim shader=%u---\n", sh); fsync(2);
+  }
+  /* CUP_ALPHAFIX: sprites/cenário/chefes INVISÍVEIS — o variant ETC1-split-alpha
+   * sampleia _AlphaTex (bound num dummy 4x4) com _EnableExternalAlpha=1:
+   *   alpha = mix(_MainTex.a, _AlphaTex.x, _EnableExternalAlpha) -> 0 -> transparente.
+   * Os atlases aqui sobem DESCOMPRIMIDOS (RGBA com alpha real no .a — o player prova).
+   * Patch: remove a declaração e troca usos de _EnableExternalAlpha por 0.0
+   * (força o caminho interno _MainTex.a). */
+  if (getenv("CUP_ALPHAFIX") && string &&
+      (strstr2_any(string, count, "_EnableExternalAlpha") ||
+       strstr2_any(string, count, "_RendererColor"))) {
+    /* tokens neutralizados (substituição com fronteira de identificador):
+     *   _EnableExternalAlpha -> 0.0       (força alpha interno _MainTex.a)
+     *   _RendererColor/_Color -> vec4(1.0) (uniform não-setado = 0 em GLES2 -> cor*0 = invisível) */
+    static const struct { const char *tok, *rep; } T[] = {
+      {"_EnableExternalAlpha", "0.0"},
+      {"_RendererColor", "vec4(1.0)"},
+      {"_Color", "vec4(1.0)"},
+    };
+    size_t tot = 0;
+    for (int i = 0; i < count && string[i]; i++)
+      tot += (length && length[i] >= 0) ? (size_t)length[i] : strlen(string[i]);
+    char *buf = tot < 65536 ? malloc(tot + 1) : NULL;
+    if (buf) {
+      size_t o = 0;
+      for (int i = 0; i < count && string[i]; i++) {
+        size_t l = (length && length[i] >= 0) ? (size_t)length[i] : strlen(string[i]);
+        memcpy(buf + o, string[i], l); o += l;
+      }
+      buf[o] = 0;
+      char *out = malloc(o * 2 + 64);
+      if (out) {
+        size_t w = 0;
+        for (char *p = buf; *p; ) {
+          char *nl = strchr(p, '\n');
+          size_t ll = nl ? (size_t)(nl - p + 1) : strlen(p);
+          int drop = 0;
+          if (memmem(p, ll, "uniform", 7))
+            for (unsigned t = 0; t < sizeof T / sizeof T[0] && !drop; t++)
+              if (memmem(p, ll, T[t].tok, strlen(T[t].tok))) drop = 1;  /* corta declaração */
+          if (drop) { p += ll; continue; }
+          for (size_t k = 0; k < ll; ) {
+            int hit = 0;
+            for (unsigned t = 0; t < sizeof T / sizeof T[0]; t++) {
+              size_t tl = strlen(T[t].tok);
+              if (k + tl <= ll && !memcmp(p + k, T[t].tok, tl)) {
+                char b = k ? p[k - 1] : ' ', a = (k + tl < ll) ? p[k + tl] : ' ';
+                if (!(isalnum(b) || b == '_') && !(isalnum(a) || a == '_')) {  /* fronteira */
+                  size_t rl = strlen(T[t].rep);
+                  memcpy(out + w, T[t].rep, rl); w += rl; k += tl; hit = 1; break;
+                }
+              }
+            }
+            if (!hit) out[w++] = p[k++];
+          }
+          p += ll;
+        }
+        out[w] = 0;
+        fprintf(stderr, "[ALPHAFIX] shader=%u: ExternalAlpha->0 + _Color/_RendererColor->vec4(1)\n", sh);
+        fsync(2);
+        r_glShaderSource(sh, 1, (const char **)&out, NULL);
+        free(out); free(buf);
+        return;
+      }
+      free(buf);
+    }
+  }
+  r_glShaderSource(sh, count, string, length);
+}
 static void my_glLinkProgram(unsigned pr) {
   if (!r_glLinkProgram) r_glLinkProgram = dlsym(RTLD_DEFAULT, "glLinkProgram");
   if (!r_glGetProgramiv) r_glGetProgramiv = dlsym(RTLD_DEFAULT, "glGetProgramiv");
   r_glLinkProgram(pr);
+  {
+    int (*gul)(unsigned, const char *) = dlsym(RTLD_DEFAULT, "glGetUniformLocation");
+    if (gul && pr < 4096 && gul(pr, "_AlphaTex") >= 0) {
+      extern unsigned char g_extalpha_prog[];
+      g_extalpha_prog[pr] = 1;
+      fprintf(stderr, "[EXTALPHA] prog=%u marcado (variant _AlphaTex)\n", pr); fsync(2);
+    }
+  }
   int st = -1; if (r_glGetProgramiv) r_glGetProgramiv(pr, 0x8B82, &st); /* LINK_STATUS */
   if (st != 1 && g_prN < 100) {
     char log[768] = {0}; if (r_glGetShaderInfoLog) { void (*gpil)(unsigned,int,int*,char*) = dlsym(RTLD_DEFAULT,"glGetProgramInfoLog"); if (gpil) gpil(pr, sizeof log-1, NULL, log); }
@@ -658,7 +754,7 @@ static void (*ds_r_GetIntegerv)(unsigned, int *);
 #define DS_RING 128
 typedef struct {
   unsigned seq; int frame; unsigned char kind, in_progress; /* kind 0=elems 1=arrays */
-  unsigned mode, type; int count, prog, tex, fbo, unit, texw, texh;
+  unsigned mode, type; int count, prog, tex, fbo, unit, texw, texh, tex0, tex1;
 } ds_rec;
 static ds_rec ds_ring[DS_RING];
 static volatile unsigned ds_seq = 0;
@@ -687,8 +783,100 @@ static ds_rec *ds_enter(int kind, unsigned mode, int count, unsigned type) {
   r->fbo  = ds_geti(0x8CA6);          /* GL_FRAMEBUFFER_BINDING */
   r->texw = (r->tex > 0 && r->tex < DS_MAXTEXID) ? ds_tw[r->tex] : 0;
   r->texh = (r->tex > 0 && r->tex < DS_MAXTEXID) ? ds_th[r->tex] : 0;
+  r->tex0 = r->tex1 = 0;
   r->in_progress = 1;
   return r;
+}
+/* probe ARMÁVEL de estado por-draw (depth/blend/attachment do FBO + t0/t1):
+ * touch /tmp/dsdump arma N draws via watchdog — pega o quadro completo EM GAMEPLAY */
+static volatile int g_probe_arm = 0;
+static void ds_probe_state(ds_rec *r) {
+  static void (*at)(unsigned);
+  static unsigned char (*ise)(unsigned);
+  static void (*gfap)(unsigned, unsigned, unsigned, int *);
+  if (!at) at = dlsym(RTLD_DEFAULT, "glActiveTexture");
+  if (!ise) ise = dlsym(RTLD_DEFAULT, "glIsEnabled");
+  if (!gfap) gfap = dlsym(RTLD_DEFAULT, "glGetFramebufferAttachmentParameteriv");
+  if (!at || !ise) return;
+  at(0x84C0); r->tex0 = ds_geti(0x8069);
+  at(0x84C1); r->tex1 = ds_geti(0x8069);
+  at(0x84C0 + (r->unit >= 0 && r->unit < 32 ? r->unit : 0));
+  int dtest = ise(0x0B71), blend = ise(0x0BE2);
+  int dmask = ds_geti(0x0B72), dfunc = ds_geti(0x0B74);
+  int datt = -1;
+  if (gfap && r->fbo != 0) gfap(0x8D40, 0x8D00, 0x8CD0, &datt);  /* FBO/DEPTH_ATT/OBJ_TYPE */
+  /* colorMask (4 bools) + stencil completo — fragments podem estar sendo descartados */
+  int cm[4] = {-1, -1, -1, -1};
+  static void (*gbv)(unsigned, unsigned char *);
+  if (!gbv) gbv = dlsym(RTLD_DEFAULT, "glGetBooleanv");
+  if (gbv) { unsigned char b[4] = {9, 9, 9, 9}; gbv(0x0C23, b); cm[0] = b[0]; cm[1] = b[1]; cm[2] = b[2]; cm[3] = b[3]; }
+  int stest = ise(0x0B90), sfunc = ds_geti(0x0B92), sref = ds_geti(0x0B97),
+      svmask = ds_geti(0x0B93), swmask = ds_geti(0x0B98);
+  int sciss = ise(0x0C11);
+  int sbox[4] = {0}, vp[4] = {0};
+  static void (*giv)(unsigned, int *);
+  if (!giv) giv = dlsym(RTLD_DEFAULT, "glGetIntegerv");
+  if (giv) { giv(0x0C10, sbox); giv(0x0BA2, vp); }
+  fprintf(stderr, "[SPROBE] f=%d prog=%d fbo=%d u%d cnt=%d t0=%d t1=%d(%dx%d) depth{test=%d mask=%d func=0x%X att=0x%X} blend=%d color=%d%d%d%d sten{test=%d func=0x%X ref=%d vm=0x%X wm=0x%X} sciss=%d[%d,%d,%d,%d] vp=[%d,%d,%d,%d]\n",
+          r->frame, r->prog, r->fbo, r->unit, r->count, r->tex0,
+          r->tex1, r->tex1 > 0 && r->tex1 < DS_MAXTEXID ? ds_tw[r->tex1] : 0,
+          r->tex1 > 0 && r->tex1 < DS_MAXTEXID ? ds_th[r->tex1] : 0,
+          dtest, dmask, dfunc, datt, blend, cm[0], cm[1], cm[2], cm[3],
+          stest, sfunc, sref, svmask, swmask,
+          sciss, sbox[0], sbox[1], sbox[2], sbox[3], vp[0], vp[1], vp[2], vp[3]);
+  fsync(2);
+}
+/* programas com _AlphaTex (variant sprite ext-alpha) marcados no link */
+unsigned char g_extalpha_prog[4096];
+static volatile int g_cur_prog;
+static void (*r_glUseProgram)(unsigned);
+static void my_glUseProgram(unsigned p) {
+  if (!r_glUseProgram) r_glUseProgram = dlsym(RTLD_DEFAULT, "glUseProgram");
+  g_cur_prog = (int)p;
+  r_glUseProgram(p);
+}
+/* log de matrizes (translação+escala) enquanto o probe está armado */
+static void (*r_glUniformMatrix4fv)(int, int, unsigned char, const float *);
+static void my_glUniformMatrix4fv(int loc, int cnt, unsigned char tr, const float *m) {
+  if (!r_glUniformMatrix4fv) r_glUniformMatrix4fv = dlsym(RTLD_DEFAULT, "glUniformMatrix4fv");
+  if (g_probe_arm > 0 && m) {
+    fprintf(stderr, "[MAT] prog=%d loc=%d n=%d diag=(%.3f %.3f %.3f %.3f) trans=(%.2f %.2f %.2f)\n",
+            g_cur_prog, loc, cnt, m[0], m[5], m[10], m[15], m[12], m[13], m[14]);
+    fsync(2);
+  }
+  r_glUniformMatrix4fv(loc, cnt, tr, m);
+}
+/* PROGSPY: na 1ª vez que um programa desenha, loga samplers->unit + fonte GLSL */
+static void ds_progspy(int prog) {
+  static unsigned char seen[256];
+  if (prog <= 0 || prog >= 256 || seen[prog]) return;
+  seen[prog] = 1;
+  void (*gau)(unsigned, unsigned, int, int *, int *, unsigned *, char *) = dlsym(RTLD_DEFAULT, "glGetActiveUniform");
+  int (*gul)(unsigned, const char *) = dlsym(RTLD_DEFAULT, "glGetUniformLocation");
+  void (*guiv)(unsigned, int, int *) = dlsym(RTLD_DEFAULT, "glGetUniformiv");
+  void (*gas)(unsigned, int, int *, unsigned *) = dlsym(RTLD_DEFAULT, "glGetAttachedShaders");
+  void (*gss)(unsigned, int, int *, char *) = dlsym(RTLD_DEFAULT, "glGetShaderSource");
+  void (*gpiv)(unsigned, unsigned, int *) = dlsym(RTLD_DEFAULT, "glGetProgramiv");
+  if (!gau || !gul || !guiv || !gas || !gss || !gpiv) return;
+  int nu = 0; gpiv(prog, 0x8B86, &nu);  /* GL_ACTIVE_UNIFORMS */
+  fprintf(stderr, "[PROGSPY] prog=%d uniforms=%d f=%d\n", prog, nu, g_render_frame);
+  for (int i = 0; i < nu && i < 64; i++) {
+    char nm[128] = {0}; int sz = 0; unsigned ty = 0;
+    gau(prog, i, sizeof nm - 1, NULL, &sz, &ty, nm);
+    if (ty == 0x8B5E || ty == 0x8B60) {  /* SAMPLER_2D / SAMPLER_CUBE */
+      int loc = gul(prog, nm), unit = -1;
+      if (loc >= 0) guiv(prog, loc, &unit);
+      fprintf(stderr, "[PROGSPY]   sampler %s -> unit %d\n", nm, unit);
+    }
+  }
+  unsigned shs[4] = {0}; int ns = 0;
+  gas(prog, 4, &ns, shs);
+  for (int i = 0; i < ns; i++) {
+    static char src[4096]; int len = 0; src[0] = 0;
+    gss(shs[i], sizeof src - 1, &len, src);
+    fprintf(stderr, "[PROGSPY] prog=%d shader[%d] len=%d SRC:\n%.2400s\n[PROGSPY] ---fim---\n", prog, i, len, src);
+  }
+  fsync(2);
 }
 static int ds_skip(const ds_rec *r) {
   if (g_skipfbo && r->fbo != 0) return 1;
@@ -697,14 +885,41 @@ static int ds_skip(const ds_rec *r) {
 }
 volatile unsigned long g_frame_draws, g_frame_verts, g_draws_lo;   /* CUP_DRAWCOUNT: carga de desenho/frame */
 extern int rs_logical0(void); extern int rs_enabled(void);
+static void ds_draw_noscissor(void (*draw)(unsigned, int, unsigned, const void *),
+                              unsigned mode, int count, unsigned type, const void *idx) {
+  static void (*dis)(unsigned), (*ena)(unsigned);
+  static unsigned char (*ise2)(unsigned);
+  if (!dis) { dis = dlsym(RTLD_DEFAULT, "glDisable"); ena = dlsym(RTLD_DEFAULT, "glEnable"); ise2 = dlsym(RTLD_DEFAULT, "glIsEnabled"); }
+  int was = ise2 ? ise2(0x0C11) : 0;
+  if (was && dis) dis(0x0C11);
+  draw(mode, count, type, idx);
+  if (was && ena) ena(0x0C11);
+}
+static int g_noscissor = -1;
 static void my_glDrawElements(unsigned mode, int count, unsigned type, const void *idx) {
   g_frame_draws++; g_frame_verts += (unsigned)count;
   if (rs_enabled() && rs_logical0()) g_draws_lo++;
-  if (!g_drawdiag) { ds_r_DrawElements(mode, count, type, idx); return; }  /* fast path: SEM glGetIntegerv */
+  if (g_noscissor < 0) g_noscissor = getenv("CUP_NOSCISSOR") ? 1 : 0;
+  if (!g_drawdiag) {  /* fast path: SEM glGetIntegerv (NOSCISSOR só olha o prog atual) */
+    if (g_noscissor && g_cur_prog > 0 && g_cur_prog < 4096 && g_extalpha_prog[g_cur_prog]) {
+      ds_draw_noscissor(ds_r_DrawElements, mode, count, type, idx);
+      return;
+    }
+    ds_r_DrawElements(mode, count, type, idx);
+    return;
+  }
   ds_rec *r = ds_enter(0, mode, count, type);
+  ds_progspy(r->prog);
+  if (g_probe_arm > 0) { g_probe_arm--; ds_probe_state(r); }
   if (r->seq < 8) fprintf(stderr, "[DS] draw#%u f=%d ELM cnt=%d prog=%d fbo=%d tex=%d(%dx%d)\n",
                           r->seq, r->frame, count, r->prog, r->fbo, r->tex, r->texw, r->texh);
   if (ds_skip(r)) { r->in_progress = 0; ds_skipped++; return; }
+  /* CUP_NOSCISSOR: testa se o scissor está cortando os sprites ext-alpha */
+  if (g_noscissor && r->prog > 0 && r->prog < 4096 && g_extalpha_prog[r->prog]) {
+    ds_draw_noscissor(ds_r_DrawElements, mode, count, type, idx);
+    r->in_progress = 0;
+    return;
+  }
   ds_r_DrawElements(mode, count, type, idx);
   r->in_progress = 0;
 }
@@ -722,7 +937,7 @@ static void ds_rectex(int w, int h, const char *what) {
     if ((unsigned short)w > ds_tw[t]) ds_tw[t] = (unsigned short)w;
     if ((unsigned short)h > ds_th[t]) ds_th[t] = (unsigned short)h;
   }
-  if (w > 2048 || h > 2048) { fprintf(stderr, "[DS] BIG TEX %s id=%d %dx%d\n", what, t, w, h); fsync(2); }
+  if (w >= 1024 || h >= 1024) { fprintf(stderr, "[DS] BIG TEX %s id=%d %dx%d f=%d\n", what, t, w, h, g_render_frame); fsync(2); }
 }
 /* CUP_TEXHALF=N: downscale (nearest) das texturas nivel-0 não-comprimidas até
  * caberem no teto N (max(w,h) <= N). N=512 → 2048 vira 512 (1/16 da RAM/VRAM!).
@@ -743,6 +958,22 @@ static int gl_bpp(unsigned fmt, unsigned type) {
 static unsigned char ds_shift[DS_MAXTEXID];  /* fator de downscale (log2) por tex id */
 static void my_glTexImage2D(unsigned tgt, int lvl, int ifmt, int w, int h, int b, unsigned fmt, unsigned type, const void *px) {
   if (lvl == 0 && tgt == 0x0DE1) ds_rectex(w, h, "tex");
+  if (g_drawdiag && lvl == 0 && tgt == 0x0DE1 && w >= 256) {
+    fprintf(stderr, "[TEXFMT] id=%d %dx%d ifmt=0x%X fmt=0x%X type=0x%X px=%c f=%d\n",
+            ds_geti(0x8069), w, h, ifmt, fmt, type, px ? 'Y' : 'N', g_render_frame); fsync(2);
+  }
+  /* CUP_TEXSTAT: o canal alpha dos atlases grandes é real ou zerado? */
+  if (getenv("CUP_TEXSTAT") && lvl == 0 && tgt == 0x0DE1 && w >= 1024 && px && fmt == 0x1908 && type == 0x1401) {
+    const unsigned char *q = px;
+    size_t n = (size_t)w * h, z = 0, ff = 0;
+    for (size_t i = 0; i < n; i += 7) {            /* amostra 1/7 dos pixels */
+      unsigned char a = q[i * 4 + 3];
+      if (a == 0) z++; else if (a == 255) ff++;
+    }
+    size_t s = (n + 6) / 7;
+    fprintf(stderr, "[TEXSTAT] id=%d %dx%d alpha: zero=%zu%% cheio=%zu%% (amostra %zu) f=%d\n",
+            ds_geti(0x8069), w, h, z * 100 / s, ff * 100 / s, s, g_render_frame); fsync(2);
+  }
   int tid = (g_texhalf && tgt == 0x0DE1) ? ds_geti(0x8069) : 0;
   int shift = 0;
   if (g_texhalf && tgt == 0x0DE1 && px && gl_bpp(fmt, type) > 0) {
@@ -779,6 +1010,54 @@ static void my_glCompTexImage2D(unsigned tgt, int lvl, unsigned ifmt, int w, int
   if (lvl == 0 && tgt == 0x0DE1) ds_rectex(w, h, "ctex");
   ds_r_CompTexImage2D(tgt, lvl, ifmt, w, h, b, sz, px);
 }
+/* ---- renderbuffer/FBO: log + retry de formato de DEPTH não suportado ----
+ * Hipótese chefes-invisíveis: Unity pede DEPTH_COMPONENT24/32 (ext OES) que o blob
+ * Utgard antigo não tem -> glRenderbufferStorage falha SILENCIOSO -> FBO da cena sem
+ * depth -> passe opaco front-to-back sem oclusão -> céu (desenhado depois) soterra
+ * os sprites. Retry com DEPTH_COMPONENT16 (sempre suportado em GLES2). */
+static void (*r_glRenderbufferStorage)(unsigned, unsigned, int, int);
+static unsigned (*r_glGetError2)(void);
+static unsigned (*r_glCheckFBStatus)(unsigned);
+static void my_glRenderbufferStorage(unsigned tgt, unsigned ifmt, int w, int h) {
+  if (!r_glRenderbufferStorage) r_glRenderbufferStorage = dlsym(RTLD_DEFAULT, "glRenderbufferStorage");
+  if (!r_glGetError2) r_glGetError2 = dlsym(RTLD_DEFAULT, "glGetError");
+  if (r_glGetError2) r_glGetError2();                     /* limpa erro pendente */
+  r_glRenderbufferStorage(tgt, ifmt, w, h);
+  unsigned err = r_glGetError2 ? r_glGetError2() : 0;
+  fprintf(stderr, "[RBSTOR] rb=%d ifmt=0x%X %dx%d err=0x%X\n", ds_geti(0x8CA7), ifmt, w, h, err);
+  if (err) {
+    unsigned fb = 0;
+    if (ifmt == 0x81A6 || ifmt == 0x81A7) fb = 0x81A5;          /* DEPTH24/32 -> DEPTH16 */
+    else if (ifmt == 0x88F0) fb = 0x81A5;                       /* D24S8 -> DEPTH16 (sem stencil) */
+    if (fb) {
+      r_glRenderbufferStorage(tgt, fb, w, h);
+      unsigned e2 = r_glGetError2 ? r_glGetError2() : 0;
+      fprintf(stderr, "[RBSTOR] retry ifmt=0x%X -> err=0x%X %s\n", fb, e2, e2 ? "FALHOU" : "OK");
+    }
+    fsync(2);
+  }
+}
+/* wiring dos FBOs: qual textura/RB em cada attachment (mapa cena->composição) */
+static void (*r_glFBTex2D)(unsigned, unsigned, unsigned, unsigned, int);
+static void my_glFramebufferTexture2D(unsigned tgt, unsigned att, unsigned textgt, unsigned tex, int lvl) {
+  if (!r_glFBTex2D) r_glFBTex2D = dlsym(RTLD_DEFAULT, "glFramebufferTexture2D");
+  fprintf(stderr, "[FBWIRE] fbo=%d att=0x%X tex=%u(%dx%d)\n", ds_geti(0x8CA6), att, tex,
+          tex > 0 && tex < DS_MAXTEXID ? ds_tw[tex] : 0, tex > 0 && tex < DS_MAXTEXID ? ds_th[tex] : 0);
+  fsync(2);
+  r_glFBTex2D(tgt, att, textgt, tex, lvl);
+}
+static void (*r_glFBRb)(unsigned, unsigned, unsigned, unsigned);
+static void my_glFramebufferRenderbuffer(unsigned tgt, unsigned att, unsigned rbtgt, unsigned rb) {
+  if (!r_glFBRb) r_glFBRb = dlsym(RTLD_DEFAULT, "glFramebufferRenderbuffer");
+  fprintf(stderr, "[FBWIRE] fbo=%d att=0x%X rb=%u\n", ds_geti(0x8CA6), att, rb); fsync(2);
+  r_glFBRb(tgt, att, rbtgt, rb);
+}
+static unsigned my_glCheckFramebufferStatus(unsigned tgt) {
+  if (!r_glCheckFBStatus) r_glCheckFBStatus = dlsym(RTLD_DEFAULT, "glCheckFramebufferStatus");
+  unsigned st = r_glCheckFBStatus ? r_glCheckFBStatus(tgt) : 0;
+  if (st != 0x8CD5) { fprintf(stderr, "[FBSTAT] fbo=%d status=0x%X (INCOMPLETO)\n", ds_geti(0x8CA6), st); fsync(2); }
+  return st;
+}
 static void ds_dump(void) {
   unsigned end = ds_seq;
   unsigned n = end < DS_RING ? end : DS_RING;
@@ -786,9 +1065,9 @@ static void ds_dump(void) {
   for (unsigned i = end - n; i != end; i++) {
     ds_rec *r = &ds_ring[i % DS_RING];
     if (r->seq != i) continue;  /* slot já sobrescrito (race benigna) */
-    fprintf(stderr, "[DS] #%u f=%d %s mode=%u cnt=%d prog=%d fbo=%d u%d tex=%d(%dx%d)%s\n",
+    fprintf(stderr, "[DS] #%u f=%d %s mode=%u cnt=%d prog=%d fbo=%d u%d tex=%d(%dx%d) t0=%d t1=%d%s\n",
             r->seq, r->frame, r->kind ? "ARR" : "ELM", r->mode, r->count,
-            r->prog, r->fbo, r->unit, r->tex, r->texw, r->texh,
+            r->prog, r->fbo, r->unit, r->tex, r->texw, r->texh, r->tex0, r->tex1,
             r->in_progress ? "  <== IN-PROGRESS (bloqueado no driver)" : "");
   }
   fsync(2);
@@ -800,6 +1079,10 @@ static void *ds_watchdog(void *a) {
     sleep(2);
     unsigned s = ds_seq;
     if (++beat % 30 == 0) { fprintf(stderr, "[DS] alive seq=%u f=%d skipped=%u\n", s, g_render_frame, ds_skipped); fsync(2); }
+    if (access("/tmp/dsdump", F_OK) == 0) { unlink("/tmp/dsdump"); ds_dump(); g_probe_arm = 60; }
+    /* liga/desliga o diag PESADO em runtime (boot/nav leves, diag só na fase) */
+    if (access("/tmp/dson", F_OK) == 0) { unlink("/tmp/dson"); g_drawdiag = 1; fprintf(stderr, "[DS] drawdiag ON (runtime)\n"); fsync(2); }
+    if (access("/tmp/dsoff", F_OK) == 0) { unlink("/tmp/dsoff"); g_drawdiag = 0; fprintf(stderr, "[DS] drawdiag OFF (runtime)\n"); fsync(2); }
     if (s != last) { last = s; still = 0; dumped = 0; continue; }
     if (s == 0) continue;
     if (++still >= 3 && !dumped) {
@@ -845,6 +1128,13 @@ static void *ds_route(const char *nm, void *real) {
   else if (!strcmp(nm, "glCompressedTexImage2D")) { ds_r_CompTexImage2D = real; w = (void *)my_glCompTexImage2D; }
   else if (!strcmp(nm, "glCompileShader")) { r_glCompileShader = real; w = (void *)my_glCompileShader; }
   else if (!strcmp(nm, "glLinkProgram"))   { r_glLinkProgram = real;   w = (void *)my_glLinkProgram; }
+  else if (!strcmp(nm, "glShaderSource"))  { r_glShaderSource = real;  w = (void *)my_glShaderSource; }
+  else if (!strcmp(nm, "glRenderbufferStorage")) { r_glRenderbufferStorage = real; w = (void *)my_glRenderbufferStorage; }
+  else if (!strcmp(nm, "glCheckFramebufferStatus")) { r_glCheckFBStatus = real; w = (void *)my_glCheckFramebufferStatus; }
+  else if (!strcmp(nm, "glFramebufferTexture2D")) { r_glFBTex2D = real; w = (void *)my_glFramebufferTexture2D; }
+  else if (!strcmp(nm, "glFramebufferRenderbuffer")) { r_glFBRb = real; w = (void *)my_glFramebufferRenderbuffer; }
+  else if (!strcmp(nm, "glUseProgram")) { r_glUseProgram = real; w = (void *)my_glUseProgram; }
+  else if (!strcmp(nm, "glUniformMatrix4fv")) { r_glUniformMatrix4fv = real; w = (void *)my_glUniformMatrix4fv; }
   if (w != real) { fprintf(stderr, "[DS] route %s (real=%p)\n", nm, real); fsync(2); }
   return w;
 }
@@ -861,7 +1151,7 @@ static void ds_init(void) {
     for (char *t = strtok(buf, ","); t && g_nskipprog < 8; t = strtok(NULL, ","))
       g_skipprog[g_nskipprog++] = atoi(t);
   }
-  if (g_drawdiag) { pthread_t th; pthread_create(&th, NULL, ds_watchdog, NULL); }
+  if (g_drawdiag || getenv("CUP_DRAWCOUNT")) { pthread_t th; pthread_create(&th, NULL, ds_watchdog, NULL); }
   fprintf(stderr, "[DS] roteamento ON (texhalf=%d drawdiag=%d skipfbo=%d)\n",
           g_texhalf, g_drawdiag, g_skipfbo);
 }
