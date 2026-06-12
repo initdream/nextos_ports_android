@@ -55,6 +55,73 @@ if [ ! -f "$GAMEDIR/libGame.so" ] || [ ! -f "$GAMEDIR/assets/data_0.zip" ]; then
   exit 1
 fi
 
+# ---------- settings padrao da 1a execucao ----------
+# O jogo cria o settings.ini com Clarity (resolution) = rs_low em instalacao
+# nova. Semeia um padrao com rs_high (template gerado pelo proprio engine).
+# So age quando NAO existe settings.ini — depois a escolha do usuario manda.
+if [ ! -f "$GAMEDIR/settings.ini" ]; then
+  cat > "$GAMEDIR/settings.ini" <<'SETEOF'
+bullysettings={
+	fxvolume=0.600000,
+	musicvolume=0.600000,
+	speechvolume=0.700000,
+	brightness=0.800000,
+	shadow=ss_off,
+	resolution=rs_high,
+	language=ls_english,
+	sensitivity=0.400000,
+	invertx=false,
+	inverty=false,
+	vibrate=vs_high,
+	subtitles=false,
+	lefthanded=false,
+	autoclimb=false,
+	recording=false,
+	hasrated=false,
+	steeringmode=vsm_digital,
+	positions=[6,{
+		center={
+			x=0.830000,
+			y=0.790000
+		},
+		size=3
+	},{
+		center={
+			x=0.635000,
+			y=0.835000
+		},
+		size=1
+	},{
+		center={
+			x=0.680000,
+			y=0.645000
+		},
+		size=1
+	},{
+		center={
+			x=0.875000,
+			y=0.595000
+		},
+		size=1
+	},{
+		center={
+			x=0.870000,
+			y=0.460000
+		},
+		size=0
+	},{
+		center={
+			x=0.465000,
+			y=0.895000
+		},
+		size=1
+	}],
+	vehiclesensitivity=0.800000
+}
+SETEOF
+  echo "settings.ini semeado com Clarity=rs_high (1a execucao)"
+fi
+
 # ---------- ambiente ----------
 # runtime/ = glibc 2.43 bundlada (ld+libc+libm) p/ devices com glibc velha (<2.34,
 # ex: ArkOS). O binario usa interpretador RELATIVO runtime/ld-linux-aarch64.so.1

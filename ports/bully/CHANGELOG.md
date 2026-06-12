@@ -36,6 +36,9 @@ build mobile — foi destravada via toque sintetico no HUD.
 4. Sem gptokeyb no CFW -> fallback automatico pro controle nativo da v5.
 
 ### Outras mudancas
+- **Clarity (resolution) vem em HIGH por padrao**: em instalacao nova o jogo
+  criava o settings.ini com rs_low; o launcher semeia um settings.ini padrao
+  com `resolution=rs_high` na 1a execucao (depois a escolha do usuario manda).
 - **MSAA 4x agora e OPCIONAL e vem DESLIGADO** (linha comentada no Bully.sh;
   descomente `export BULLY_MSAA=4` p/ ligar em paineis 480p).
 - **Instancia unica**: o launcher mata instancia anterior presa (crash) antes
