@@ -308,6 +308,52 @@ real (GLVER=3.0, egl_shim pede major=3) — branco igual.
 - ModelSurface symbols: GenerateVerticesByFormat @0xa025b8, GetVerticesByFormat
   @0xa0571c, InitializeIndexBuffer @0xa04250, FreeVertexAndIndexBuffers @0xa054c8.
 
+## 🏆🏆 SESSÃO 2026-06-12 (noite) — MUNDO BRANCO RESOLVIDO! (shaders feature_level=2 pulados)
+**CAUSA-RAIZ FINAL (cadeia completa, confirmada com fix funcionando nos 2 devices):**
+1. Os XMLs de shader das variantes `*Shadows` (e `SkinnedLitFur`) declaram
+   **`<node id="feature_level" value="2"/>`** → mask de targets **0x7E** (exclui o
+   tier GL mais baixo; tabela {fl1=0x7F, fl2=0x7E, fl3=0x50} @0x3035b4, ReadTargets
+   @0x5afbb8). Shaders sem o atributo = default 0x7F.
+2. O target atual do renderer = `renderer+1120` (RendererImplementationOpenGL::
+   GetShaderTarget @0x520ab8), computado por GL::APIManager::GetFunctions da versão
+   GL → no nosso ambiente = **1 (tier mais baixo)** mesmo com contexto ES3 no X5M.
+3. Shader com (mask & target)==0 é **PULADO SILENCIOSAMENTE** (sem erro no
+   translator) → `nx_shader_t` fica zerado → **shader+44 (vertex format) = 0**.
+4. `ModelBuilderSurfaceBased::AddBuiltModelSurfacesToModel @0xb304a8` lê o formato
+   de `[[effect+48]+44]` → entry fmt=0 + **alloc(0)** (case default do switch) →
+   verts@8 = ponteiro p/ alocação vazia (o "objeto" misterioso era lixo de heap!) →
+   `createvb(0,...)` falha ("unknown vertex format", 2299×) → chão/pedras/lixeiras/
+   árvores/água invisíveis. Sombras dos shards apareciam pq usam fmt=7 HARDCODED
+   (ActorRenderer::OnShadowUpdate @0xaeb4fc).
+- Relato do Felipe no Mali-450 bateu 100%: aparece o que usa material sem sombra
+  (carros/portas/prateleiras/tapete), some o que usa `*Shadows` (fundo do mapa,
+  pedras, lixeiras).
+
+**FIX (hook_getshader, detour NX_Graphics_GetShader @0x4846b0, default ON):** se o
+shader pedido sai com fmt==0, degrada o nome progressivamente até variante que
+carrega: tira `Shadows`→`Reflections`→`Heights`→`Specular`→`Normals`→`Glow`,
+`Fur`→`Diffuse`, e por fim tira `Lit` (TagWaterLit→TagWater, BillboardLit→
+Billboard). Resultado X5M: **43 aliases, 0 shaders fmt=0, 0 erros de vertex
+buffer, MUNDO RENDERIZA** (grama/terreno/carro/casas/props com cor — screenshot
+/tmp/dys_fix.png; Felipe: "as gramas apareceram todas"). Env:
+`DYSMANTLE_KEEP_SHADOW_SHADERS=1` desliga o alias.
+- Fix A alternativo (X5M/ES3): `DYSMANTLE_SHTARGET=2` (hook_inittrans, GOT de
+  ShaderUtility::InitializeTranslator) sobe renderer+1120 → carregaria os Shadows
+  de verdade (não testado a fundo; alias já resolve e funciona tb no ES2).
+- Diag que destravou: hook_shaderload (helper @0x487990 copia info+388→shader+44),
+  hook_getshader ([GETSHADER] nome→fmt revelou o padrão *Shadows), [BROKENSURF]
+  (shader do material das surfaces quebradas), diff dos XMLs TreeLeaves vs
+  TreeLeavesShadows (feature_level=2).
+- Deploy: X5M /storage/roms/ports/dysmantle (testado, rodando) + Mali-450 .89
+  /storage/roms/dysmantle (dysmantle.pre-shalias.bak = backup; falta Felipe validar).
+- ⚠️ X5M: para liberar o KMSDRM parei o ES: `systemctl stop essway` (religar com
+  `systemctl start essway` ao terminar os testes). DRM master demora ~5s p/ soltar
+  após pkill (kmsdrm "not available" transitório → esperar e relançar).
+- PENDENTE pós-fix: Felipe validar Mali-450 (chão/lixeiras/pedras); investigar
+  gargalo/travamento de ÁUDIO no Mali-450 (relato 2026-06-12, possivelmente só
+  perf geral); visual sem shadow maps (aceitável; SHTARGET=2 no X5M se quiser
+  sombras reais).
+
 ### Tooling X5M criado (commits b437d84, 94d6983)
 - Resolução DINÂMICA (desktop mode + DYSMANTLE_RES override) — não mais 1280x720 fixo.
 - Screenshot remoto: `touch /dev/shm/dys_shot` -> /dev/shm/dys_shot.raw (RGBA flip-V).

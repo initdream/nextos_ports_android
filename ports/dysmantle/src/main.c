@@ -491,6 +491,24 @@ static void my_initbufs(void *self) {
     uint8_t *arr = *(uint8_t **)(s + 224);
     int32_t cnt = *(int32_t *)(s + 232);
     uint32_t real = surface_format(s);
+    /* DIAG mundo-branco: p/ surface com entry fmt=0, loga o SHADER do material
+     * (surface+48=mat, mat+168=effect, effect+48=shader, shader+0=nome,
+     * shader+44=fmt). Hipótese: shader zerado (nunca carregado) -> fmt 0. */
+    if (arr && cnt > 0 && *(uint32_t *)arr == 0) {
+      static void *seensh[32]; static int nsh = 0;
+      uint8_t *mat = *(uint8_t **)(s + 48);
+      uint8_t *eff = mat ? *(uint8_t **)(mat + 168) : NULL;
+      uint8_t *sh = eff ? *(uint8_t **)(eff + 48) : NULL;
+      int known = 0;
+      for (int i = 0; i < nsh; i++) if (seensh[i] == (void *)sh) { known = 1; break; }
+      if (!known && nsh < 32) {
+        seensh[nsh++] = (void *)sh;
+        fprintf(stderr, "[BROKENSURF] mat=%p eff=%p sh=%p name='%s' shfmt=0x%x\n",
+                (void *)mat, (void *)eff, (void *)sh,
+                sh && *(char **)sh ? *(char **)sh : "?",
+                sh ? *(uint32_t *)(sh + 44) : 0xdead);
+      }
+    }
     if (arr) {
       for (int i = 0; i < cnt && i < 64; i++) {
         uint32_t *e = (uint32_t *)(arr + (size_t)i * 0x20);
@@ -577,6 +595,157 @@ static void hook_genverts(void) {
   so_make_text_executable(); so_flush_caches();
   fprintf(stderr, "hook_genverts: detour @ %p gen_streams=%p\n", (void *)addr,
           (void *)gen_streams_from_interleaved);
+}
+/* 🌍 CAUSA-RAIZ DO MUNDO BRANCO (sessão 2026-06-12): detour no helper interno
+ * de NXI_LoadShaderWithPreCompiledCode @0x487990 (args: x0=nx_shader_t*,
+ * x1=ShaderInfo*). Ele copia info+388 -> shader+44, e shader+44 é usado por
+ * ModelBuilderSurfaceBased::AddBuiltModelSurfacesToModel como o VERTEX FORMAT
+ * das surfaces construídas do mundo (chão/props). info+388 = mask de targets
+ * do XML do shader (atributo "target"; default 0x7F quando ausente) — 0x7F
+ * coincide com o formato full 40B, por isso funciona no Android. No nosso
+ * ambiente chega 0 -> entries fmt=0 -> createvb falha -> mundo invisível.
+ * FIX: se info+388==0, força 0x7F antes do helper rodar (o builder então
+ * aloca/escreve vértices 40B corretos). DYSMANTLE_SHADERFMT_OFF desliga;
+ * log dos primeiros shaders + de todos com fmt 0. */
+static void (*real_shaderload)(void *, void *);
+static void my_shaderload(void *shader, void *infov) {
+  uint8_t *info = (uint8_t *)infov;
+  uint32_t fmt = *(uint32_t *)(info + 388);
+  const char *name = *(const char **)(info + 232);
+  static int n = 0;
+  if (fmt == 0 || n < 8) {
+    fprintf(stderr, "[SHADERFMT] '%s' fmt=0x%x ver=0x%x%s\n",
+            name ? name : "?", fmt, *(uint32_t *)(info + 392),
+            (fmt == 0 && !getenv("DYSMANTLE_SHADERFMT_OFF")) ? " -> 0x7f" : "");
+    n++;
+  }
+  if (fmt == 0 && !getenv("DYSMANTLE_SHADERFMT_OFF"))
+    *(uint32_t *)(info + 388) = 0x7f;
+  real_shaderload(shader, infov);
+}
+/* 🌍 FIX B (mundo branco, GLES2-friendly): os shaders *Shadows têm
+ * feature_level=2 (mask 0x7E) e são PULADOS no target GL mais baixo →
+ * shader+44=0 → chão/pedras/lixeiras/árvores não desenham. Alias: redireciona
+ * "...Shadows.xml" pra variante sem sombra (mesmo material, sem shadow map).
+ * DYSMANTLE_KEEP_SHADOW_SHADERS=1 desliga o alias. */
+static void *(*real_getshader)(const char *);
+/* remove a 1ª ocorrência de tok em s (in place); 1 se removeu */
+static int shname_strip(char *s, const char *tok) {
+  char *p = strstr(s, tok);
+  if (!p) return 0;
+  memmove(p, p + strlen(tok), strlen(p + strlen(tok)) + 1);
+  return 1;
+}
+static void *my_getshader(const char *name) {
+  void *sh = real_getshader(name);
+  /* fallback: shader pediu features acima do target GL atual (feature_level=2,
+   * ex *Shadows) -> fmt 0 -> não desenharia. Degrada o nome progressivamente
+   * até uma variante que carrega. */
+  if (sh && name && strlen(name) < 240 &&
+      *(uint32_t *)((uint8_t *)sh + 44) == 0 &&
+      !getenv("DYSMANTLE_KEEP_SHADOW_SHADERS")) {
+    char cur[256];
+    strcpy(cur, name);
+    static const char *toks[] = {"Shadows", "Reflections", "Heights",
+                                 "Specular", "Normals", "Glow"};
+    void *best = NULL; const char *how = NULL;
+    for (unsigned i = 0; i < sizeof(toks) / sizeof(*toks) && !best; i++) {
+      if (!shname_strip(cur, toks[i])) continue;
+      void *a = real_getshader(cur);
+      if (a && *(uint32_t *)((uint8_t *)a + 44) != 0) { best = a; how = toks[i]; }
+    }
+    if (!best) { /* Fur -> Diffuse (SkinnedLitFur etc.) */
+      char *f = strstr(cur, "Fur");
+      if (f) {
+        char tmp[256]; size_t pre = (size_t)(f - cur);
+        memcpy(tmp, cur, pre);
+        snprintf(tmp + pre, sizeof(tmp) - pre, "Diffuse%s", f + 3);
+        void *a = real_getshader(tmp);
+        if (a && *(uint32_t *)((uint8_t *)a + 44) != 0) { best = a; how = "Fur"; strcpy(cur, tmp); }
+      }
+    }
+    if (!best && shname_strip(cur, "Lit")) { /* TagWaterLit->TagWater, BillboardLit->Billboard */
+      void *a = real_getshader(cur);
+      if (a && *(uint32_t *)((uint8_t *)a + 44) != 0) { best = a; how = "Lit"; }
+    }
+    if (best) {
+      static int z = 0;
+      if (z < 48) { fprintf(stderr, "[SHALIAS] '%s' -> '%s' (-%s, fmt=0x%x)\n",
+                            name, cur, how, *(uint32_t *)((uint8_t *)best + 44)); z++; }
+      return best;
+    }
+    fprintf(stderr, "[SHALIAS] '%s' SEM fallback (fica fmt=0)\n", name);
+  }
+  static char seen[64][96]; static int ns = 0;
+  if (name && sh) {
+    for (int i = 0; i < ns; i++) if (!strncmp(seen[i], name, 95)) return sh;
+    if (ns < 64) { strncpy(seen[ns], name, 95); ns++; }
+    uint32_t fmt = *(uint32_t *)((uint8_t *)sh + 44);
+    fprintf(stderr, "[GETSHADER] '%s' -> %p fmt=0x%x\n", name, sh, fmt);
+    if (fmt == 0) {
+      /* erro do TranslatorDriver: global [0xdc96a8] -> +0x448b8 = driver;
+       * driver+128 = char* da última mensagem de erro (ReadShaderXML/Translate) */
+      uintptr_t lb = so_find_addr("android_main") - 0x4651a4;
+      uint8_t *gd = *(uint8_t **)(lb + 0xdc96a8);
+      uint8_t *drv = gd ? *(uint8_t **)(gd + 0x448b8) : NULL;
+      const char *err = drv ? *(const char **)(drv + 128) : NULL;
+      fprintf(stderr, "[GETSHADER]   erro do translator: '%s'\n",
+              err && err[0] ? err : "(vazio)");
+    }
+  }
+  return sh;
+}
+/* 🌍 FIX A (alternativo, X5M/ES3): sobe o ShaderTarget do renderer
+ * (renderer+1120, lido por GetShaderTarget) ANTES do translator inicializar.
+ * DYSMANTLE_SHTARGET=2 = tier ES3 → shaders feature_level=2 (mask 0x7E)
+ * passam a carregar. GOT-hook em ShaderUtility::InitializeTranslator. */
+static int (*orig_inittrans)(void *) = NULL;
+static int my_inittrans(void *self) {
+  uintptr_t lb = so_find_addr("android_main") - 0x4651a4;
+  void **g = *(void ***)(lb + 0xdc9700); /* [dc9000+1792] -> obj; [obj]=renderer */
+  uint8_t *ren = g ? (uint8_t *)*g : NULL;
+  if (ren) {
+    uint32_t cur = *(uint32_t *)(ren + 1120);
+    const char *e = getenv("DYSMANTLE_SHTARGET");
+    fprintf(stderr, "[SHTARGET] renderer=%p target=%u%s\n", (void *)ren, cur,
+            e ? " (override)" : "");
+    if (e) *(uint32_t *)(ren + 1120) = (uint32_t)atoi(e);
+  }
+  return orig_inittrans ? orig_inittrans(self) : 0;
+}
+static void hook_inittrans(void) {
+  uintptr_t slot = so_find_rel_addr_safe("_ZN8Graphics13ShaderUtility20InitializeTranslatorEv");
+  if (!slot) { fprintf(stderr, "hook: GOT InitializeTranslator não achado\n"); return; }
+  uintptr_t *p = (uintptr_t *)slot;
+  orig_inittrans = (int (*)(void *))*p;
+  *p = (uintptr_t)my_inittrans;
+  fprintf(stderr, "hook: InitializeTranslator GOT %p\n", (void *)slot);
+}
+static void hook_getshader(void) {
+  uintptr_t lb = so_find_addr("android_main") - 0x4651a4;
+  uintptr_t addr = lb + 0x4846b0;
+  uint32_t *tr = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  tr[0] = *(uint32_t *)addr; tr[1] = 0x58000051u; tr[2] = 0xd61f0220u;
+  *(uint64_t *)&tr[3] = addr + 4;
+  __builtin___clear_cache((char *)tr, (char *)tr + 32);
+  real_getshader = (void *(*)(const char *))tr;
+  so_make_text_writable(); hook_arm64(addr, (uintptr_t)my_getshader);
+  so_make_text_executable(); so_flush_caches();
+  fprintf(stderr, "hook_getshader: detour @ %p\n", (void *)addr);
+}
+static void hook_shaderload(void) {
+  uintptr_t lb = so_find_addr("android_main") - 0x4651a4;
+  uintptr_t addr = lb + 0x487990; /* stp x29,x30,[sp,#-96]! (PIC) */
+  uint32_t *tr = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  tr[0] = *(uint32_t *)addr; tr[1] = 0x58000051u; tr[2] = 0xd61f0220u;
+  *(uint64_t *)&tr[3] = addr + 4;
+  __builtin___clear_cache((char *)tr, (char *)tr + 32);
+  real_shaderload = (void (*)(void *, void *))tr;
+  so_make_text_writable(); hook_arm64(addr, (uintptr_t)my_shaderload);
+  so_make_text_executable(); so_flush_caches();
+  fprintf(stderr, "hook_shaderload: detour @ %p\n", (void *)addr);
 }
 static void hook_createvb(void) {
   uintptr_t lb = so_find_addr("android_main") - 0x4651a4;
@@ -856,6 +1025,9 @@ int main(int argc, char *argv[]) {
   hook_genverts(); /* fix do mundo branco: fmt 0 → formato real dos streams */
   hook_initbufs();
   hook_createvb();
+  hook_shaderload(); /* 🌍 fix mundo branco: shader fmt 0 -> 0x7f (causa-raiz) */
+  hook_getshader();  /* 🌍 diag + FIX B: alias *Shadows.xml -> variante s/ sombra */
+  hook_inittrans();  /* 🌍 diag + FIX A: log/override do ShaderTarget */
   /* skip do skinned-actor: NÃO é a solução real (o crash vem de config LOW;
    * reverter as configs pro default resolve). Fica como rede de segurança
    * opcional via DYSMANTLE_SKIP_BADACTORS=1 (corrompe o importer, usar só p/
