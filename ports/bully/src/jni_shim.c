@@ -73,18 +73,23 @@ static char *FileGetArchiveName(int type) {
   return NULL;
 }
 static int GetGamepadType(int port) { return port == 0 ? 8 : -1; } /* PS3 */
-static int GetGamepadButtons(int port) {
-  if (port != 0 || !g_pad) return 0;
-  SDL_GameControllerUpdate();
-  /* Hotkey universal de SAIR (SELECT+START) — funciona em qualquer device, sem
-   * depender de gptokeyb/set_kill. _exit imediato evita o deadlock do blob Mali
-   * (Valhall/Utgard) ao liberar o contexto GL no encerramento. */
+/* Hotkey universal de SAIR (SELECT+START) — funciona em qualquer device, sem
+ * depender de gptokeyb/set_kill (que varia por CFW). Chamado do pump_gamepad
+ * (todo frame; o jogo usa eventos, nao polling) E do GetGamepadButtons (poll).
+ * _exit imediato evita o deadlock do blob Mali (Valhall/Utgard) ao liberar o
+ * contexto GL no encerramento. */
+static void check_exit_hotkey(void) {
   if (g_pad &&
       SDL_GameControllerGetButton(g_pad, SDL_CONTROLLER_BUTTON_BACK) &&
       SDL_GameControllerGetButton(g_pad, SDL_CONTROLLER_BUTTON_START)) {
     fprintf(stderr, "[pad] SELECT+START -> saindo do jogo\n");
     _exit(0);
   }
+}
+static int GetGamepadButtons(int port) {
+  if (port != 0 || !g_pad) return 0;
+  SDL_GameControllerUpdate();
+  check_exit_hotkey();
   int m = 0;
   struct { int b; int mask; } map[] = {
     {SDL_CONTROLLER_BUTTON_A,0x1},{SDL_CONTROLLER_BUTTON_B,0x2},
@@ -141,6 +146,7 @@ static void pump_gamepad(void) {
     inited = 1;
   }
   SDL_GameControllerUpdate();
+  check_exit_hotkey();
   /* botões */
   for (unsigned i = 0; i < sizeof(g_btnmap)/sizeof(g_btnmap[0]); i++) {
     int g = g_btnmap[i].game;
