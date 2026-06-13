@@ -8,8 +8,10 @@
  * Entrada = android_main (NativeActivity), janela GLES2 via egl_shim/SDL2.
  */
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <setjmp.h>
 #include <stdio.h>
@@ -897,6 +899,67 @@ static void hook_getproductvalue(void) {
   fprintf(stderr, "hook: NXI_GetProductValue GOT %p orig=%p\n", (void *)slot, (void *)orig_getprod);
 }
 
+/* [PERFCPU] sampler de CPU por thread: a cada 5s lê /proc/self/task/STAT e
+ * imprime as 6 threads que mais usaram CPU no intervalo (% de 1 core).
+ * Diagnóstico do lag — acha busy-spin/thread moedora. */
+static void *perfcpu_thread(void *arg) {
+  (void)arg;
+  struct ent { long tid; char name[20]; unsigned long long ticks; };
+  static struct ent prev[256]; int nprev = 0;
+  long hz = sysconf(_SC_CLK_TCK);
+  for (;;) {
+    sleep(5);
+    DIR *d = opendir("/proc/self/task");
+    if (!d) continue;
+    struct ent cur[256]; int nc = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) && nc < 256) {
+      if (de->d_name[0] == '.') continue;
+      char path[64];
+      snprintf(path, sizeof(path), "/proc/self/task/%s/stat", de->d_name);
+      FILE *f = fopen(path, "r");
+      if (!f) continue;
+      long tid; char comm[20] = ""; char st;
+      unsigned long ut = 0, stm = 0;
+      if (fscanf(f, "%ld (%19[^)]) %c", &tid, comm, &st) == 3) {
+        for (int k = 0; k < 11; k++) fscanf(f, "%*s");
+        fscanf(f, "%lu %lu", &ut, &stm);
+        cur[nc].tid = tid; cur[nc].ticks = (unsigned long long)ut + stm;
+        strncpy(cur[nc].name, comm, 19); cur[nc].name[19] = 0; nc++;
+      }
+      fclose(f);
+    }
+    closedir(d);
+    /* delta vs prev, top 6 */
+    struct { double pct; char name[20]; long tid; } top[6] = {{0}};
+    for (int i = 0; i < nc; i++) {
+      unsigned long long old = 0;
+      for (int j = 0; j < nprev; j++)
+        if (prev[j].tid == cur[i].tid) { old = prev[j].ticks; break; }
+      double pct = (double)(cur[i].ticks - old) * 100.0 / (hz * 5.0);
+      for (int s = 0; s < 6; s++)
+        if (pct > top[s].pct) {
+          for (int m = 5; m > s; m--) top[m] = top[m - 1];
+          top[s].pct = pct; top[s].tid = cur[i].tid;
+          strncpy(top[s].name, cur[i].name, 19); top[s].name[19] = 0;
+          break;
+        }
+    }
+    char line[256]; int lp = 0; line[0] = 0;
+    for (int s = 0; s < 6 && top[s].pct > 0.5 && lp < 220; s++)
+      lp += snprintf(line + lp, sizeof(line) - lp, " %s(%ld)=%.0f%%",
+                     top[s].name, top[s].tid, top[s].pct);
+    fprintf(stderr, "[PERFCPU]%s\n", line);
+    memcpy(prev, cur, sizeof(cur[0]) * nc); nprev = nc;
+  }
+  return NULL;
+}
+static void start_perfcpu(void) {
+  if (getenv("DYSMANTLE_NOPERF")) return;
+  pthread_t t;
+  pthread_create(&t, NULL, perfcpu_thread, NULL);
+}
+
 static void load_module(const char *name, int heap_mb, DynLibFunction *tbl, int n) {
   size_t hs = (size_t)heap_mb * 1024 * 1024;
   void *heap = mmap(NULL, hs, PROT_READ | PROT_WRITE | PROT_EXEC,
@@ -1028,6 +1091,7 @@ int main(int argc, char *argv[]) {
   hook_shaderload(); /* 🌍 fix mundo branco: shader fmt 0 -> 0x7f (causa-raiz) */
   hook_getshader();  /* 🌍 diag + FIX B: alias *Shadows.xml -> variante s/ sombra */
   hook_inittrans();  /* 🌍 diag + FIX A: log/override do ShaderTarget */
+  start_perfcpu();   /* [PERFCPU] sampler de CPU por thread (diag lag) */
   /* skip do skinned-actor: NÃO é a solução real (o crash vem de config LOW;
    * reverter as configs pro default resolve). Fica como rede de segurança
    * opcional via DYSMANTLE_SKIP_BADACTORS=1 (corrompe o importer, usar só p/

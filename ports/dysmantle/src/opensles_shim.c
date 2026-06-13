@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "opensles_shim.h"
 #include "so_util.h"
@@ -450,6 +451,25 @@ static void sdl_audio_callback(void *userdata, Uint8 *stream, int len) {
     prev_left = out[out_samples - 2];
     prev_right = out[out_samples - 1];
   }
+  /* [PERFAUD] relatório ~5s: callbacks, underruns acumulados, clicks, players
+   * ativos e enchimento do ring de cada um (diagnóstico do lag de áudio). */
+  {
+    static uint32_t last_report_cb = 0;
+    uint32_t cbs_5s = (uint32_t)(5.0 * SDL_OUTPUT_RATE / (out_frames ? out_frames : 1024));
+    if (callback_count - last_report_cb >= cbs_5s) {
+      last_report_cb = callback_count;
+      uint32_t under = 0;
+      char rings[128]; int rp = 0; rings[0] = 0;
+      for (int i = 0; i < MAX_PLAYERS; i++) {
+        AudioPlayer *p = &g_players[i];
+        under += p->underrun_count;
+        if (p->active && p->play_state == SL_PLAYSTATE_PLAYING && rp < 100)
+          rp += snprintf(rings + rp, sizeof(rings) - rp, " p%d=%u", i, ring_readable(p));
+      }
+      fprintf(stderr, "[PERFAUD] cb=%u underruns=%u clicks=%u active=%d ring:%s\n",
+              callback_count, under, click_count, num_active, rings);
+    }
+  }
 }
 
 /* Initialize SDL2 audio */
@@ -461,11 +481,19 @@ static void ensure_audio_initialized(void) {
   want.freq = 44100;
   want.format = AUDIO_S16SYS;
   want.channels = 2;
-  want.samples = SDL_AUDIO_SAMPLES;
+  /* 1024 frames = ~23ms (4096 dava 93ms de latência + 4 enqueues por callback
+   * = áudio atrasado e engasgado). SEM ALLOW_SAMPLES_CHANGE: o SDL emula 1024
+   * mesmo se o ALSA pedir mais. DYSMANTLE_AUDIO_SAMPLES ajusta sem rebuild. */
+  {
+    const char *e = getenv("DYSMANTLE_AUDIO_SAMPLES");
+    int s = e ? atoi(e) : 1024;
+    if (s < 256 || s > SDL_AUDIO_SAMPLES) s = 1024;
+    want.samples = (Uint16)s;
+  }
   want.callback = sdl_audio_callback;
   want.userdata = NULL;
 
-  g_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, SDL_AUDIO_ALLOW_SAMPLES_CHANGE);
+  g_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
   if (g_audio_dev == 0) {
     debugPrintf("opensles_shim: SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
     g_audio_initialized = 1;
@@ -476,6 +504,28 @@ static void ensure_audio_initialized(void) {
               have.freq, have.channels, have.samples);
   SDL_PauseAudioDevice(g_audio_dev, 0);
   g_audio_initialized = 1;
+  /* 🔊 PUMP THREAD: no Android real o OpenSLES chama os bq callbacks de uma
+   * thread PRÓPRIA. Bombear só do event-loop (1x/frame) deixa o ring secar
+   * entre frames -> underrun constante (causa do áudio engasgado). Thread
+   * dedicada a ~4ms mantém o ring cheio. DYSMANTLE_NO_AUDIOPUMP=1 desliga. */
+  if (!getenv("DYSMANTLE_NO_AUDIOPUMP")) {
+    static int started = 0;
+    if (!started) {
+      started = 1;
+      pthread_t t;
+      extern void *sl_pump_thread_fn(void *);
+      pthread_create(&t, NULL, sl_pump_thread_fn, NULL);
+      debugPrintf("opensles_shim: pump thread iniciada (4ms)\n");
+    }
+  }
+}
+void *sl_pump_thread_fn(void *a) {
+  (void)a;
+  for (;;) {
+    opensles_shim_pump_callbacks();
+    usleep(4000);
+  }
+  return NULL;
 }
 
 /* Reset player metadata without touching the 4MB ring buffer.
@@ -1073,7 +1123,16 @@ static void init_engine(void) {
 }
 
 /* Public API */
+static void opensles_pump_locked(void);
+static pthread_mutex_t g_pump_lock = PTHREAD_MUTEX_INITIALIZER;
 void opensles_shim_pump_callbacks(void) {
+  /* pode ser chamada do event-loop E da pump-thread: serializa; se já tem
+   * alguém bombeando, pula (sem fila — a próxima volta pega). */
+  if (pthread_mutex_trylock(&g_pump_lock) != 0) return;
+  opensles_pump_locked();
+  pthread_mutex_unlock(&g_pump_lock);
+}
+static void opensles_pump_locked(void) {
   for (int i = 0; i < MAX_PLAYERS; i++) {
     AudioPlayer *p = &g_players[i];
     if (!p->active || p->play_state != SL_PLAYSTATE_PLAYING) continue;

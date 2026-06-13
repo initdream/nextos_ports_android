@@ -561,7 +561,9 @@ static void my_glDrawElements(unsigned mode, int cnt, unsigned typ, const void *
   if ((++t % 3000) == 0)
     fprintf(stderr, "[DRAWSTATS] fbo=%lu screen=%lu (cur_fbo=%u)\n",
             g_draws_fbo, g_draws_screen, g_cur_fbo);
-  if (getenv("DYSMANTLE_DRAW_LOG")) {
+  static int drawlog = -1;
+  if (drawlog < 0) drawlog = getenv("DYSMANTLE_DRAW_LOG") ? 1 : 0;
+  if (drawlog) {
     static int dn = 0;
     /* draws GRANDES (chão/terreno) dentro do FBO: loga programa + texturas */
     if (g_cur_fbo && cnt > 3000 && dn < 30) {

@@ -36,6 +36,8 @@ enum {
   MID_GET_CLASS_LOADER,
   MID_LOAD_CLASS,
   MID_AUDIO_STREAM_PARAMS,
+  MID_BATTERY_LEVEL,
+  MID_BATTERY_STATUS,
   MID_GENERIC,
   FID_OBB_VERSIONCODE,
   FID_GENERIC,
@@ -107,6 +109,12 @@ static void *jni_GetMethodID(void *env, void *clazz, const char *name,
     return &g_method_tags[MID_LOAD_CLASS];
   if (strcmp(name, "GetDefaultAudioStreamParameters") == 0)
     return &g_method_tags[MID_AUDIO_STREAM_PARAMS];
+  /* 🔋 bateria: a engine 10tons reduz pra 30fps em modo economia. Respondemos
+   * 100% + carregando (level garbage/0 = power-save = cap de fps!). */
+  if (strcmp(name, "getBatteryLevel") == 0)
+    return &g_method_tags[MID_BATTERY_LEVEL];
+  if (strcmp(name, "getBatteryStatus") == 0)
+    return &g_method_tags[MID_BATTERY_STATUS];
   return &g_method_tags[MID_GENERIC];
 }
 
@@ -207,8 +215,19 @@ static unsigned char jni_CallBooleanMethod(void *env, void *obj,
 static jint jni_CallIntMethod(void *env, void *obj, void *methodID, ...) {
   (void)env;
   (void)obj;
-  (void)methodID;
+  if (methodID == &g_method_tags[MID_BATTERY_STATUS])
+    return 2; /* BATTERY_STATUS_CHARGING — sem power-save/cap de fps */
   return 0;
+}
+
+/* CallFloatMethod (index 55-57) — sem isto o retorno float era LIXO em s0
+ * (getBatteryLevel lia qualquer coisa -> engine entrava em power-save 30fps) */
+static float jni_CallFloatMethod(void *env, void *obj, void *methodID, ...) {
+  (void)env;
+  (void)obj;
+  if (methodID == &g_method_tags[MID_BATTERY_LEVEL])
+    return 100.0f; /* 100% (escala 0..1 ou 0..100, ambas acima do threshold) */
+  return 0.0f;
 }
 
 /* CallVoidMethod (index 94) */
@@ -501,6 +520,9 @@ void jni_shim_init(void **out_vm, void **out_env) {
   jni_env_vtable[38] = (uintptr_t)jni_CallBooleanMethod;   /* V */
   jni_env_vtable[49] = (uintptr_t)jni_CallIntMethod;
   jni_env_vtable[50] = (uintptr_t)jni_CallIntMethod;       /* V */
+  jni_env_vtable[55] = (uintptr_t)jni_CallFloatMethod;
+  jni_env_vtable[56] = (uintptr_t)jni_CallFloatMethod;     /* V */
+  jni_env_vtable[57] = (uintptr_t)jni_CallFloatMethod;     /* A */
   jni_env_vtable[61] = (uintptr_t)jni_CallVoidMethod;
   jni_env_vtable[62] = (uintptr_t)jni_CallVoidMethod;      /* V */
   jni_env_vtable[94] = (uintptr_t)jni_GetFieldID;

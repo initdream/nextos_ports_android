@@ -51,6 +51,7 @@ static SDL_GLContext gl_createcontext(SDL_Window *w) {
 typedef struct {
   SDL_GLContext sdl_context;
   EGLBoolean is_pbuffer;
+  int swapint_applied;
   int id;
 } _egl_context;
 
@@ -110,6 +111,15 @@ void egl_shim_create_window(void) {
     return;
   }
   debugPrintf("egl_shim: GL share-root context created\n");
+  /* DYSMANTLE_SWAPINT no contexto novo (a engine pode nunca chamar
+   * eglSwapInterval; default SDL=vsync 1 + limiter da engine = 30fps). */
+  {
+    const char *f = getenv("DYSMANTLE_SWAPINT");
+    if (f) {
+      SDL_GL_SetSwapInterval(atoi(f));
+      debugPrintf("egl_shim: swap interval forçado=%d\n", atoi(f));
+    }
+  }
 
   gl_makecurrent(egl_window, NULL);
   debugPrintf("egl_shim: Context released, ready for game\n");
@@ -266,6 +276,15 @@ EGLBoolean egl_shim_MakeCurrent(EGLDisplay dpy, EGLSurface draw,
   int ret = gl_makecurrent(egl_window, context->sdl_context);
   if (ret == 0) {
     has_real_gl = 1;
+    /* DYSMANTLE_SWAPINT: intervalo é estado por-contexto; aplica 1x em cada */
+    {
+      static const char *si = (const char *)-1;
+      if (si == (const char *)-1) si = getenv("DYSMANTLE_SWAPINT");
+      if (si && !context->swapint_applied) {
+        context->swapint_applied = 1;
+        SDL_GL_SetSwapInterval(atoi(si));
+      }
+    }
     static int acq_log = 0;
     if (acq_log < 20 || mc % 500 == 0) {
       //debugPrintf("egl_shim: MakeCurrent #%d %s [tid=%lx] ACQUIRED [ctx_id=%d]\n",
@@ -313,6 +332,29 @@ EGLBoolean egl_shim_SwapBuffers(EGLDisplay dpy, EGLSurface surface) {
   if (has_real_gl && current_context && !current_context->is_pbuffer) {
     dys_maybe_screenshot();
     SDL_GL_SwapWindow(egl_window);
+    /* [PERF] frame-time entre swaps; relatório a cada ~5s (diagnóstico do lag;
+     * custo: 1 clock_gettime/frame + 1 fprintf/5s). */
+    {
+      static struct timespec last = {0, 0};
+      static double sum = 0, mx = 0;
+      static unsigned n = 0, s20 = 0, s40 = 0;
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      if (last.tv_sec) {
+        double ms = (now.tv_sec - last.tv_sec) * 1e3 +
+                    (now.tv_nsec - last.tv_nsec) / 1e6;
+        sum += ms; n++;
+        if (ms > mx) mx = ms;
+        if (ms > 20) s20++;
+        if (ms > 40) s40++;
+        if (sum >= 5000) {
+          fprintf(stderr, "[PERF] fps=%.1f avg=%.1fms max=%.0fms >20ms=%u >40ms=%u\n",
+                  n * 1000.0 / sum, sum / n, mx, s20, s40);
+          sum = 0; n = 0; mx = 0; s20 = 0; s40 = 0;
+        }
+      }
+      last = now;
+    }
     int fc = ++frame_count;
     if (fc <= 10 || fc % 60 == 0) {
       //debugPrintf("egl_shim: SwapBuffers #%d [tid=%lx]\n",
@@ -416,6 +458,11 @@ const char *egl_shim_QueryString(EGLDisplay dpy, EGLint name) {
 
 EGLBoolean egl_shim_SwapInterval(EGLDisplay dpy, EGLint interval) {
   (void)dpy;
+  /* DYSMANTLE_SWAPINT força o intervalo (teste do double-pacing: engine dorme
+   * ~16ms + vsync = 2 períodos = trava em 30fps; =0 deixa a engine ditar). */
+  const char *f = getenv("DYSMANTLE_SWAPINT");
+  if (f) interval = atoi(f);
+  debugPrintf("egl_shim: SwapInterval(%d)%s\n", (int)interval, f ? " [forçado]" : "");
   SDL_GL_SetSwapInterval(interval);
   return EGL_TRUE;
 }
