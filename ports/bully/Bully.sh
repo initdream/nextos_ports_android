@@ -127,23 +127,15 @@ SETEOF
 fi
 
 # ---------- ambiente ----------
-# runtime/ = glibc 2.43 bundlada (ld+libc+libm + stubs dl/pthread/rt/util/resolv/nss)
-# p/ devices com glibc velha (<2.34, ex: ArkOS). O binario usa interpretador
-# RELATIVO runtime/ld-linux-aarch64.so.1 (patchelf no empacote) -> o cd "$GAMEDIR"
-# acima e OBRIGATORIO. Multiarch dirs no fim p/ SDL2/EGL de CFWs Debian-based.
-# SDL2/EGL/GPU sao SEMPRE os do device.
-# v7: o runtime/ vai SO no env do ./bully (prefixo na linha de exec, la embaixo),
-# NUNCA neste export global. Exportar runtime/ global fazia gptokeyb/grep (binarios
-# do SISTEMA, que sobem com o ld.so VELHO do device) carregarem a NOSSA libc 2.43;
-# ld.so e libc trocam simbolos GLIBC_PRIVATE e tem que ser do MESMO build glibc ->
-# "undefined symbol: tunable_is_initialized" no muOS (AYN) e similares.
-# Ordem: multiarch ANTES de /usr/lib — em CFW Debian-based (ArkOS...) a stack
-# GL correta (libmali/Mesa casada com o kernel) vive em /usr/lib/aarch64-linux-gnu;
-# um libmali velho perdido em /usr/lib na frente da multiarch da "user 10.6,
-# kernel 11.7 / Failed creating base context" (R36S ArkOS). Em devices SEM
-# multiarch (NextOS, Trimui, muOS...) os dirs nem existem -> ordem identica.
-export LD_LIBRARY_PATH="$GAMEDIR:/usr/lib/aarch64-linux-gnu:/lib/aarch64-linux-gnu:/usr/lib:$LD_LIBRARY_PATH"
-BULLY_RUNTIME_LP="$GAMEDIR/runtime:$LD_LIBRARY_PATH"
+# Env IDENTICO ao v4 (comprovado em campo: NextOS, muOS, X5M, R36S). O binario
+# tem interpretador NORMAL (/lib/ld-linux-aarch64.so.1, SEM patchelf): em device
+# com glibc capaz ele roda 100% nativo como no v4 — o ld.so do PROPRIO CFW acha
+# libgcc_s, o libmali casado com o kernel, tudo nos dirs default dele.
+# A glibc 2.43 bundlada (runtime/) so entra em device de glibc VELHA, via
+# invocacao EXPLICITA do loader na hora do exec (la embaixo) — nunca em export
+# global (envenenava gptokeyb/grep do sistema: ld.so velho + libc nova =
+# "undefined symbol: tunable_is_initialized" GLIBC_PRIVATE, muOS/AYN).
+export LD_LIBRARY_PATH="/usr/lib:$GAMEDIR:$LD_LIBRARY_PATH"
 export SDL_GAMECONTROLLERCONFIG="$sdl_controllerconfig"
 export SDL2COMPAT_FORCE_FULLSCREEN_DESKTOP=1
 export SDL_VIDEO_FULLSCREEN_DESKTOP=1
@@ -222,8 +214,24 @@ elif command -v gptokeyb >/dev/null 2>&1; then
 fi
 
 command -v pm_platform_helper >/dev/null 2>&1 && pm_platform_helper "$GAMEDIR/bully"
-# runtime/ (glibc 2.43) SO no env do jogo — ver comentario na secao ambiente.
-LD_LIBRARY_PATH="$BULLY_RUNTIME_LP" ./bully
+
+# A glibc do device aguenta o binario (precisa >= 2.38)? Roda NATIVO = modo v4,
+# o ld.so do CFW resolve as libs dele (libgcc_s, GL/libmali certos, etc).
+# Senao (ex: ArkOS 2.27/2.30), roda pelo loader BUNDLADO (glibc 2.43 completa
+# em runtime/, incl. stubs + libgcc_s/libstdc++), com runtime/ primeiro e
+# multiarch ANTES de /usr/lib (um libmali velho perdido em /usr/lib na frente
+# da multiarch dava "user 10.6, kernel 11.7 / Failed creating base context").
+GLIBC_NEED=2.38
+glibc_have=$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $NF}')
+[ -n "$glibc_have" ] || glibc_have=$(ldd --version 2>/dev/null | head -1 | awk '{print $NF}')
+glibc_ok=$(echo "${glibc_have:-0} $GLIBC_NEED" | awk '{split($1,a,".");split($2,b,".");print (a[1]>b[1]||(a[1]==b[1]&&a[2]+0>=b[2]+0))?1:0}')
+if [ "$glibc_ok" = "1" ]; then
+  echo "[launcher] glibc do device = $glibc_have >= $GLIBC_NEED -> NATIVO (modo v4)"
+  ./bully
+else
+  echo "[launcher] glibc do device = ${glibc_have:-desconhecida} < $GLIBC_NEED -> loader bundlado (glibc 2.43)"
+  "$GAMEDIR/runtime/ld-linux-aarch64.so.1" --library-path "$GAMEDIR/runtime:$GAMEDIR:/usr/lib/aarch64-linux-gnu:/lib/aarch64-linux-gnu:/usr/lib:$LD_LIBRARY_PATH" "$GAMEDIR/bully"
+fi
 
 pkill -f gptokeyb 2>/dev/null
 command -v pm_finish >/dev/null 2>&1 && pm_finish

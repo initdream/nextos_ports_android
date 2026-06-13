@@ -2,11 +2,27 @@
 
 ---
 
-## v7-test — 2026-06-12 — Build de TESTE: fix muOS/AYN + anti-freeze 1GB RAM + MSAA auto 480p
+## v7-test — 2026-06-12 — Build de TESTE: fix muOS/AYN/ArkOS + anti-freeze 1GB RAM + MSAA auto 480p
 
-> **BINARIO IDENTICO ao v6** — todas as mudancas sao no launcher (Bully.sh) e no
-> runtime/. Quem ja roda bem no v6 nao muda NADA. Build de teste p/ validar os
-> fixes dos bugs relatados no Discord; feedback bem-vindo.
+> **BINARIO IDENTICO ao v6** (codigo; sem o patchelf do empacote — ver item 0).
+> Todas as mudancas sao no launcher (Bully.sh) e no runtime/. Build de teste p/
+> validar os fixes dos bugs relatados no Discord; feedback bem-vindo.
+
+### 0. Modo DUAL: nativo (v4) onde a glibc aguenta, runtime bundlado no resto
+O v4 rodava liso em muOS/X5M/R36S porque o binario era NORMAL e o ld.so do
+PROPRIO CFW resolvia as libs do device (libgcc_s, o libmali casado com o
+kernel...). O v5/v6 trocou isso por interpretador patcheado + glibc bundlada
+pra TODOS — consertou ArkOS e quebrou sutilezas nos outros (ex: muOS RG34XX-SP
+`libgcc_s.so.1 not found`, pois o nosso ld.so nao conhece os dirs do muOS).
+v7 faz os DOIS: o binario volta a ter interpretador normal (sem patchelf) e o
+launcher detecta a glibc do device (`getconf GNU_LIBC_VERSION`):
+- glibc >= 2.38 (muOS, Knulli, ROCKNIX, NextOS, X5M...): roda `./bully` NATIVO,
+  caminho EXATAMENTE igual ao v4 que ja funcionava nesses devices;
+- glibc < 2.38 (ArkOS/dArkOS 2.27-2.30...): roda via o loader bundlado
+  (`runtime/ld-linux-aarch64.so.1 --library-path runtime:...`), que e o que o
+  v5 tentava fazer, agora sem efeitos colaterais nos demais devices.
+O runtime/ tambem ganhou libgcc_s.so.1 + libstdc++.so.6 (runtime do GCC, mesma
+logica de retrocompatibilidade) p/ o caminho bundlado ser autossuficiente.
 
 ### 1. Fix muOS (AYN e similares): glibc bundlada envenenava o sistema
 Sintomas relatados:
